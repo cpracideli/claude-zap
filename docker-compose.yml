@@ -160,6 +160,39 @@ services:
             }
           }
 
+          // ---------- live status: one message that is edited while Claude works and deleted when the answer is sent ----------
+          const msgIdOf = (r) => (r && r.id && (r.id._serialized || r.id)) || null;
+          const msgPath = (chatId, id) => '/api/' + WAHA_SESSION + '/chats/' + chatId + '/messages/' + id;
+          function liveStatus(chatId) {
+            const started = Date.now();
+            let label = 'trabalhando';
+            let id = null;
+            let last = '';
+            const ready = waha('POST', '/api/sendText', { session: WAHA_SESSION, chatId, text: '⏳ trabalhando...' })
+              .then((r) => { id = msgIdOf(r); }).catch((e) => log('status start failed', e.message));
+            let queue = Promise.resolve();
+            const push = async () => {
+              await ready;
+              if (!id) return;
+              const secs = Math.round((Date.now() - started) / 1000);
+              const text = '⏳ ' + label + ' (' + (secs >= 60 ? Math.round(secs / 60) + ' min' : secs + ' s') + ')';
+              if (text === last) return;
+              last = text;
+              await waha('PUT', msgPath(chatId, id), { text }).catch((e) => log('status edit failed', e.message));
+            };
+            const tick = () => { queue = queue.then(push); };
+            const timer = setInterval(tick, 15000);
+            return {
+              activity(l) { label = l; tick(); },
+              async finish() {
+                clearInterval(timer);
+                await ready;
+                await queue;
+                if (id) await waha('DELETE', msgPath(chatId, id) + '?onlyLocally=false').catch((e) => log('status delete failed', e.message));
+              },
+            };
+          }
+
           // ---------- Claude ----------
           function systemPrompt(chatId) {
             return [
@@ -183,9 +216,17 @@ services:
             ].join('\n');
           }
 
-          function runClaude(chatId, prompt, opts) {
+          // Human-readable label for a tool call, shown in the live status message.
+          function describeTool(name) {
+            const labels = { Bash: 'executando comando', Read: 'lendo arquivo', Write: 'escrevendo arquivo', Edit: 'editando arquivo',
+              MultiEdit: 'editando arquivo', Glob: 'procurando arquivos', Grep: 'buscando no código', WebSearch: 'pesquisando na web',
+              WebFetch: 'abrindo página', TodoWrite: 'organizando tarefas', Task: 'delegando subtarefa' };
+            return labels[name] || ('usando ' + name);
+          }
+
+          function runClaude(chatId, prompt, opts, onActivity) {
             return new Promise((resolve) => {
-              const args = ['-p', prompt, '--output-format', 'json', '--permission-mode', PERMISSION_MODE,
+              const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--permission-mode', PERMISSION_MODE,
                 '--append-system-prompt', systemPrompt(chatId)];
               if (ALLOWED_TOOLS && PERMISSION_MODE !== 'bypassPermissions') args.push('--allowedTools', ALLOWED_TOOLS);
               if (opts.model) args.push('--model', opts.model);
@@ -195,8 +236,23 @@ services:
               const child = spawn(isScript ? process.execPath : CLAUDE_BIN, isScript ? [CLAUDE_BIN, ...args] : args,
                 { cwd: WORKDIR, env: { ...env, WA_CHAT_ID: chatId }, stdio: ['ignore', 'pipe', 'pipe'] });
               running.set(chatId, { child, started: Date.now(), prompt: prompt.slice(0, 80) });
-              let out = '', err = '', timedOut = false;
-              child.stdout.on('data', (d) => { out += d; });
+              let out = '', err = '', timedOut = false, buf = '', final = null;
+              // stream-json: one JSON event per line. Tool calls drive the live status; the "result" event is the answer.
+              child.stdout.on('data', (d) => {
+                out += d;
+                buf += d;
+                let nl;
+                while ((nl = buf.indexOf('\n')) !== -1) {
+                  const line = buf.slice(0, nl).trim();
+                  buf = buf.slice(nl + 1);
+                  if (!line) continue;
+                  let ev; try { ev = JSON.parse(line); } catch { continue; }
+                  if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content) && onActivity) {
+                    for (const block of ev.message.content) if (block.type === 'tool_use') onActivity(describeTool(block.name));
+                  }
+                  if (ev.type === 'result') final = ev;
+                }
+              });
               child.stderr.on('data', (d) => { err += d; });
               const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); }, TIMEOUT_MS);
               const done = (r) => { clearTimeout(timer); running.delete(chatId); resolve(r); };
@@ -205,9 +261,9 @@ services:
                 if (signal && !timedOut) return done({ stopped: true });
                 if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
                 try {
-                  const j = JSON.parse(out);
-                  done({ text: j.result || '', sessionId: j.session_id, isError: j.is_error,
-                    usage: { cost: j.total_cost_usd, ms: j.duration_ms, turns: j.num_turns } });
+                  if (!final) throw new Error('no result event');
+                  done({ text: final.result || '', sessionId: final.session_id, isError: final.is_error,
+                    usage: { cost: final.total_cost_usd, ms: final.duration_ms, turns: final.num_turns } });
                 } catch {
                   done({ error: 'claude saiu com código ' + code + ': ' + (err || out).slice(-500) });
                 }
@@ -428,16 +484,19 @@ services:
               const keepTyping = setInterval(typing, 20000);
               const opts = { model: c.model || DEFAULT_MODEL, effort: c.effort || DEFAULT_EFFORT, resume: c.session };
               const started = Date.now();
-              let r = await runClaude(chatId, body, opts);
+              const status = liveStatus(chatId);
+              const onActivity = (label) => status.activity(label);
+              let r = await runClaude(chatId, body, opts, onActivity);
               // Retry from a fresh session only when resuming the old one failed. Not on timeouts or user stops:
               // re-running a timed-out task from scratch would run it twice and could repeat side effects.
               if (r.error && c.session && !r.stopped && !r.timedOut) {
                 log('resume failed, starting fresh:', r.error);
                 delete c.session;
-                r = await runClaude(chatId, body, { ...opts, resume: undefined });
+                r = await runClaude(chatId, body, { ...opts, resume: undefined }, onActivity);
               }
               clearInterval(keepTyping);
               waha('POST', '/api/stopTyping', { session: WAHA_SESSION, chatId }).catch(() => {});
+              await status.finish();
               if (r.stopped) {
                 recordRun(chatId, { prompt: body.slice(0, 80), ms: Date.now() - started, error: 'interrompido pelo usuário' });
                 return;
