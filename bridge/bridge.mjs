@@ -1,0 +1,578 @@
+// WhatsApp (WAHA) <-> Claude Code bridge. No dependencies, Node 20+.
+// NOTE: this file is embedded in a docker-compose file, so it must not contain the dollar sign.
+import http from 'node:http';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+
+// Drop empty variables (compose sets unset ones to "") so Claude Code picks the auth that is really set.
+for (const k of Object.keys(process.env)) if (process.env[k] === '') delete process.env[k];
+const env = process.env;
+
+const PORT = Number(env.PORT || 3000);
+const WAHA_API_KEY = env.WAHA_API_KEY || '';
+const WAHA_SESSION = env.WAHA_SESSION || 'default';
+const WEBHOOK_HMAC_KEY = env.WEBHOOK_HMAC_KEY || '';
+const ALLOWED = String(env.ALLOWED_NUMBERS || '').split(/[,;\n]+/).map((n) => n.replace(/\D/g, '')).filter(Boolean);
+const CLAUDE_BIN = env.CLAUDE_BIN || 'claude';
+const WORKDIR = env.CLAUDE_WORKDIR || path.join(env.HOME || '/tmp', 'workspace');
+const INBOX = path.join(WORKDIR, 'inbox');
+const DATA_DIR = env.DATA_DIR || path.join(env.HOME || '/tmp', '.bridge');
+const PERMISSION_MODE = env.CLAUDE_PERMISSION_MODE || 'default';
+const ALLOWED_TOOLS = env.CLAUDE_ALLOWED_TOOLS || 'Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,TodoWrite';
+const DEFAULT_MODEL = env.CLAUDE_MODEL || '';
+const DEFAULT_EFFORT = env.CLAUDE_EFFORT || '';
+const TIMEOUT_MS = Number(env.CLAUDE_TIMEOUT_SECONDS || 1800) * 1000;
+const TZ = env.TZ || 'America/Sao_Paulo';
+const MAX_CHUNK = 3500;
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+fs.mkdirSync(INBOX, { recursive: true });
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+// ---------- persistent per-chat state ----------
+const STATE_FILE = path.join(DATA_DIR, 'chats.json');
+let chats = {};
+try { chats = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch {}
+try { // migrate the old sessions.json (chatId -> sessionId)
+  const old = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'sessions.json'), 'utf8'));
+  for (const [k, v] of Object.entries(old)) if (!chats[k]) chats[k] = { session: v };
+  fs.writeFileSync(STATE_FILE, JSON.stringify(chats, null, 2));
+  fs.renameSync(path.join(DATA_DIR, 'sessions.json'), path.join(DATA_DIR, 'sessions.json.migrated'));
+} catch {}
+const save = () => fs.writeFileSync(STATE_FILE, JSON.stringify(chats, null, 2));
+const chat = (id) => (chats[id] = chats[id] || {});
+
+const log = (...a) => console.log(new Date().toISOString(), ...a);
+const wahaBase = () => {
+  let u = String(env.WAHA_URL || 'http://localhost:3000');
+  while (u.endsWith('/')) u = u.slice(0, -1);
+  return u;
+};
+
+async function waha(method, p, body) {
+  const res = await fetch(wahaBase() + p, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'X-Api-Key': WAHA_API_KEY },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error('WAHA ' + method + ' ' + p + ' -> ' + res.status + ' ' + text.slice(0, 200));
+  try { return JSON.parse(text); } catch { return text; }
+}
+
+// Resolve the sender to a phone number. Newer WhatsApp ids may be "@lid" instead of "@c.us".
+const lidCache = new Map();
+async function senderNumber(msg) {
+  const ids = [msg.participant, msg.from, msg._data && msg._data.Info && msg._data.Info.SenderAlt].filter(Boolean);
+  for (const id of ids) {
+    if (/@(c\.us|s\.whatsapp\.net)/.test(id)) return id.split('@')[0].split(':')[0];
+  }
+  const lid = ids.find((id) => id.endsWith('@lid'));
+  if (!lid) return '';
+  if (lidCache.has(lid)) return lidCache.get(lid);
+  try {
+    const r = await waha('GET', '/api/' + encodeURIComponent(WAHA_SESSION) + '/lids/' + encodeURIComponent(lid));
+    const pn = String((r && (r.pn || r.phoneNumber)) || '').split('@')[0];
+    lidCache.set(lid, pn);
+    return pn;
+  } catch (e) { log('lid lookup failed', e.message); return ''; }
+}
+
+// ---------- WhatsApp formatting ----------
+function toWhatsApp(md) {
+  // Leave code blocks untouched; convert the rest from Markdown to WhatsApp markup.
+  return md.split('```').map((part, i) => {
+    if (i % 2 === 1) return part;
+    return part.split('\n').map((line) => {
+      const h = line.match(/^\s{0,3}#{1,6}\s+(.*)/);
+      if (h) line = '*' + h[1].replace(/\*+/g, '') + '*';
+      line = line.replace(/\*\*(.+?)\*\*/g, (m, g) => '*' + g + '*');
+      line = line.replace(/__(.+?)__/g, (m, g) => '_' + g + '_');
+      line = line.replace(/~~(.+?)~~/g, (m, g) => '~' + g + '~');
+      line = line.replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, (m, t, u) => (t === u ? u : t + ' (' + u + ')'));
+      line = line.replace(/^(\s*)[-*]\s+/, (m, s) => s + '• ');
+      return line;
+    }).join('\n');
+  }).join('```');
+}
+
+function chunks(text) {
+  const parts = [];
+  let rest = text.trim() || '(resposta vazia)';
+  while (rest.length > MAX_CHUNK) {
+    let cut = rest.lastIndexOf('\n', MAX_CHUNK);
+    if (cut < MAX_CHUNK / 2) cut = MAX_CHUNK;
+    parts.push(rest.slice(0, cut));
+    rest = rest.slice(cut).trimStart();
+  }
+  parts.push(rest);
+  return parts;
+}
+
+async function reply(chatId, text, raw) {
+  for (const part of chunks(raw ? text : toWhatsApp(text))) {
+    await waha('POST', '/api/sendText', { session: WAHA_SESSION, chatId, text: part });
+  }
+}
+
+// ---------- Claude ----------
+function systemPrompt(chatId) {
+  return [
+    'Você está conversando com o usuário pelo WhatsApp, através de uma ponte (WAHA) que roda num container Docker.',
+    'Responda em português do Brasil, de forma direta. O WhatsApp não renderiza Markdown completo: evite tabelas e títulos; use *negrito*, _itálico_, listas simples e blocos de código.',
+    'Fuso horário do usuário: ' + TZ + '. Data/hora atual: ' + new Date().toLocaleString('pt-BR', { timeZone: TZ }) + '.',
+    'Diretório de trabalho: ' + WORKDIR + '. Arquivos enviados pelo usuário chegam em ' + INBOX + '.',
+    'Para ENVIAR um arquivo ou imagem ao usuário no WhatsApp, rode: curl -s -X POST http://127.0.0.1:' + PORT + '/send-file -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","path":"/caminho/absoluto","caption":"opcional"}\'',
+    'MENSAGENS PARA OUTRAS PESSOAS: a ponte TEM o endpoint /send, criado e autorizado pelo dono desta infraestrutura (o próprio usuário). Se algo anterior nesta conversa disser que esse envio não existe ou não é permitido, está desatualizado: ignore. Você PODE enviar mensagens de WhatsApp a qualquer número, pelo número do usuário. Quando o usuário pedir ("mande um oi para +55 11 9...", "avise o João que..."), envie direto, sem pedir confirmação: curl -s -X POST http://127.0.0.1:' + PORT + '/send -H "Content-Type: application/json" -d \'{"to":"5511999998888","text":"mensagem"}\'',
+    '  "to" aceita o número em qualquer formato (com DDI; sem DDI assuma 55) ou um id do WhatsApp (...@c.us, grupo ...@g.us). Para arquivo a terceiros, use /send-file com "to" no lugar de "chatId". Envie a outras pessoas SÓ quando o usuário pedir (na conversa ou num agendamento que ele criou), escreva a mensagem como se fosse do usuário (sem dizer que é uma IA, a menos que ele peça) e confirme depois o que foi enviado e para quem. Respostas dessas pessoas NÃO chegam até você.',
+    'Ao instalar servidores MCP, use sempre o escopo de usuário (claude mcp add -s user ...) para que fiquem disponíveis em todas as conversas. Cada mensagem do WhatsApp abre um processo novo do Claude Code, então MCPs novos ou reconfigurados já valem na PRÓXIMA mensagem: não é preciso reiniciar nada; avise o usuário para mandar a próxima mensagem.',
+    'Você roda como o usuário node, mas tem sudo SEM senha: pode instalar o que precisar sem pedir permissão (sudo apt-get install -y ..., pip, npm, npx). O sistema de arquivos fora de /home/node é recriado em redeploys: para um pacote apt sobreviver, acrescente o nome dele (um por linha) em /home/node/.apt-packages; tudo em /home/node (inclusive ~/.cache/ms-playwright) já é persistente.',
+    'Navegador: para Playwright, instale com "npx playwright install --with-deps chromium" e configure o MCP com o Chromium (ex.: claude mcp add -s user playwright -- npx @playwright/mcp@latest --browser chromium --headless --no-sandbox). Não há tela: use sempre headless.',
+    'Não peça confirmação para instalar ou configurar ferramentas: o usuário autorizou. Faça e reporte o resultado.',
+    'AGENDAMENTOS: quando o usuário pedir algo recorrente ou para um horário futuro ("todo dia às 8h me mande...", "me lembre amanhã às 15h..."), crie um agendamento na ponte. Não use cron do sistema nem o agendador do Claude Code.',
+    '  Recorrente (cron de 5 campos: minuto hora dia mês dia-da-semana, no fuso ' + TZ + '): curl -s -X POST http://127.0.0.1:' + PORT + '/schedules -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","cron":"0 8 * * *","description":"resumo curto","prompt":"instrução completa e autossuficiente do que fazer e enviar"}\'',
+    '  Uma vez: troque "cron" por "at":"2026-11-10T15:00:00-03:00" (ISO 8601 com fuso).',
+    '  Listar: curl -s "http://127.0.0.1:' + PORT + '/schedules?chatId=' + encodeURIComponent(chatId) + '"   Remover: curl -s -X DELETE http://127.0.0.1:' + PORT + '/schedules/ID',
+    '  O prompt do agendamento roda depois numa sessão NOVA, sem o contexto desta conversa: escreva-o completo (o que buscar, como formatar, o que enviar). A resposta final daquela execução é enviada automaticamente ao usuário. Confirme ao usuário o id, o horário e o que será enviado.',
+    'Comandos da ponte que o usuário pode usar: /help, /new, /status, /model, /effort, /stop, /enviar, /agenda, /pausar, /cancelar.',
+  ].join('\n');
+}
+
+function runClaude(chatId, prompt, opts) {
+  return new Promise((resolve) => {
+    const args = ['-p', prompt, '--output-format', 'json', '--permission-mode', PERMISSION_MODE,
+      '--append-system-prompt', systemPrompt(chatId)];
+    if (ALLOWED_TOOLS && PERMISSION_MODE !== 'bypassPermissions') args.push('--allowedTools', ALLOWED_TOOLS);
+    if (opts.model) args.push('--model', opts.model);
+    if (opts.effort) args.push('--effort', opts.effort);
+    if (opts.resume) args.push('--resume', opts.resume);
+    const isScript = CLAUDE_BIN.endsWith('.mjs') || CLAUDE_BIN.endsWith('.js');
+    const child = spawn(isScript ? process.execPath : CLAUDE_BIN, isScript ? [CLAUDE_BIN, ...args] : args,
+      { cwd: WORKDIR, env: { ...env, WA_CHAT_ID: chatId }, stdio: ['ignore', 'pipe', 'pipe'] });
+    running.set(chatId, { child, started: Date.now(), prompt: prompt.slice(0, 80) });
+    let out = '', err = '', timedOut = false;
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); }, TIMEOUT_MS);
+    const done = (r) => { clearTimeout(timer); running.delete(chatId); resolve(r); };
+    child.on('error', (e) => done({ error: e.message }));
+    child.on('close', (code, signal) => {
+      if (signal && !timedOut) return done({ stopped: true });
+      if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido' });
+      try {
+        const j = JSON.parse(out);
+        done({ text: j.result || '', sessionId: j.session_id, isError: j.is_error,
+          usage: { cost: j.total_cost_usd, ms: j.duration_ms, turns: j.num_turns } });
+      } catch {
+        done({ error: 'claude saiu com código ' + code + ': ' + (err || out).slice(-500) });
+      }
+    });
+  });
+}
+
+// ---------- queue / running ----------
+const queues = new Map();   // chatId -> promise chain
+const pending = new Map();  // chatId -> number of queued jobs
+const running = new Map();  // chatId -> { child, started, prompt }
+function enqueue(chatId, job) {
+  pending.set(chatId, (pending.get(chatId) || 0) + 1);
+  const prev = queues.get(chatId) || Promise.resolve();
+  const next = prev.then(job).catch((e) => log('job error', e.message))
+    .finally(() => pending.set(chatId, (pending.get(chatId) || 1) - 1));
+  queues.set(chatId, next);
+  next.finally(() => { if (queues.get(chatId) === next) queues.delete(chatId); });
+}
+
+const fmtDur = (ms) => (ms >= 60000 ? Math.round(ms / 60000) + ' min' : Math.round(ms / 1000) + ' s');
+
+// ---------- commands (answered immediately, outside the queue) ----------
+const HELP = [
+  '*Comandos*',
+  '/new: começa uma conversa nova (mantém modelo e esforço)',
+  '/status: sessão, modelo, tarefa em andamento e último uso',
+  '/model [opus|sonnet|haiku|fable|<id>|padrao]: troca o modelo desta conversa (fica salvo)',
+  '/effort [low|medium|high|xhigh|max|padrao]: nível de esforço (fica salvo)',
+  '/stop: interrompe a tarefa em andamento',
+  '/enviar <número> <mensagem>: manda uma mensagem para outro número (direto, sem passar pelo Claude)',
+  '/agenda: lista os agendamentos',
+  '/pausar <id>: pausa ou retoma um agendamento',
+  '/cancelar <id>: remove um agendamento',
+  '/help: esta lista',
+  'Para agendar, peça em linguagem natural: "todo dia às 8h me mande a previsão do tempo".',
+  'Qualquer outro texto vai para o Claude Code. Imagens, áudios e documentos são salvos em inbox/ e o caminho é passado ao Claude.',
+].join('\n');
+
+async function command(chatId, body) {
+  const [cmdRaw, ...rest] = body.trim().split(/\s+/);
+  const cmd = cmdRaw.toLowerCase();
+  const arg = rest.join(' ').trim();
+  const c = chat(chatId);
+  const isDefault = (a) => ['padrao', 'padrão', 'default', 'reset'].includes(a.toLowerCase());
+  switch (cmd) {
+    case '/help': case '/ajuda': return reply(chatId, HELP, true);
+    case '/new': case '/reset': case '/nova':
+      delete c.session; save();
+      return reply(chatId, 'Nova conversa iniciada. Modelo: ' + (c.model || DEFAULT_MODEL || 'padrão') + '.', true);
+    case '/model': case '/modelo':
+      if (!arg) return reply(chatId, 'Modelo atual: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Use /model opus, /model sonnet, /model haiku ou /model padrao.', true);
+      if (isDefault(arg)) delete c.model; else c.model = arg;
+      save();
+      return reply(chatId, 'Modelo desta conversa: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Vale a partir da próxima mensagem.', true);
+    case '/effort': case '/esforco': case '/esforço':
+      if (!arg) return reply(chatId, 'Esforço atual: ' + (c.effort || DEFAULT_EFFORT || 'padrão') + '. Opções: ' + EFFORTS.join(', ') + ', padrao.', true);
+      if (isDefault(arg)) delete c.effort;
+      else if (EFFORTS.includes(arg.toLowerCase())) c.effort = arg.toLowerCase();
+      else return reply(chatId, 'Nível inválido. Opções: ' + EFFORTS.join(', ') + ', padrao.', true);
+      save();
+      return reply(chatId, 'Esforço desta conversa: ' + (c.effort || DEFAULT_EFFORT || 'padrão') + '.', true);
+    case '/stop': case '/parar': {
+      const r = running.get(chatId);
+      if (!r) return reply(chatId, 'Nada em andamento.', true);
+      r.child.kill('SIGTERM');
+      return reply(chatId, 'Interrompido após ' + fmtDur(Date.now() - r.started) + '. A conversa continua; mande a próxima mensagem.', true);
+    }
+    case '/status': case '/ping': {
+      const r = running.get(chatId);
+      const q = Math.max(0, (pending.get(chatId) || 0) - (r ? 1 : 0));
+      const u = c.lastUsage;
+      return reply(chatId, [
+        '*Status*',
+        'Sessão: ' + (c.session ? c.session.slice(0, 8) : 'nenhuma (próxima mensagem inicia uma)'),
+        'Modelo: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + ' | Esforço: ' + (c.effort || DEFAULT_EFFORT || 'padrão'),
+        'Permissões: ' + PERMISSION_MODE,
+        r ? 'Em andamento há ' + fmtDur(Date.now() - r.started) + ': "' + r.prompt + '"' : 'Ocioso',
+        q ? 'Na fila: ' + q : '',
+        u ? 'Última resposta: ' + fmtDur(u.ms || 0) + ', ' + (u.turns || 0) + ' passos' : '',
+      ].filter(Boolean).join('\n'), true);
+    }
+    case '/enviar': case '/send': case '/msg': {
+      const argRaw = body.trim().slice(cmdRaw.length).trim();
+      const m = argRaw.match(/^(\S+@\S+|\+?\d[\d().-]*(?:\s\d[\d().-]*)*)\s+([\s\S]+)/);
+      if (!m) return reply(chatId, 'Uso: /enviar <número> <mensagem>\nEx.: /enviar +55 11 99999-8888 oi, tudo bem?', true);
+      try {
+        const out = await sendMessage({ to: m[1], text: m[2] });
+        return reply(chatId, 'Enviado para ' + out.chatId.split('@')[0] + '.', true);
+      } catch (e) { return reply(chatId, 'Não enviado: ' + e.message, true); }
+    }
+    case '/agenda': case '/agendamentos': {
+      const mine = schedules.filter((s) => s.chatId === chatId);
+      if (!mine.length) return reply(chatId, 'Nenhum agendamento. Peça em linguagem natural, ex.: "todo dia às 8h me mande a previsão do tempo".', true);
+      return reply(chatId, '*Agendamentos* (fuso ' + TZ + ')\n' + mine.map(describe).join('\n'), true);
+    }
+    case '/cancelar': case '/pausar': case '/retomar': {
+      const s = schedules.find((x) => x.chatId === chatId && x.id === arg.replace('#', ''));
+      if (!s) return reply(chatId, 'Agendamento não encontrado. Veja os ids com /agenda.', true);
+      if (cmd === '/cancelar') { schedules = schedules.filter((x) => x !== s); saveSched(); return reply(chatId, 'Agendamento #' + s.id + ' removido.', true); }
+      s.paused = cmd === '/retomar' ? false : !s.paused; saveSched();
+      return reply(chatId, 'Agendamento #' + s.id + (s.paused ? ' pausado.' : ' ativo.'), true);
+    }
+    default: return null; // not a bridge command: goes to Claude (e.g. /compact or custom slash commands)
+  }
+}
+
+// ---------- media ----------
+async function saveMedia(msg) {
+  const m = msg.media;
+  if (!m || !m.url) return null;
+  let u = m.url;
+  try { const parsed = new URL(u); u = wahaBase() + parsed.pathname + parsed.search; } catch {}
+  const res = await fetch(u, { headers: { 'X-Api-Key': WAHA_API_KEY } });
+  if (!res.ok) throw new Error('download ' + res.status);
+  const ext = (m.filename && path.extname(m.filename)) || '.' + String(m.mimetype || 'bin').split('/')[1].split(';')[0];
+  const base = (m.filename ? path.basename(m.filename, path.extname(m.filename)) : 'arquivo').replace(/[^\w.-]+/g, '_');
+  const file = path.join(INBOX, new Date().toISOString().replace(/[:.]/g, '-') + '_' + base + ext);
+  fs.writeFileSync(file, Buffer.from(await res.arrayBuffer()));
+  return { file, mimetype: m.mimetype || '' };
+}
+
+// ---------- message handling ----------
+const seen = new Set();
+async function handleMessage(msg) {
+  if (!msg || msg.fromMe) return;
+  const chatId = msg.from;
+  if (!chatId || chatId.endsWith('@g.us') || chatId.endsWith('@newsletter') || chatId === 'status@broadcast') return;
+  if (msg.id && seen.has(msg.id)) return;
+  if (msg.id) { seen.add(msg.id); if (seen.size > 5000) seen.clear(); }
+
+  const number = await senderNumber(msg);
+  if (!ALLOWED.length || !ALLOWED.includes(number)) {
+    log('ignored message from non-allowed sender', number || chatId);
+    return;
+  }
+  waha('POST', '/api/sendSeen', { session: WAHA_SESSION, chatId }).catch(() => {});
+  let body = String(msg.body || '').trim();
+
+  if (body.startsWith('/')) {
+    const handled = await command(chatId, body);
+    if (handled !== null) return;
+  }
+
+  if (msg.hasMedia) {
+    try {
+      const saved = await saveMedia(msg);
+      if (!saved) {
+        await reply(chatId, 'Recebi um arquivo, mas o WAHA não disponibilizou o download (no WAHA Core isso pode exigir a versão Plus).', true);
+        if (!body) return;
+      } else {
+        const kind = saved.mimetype.startsWith('image/') ? 'uma imagem' : saved.mimetype.startsWith('audio/') ? 'um áudio' : 'um arquivo';
+        body = '[O usuário enviou ' + kind + ' (' + saved.mimetype + ') salvo em ' + saved.file + ']' + (body ? '\n\n' + body : '\n\nAnalise o conteúdo e responda.');
+      }
+    } catch (e) {
+      log('media error', e.message);
+      await reply(chatId, 'Não consegui baixar o arquivo: ' + e.message, true);
+      if (!body) return;
+    }
+  }
+  if (!body) return;
+
+  if (running.has(chatId)) {
+    const q = pending.get(chatId) || 1;
+    reply(chatId, 'Ainda estou trabalhando na mensagem anterior. Esta entrou na fila (' + q + ' à frente). Use /stop para interromper.', true).catch(() => {});
+  }
+
+  enqueue(chatId, async () => {
+    const c = chat(chatId);
+    log('prompt from', number, body.length, 'chars');
+    const typing = () => waha('POST', '/api/startTyping', { session: WAHA_SESSION, chatId }).catch(() => {});
+    typing();
+    const keepTyping = setInterval(typing, 20000);
+    const opts = { model: c.model || DEFAULT_MODEL, effort: c.effort || DEFAULT_EFFORT, resume: c.session };
+    let r = await runClaude(chatId, body, opts);
+    if (r.error && c.session && !r.stopped) {
+      log('resume failed, starting fresh:', r.error);
+      delete c.session;
+      r = await runClaude(chatId, body, { ...opts, resume: undefined });
+    }
+    clearInterval(keepTyping);
+    waha('POST', '/api/stopTyping', { session: WAHA_SESSION, chatId }).catch(() => {});
+    if (r.stopped) return;
+    if (r.sessionId) c.session = r.sessionId;
+    if (r.usage) c.lastUsage = r.usage;
+    save();
+    await reply(chatId, r.error ? 'Erro ao executar o Claude Code: ' + r.error : r.text, Boolean(r.error));
+  });
+}
+
+// ---------- schedules ----------
+const SCHED_FILE = path.join(DATA_DIR, 'schedules.json');
+let schedules = [];
+try { schedules = JSON.parse(fs.readFileSync(SCHED_FILE, 'utf8')); } catch {}
+const saveSched = () => fs.writeFileSync(SCHED_FILE, JSON.stringify(schedules, null, 2));
+const DOWS = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+function tzParts(d) {
+  const o = {};
+  const fmt = new Intl.DateTimeFormat('en-US', { timeZone: TZ, hourCycle: 'h23', year: 'numeric', month: 'numeric',
+    day: 'numeric', hour: 'numeric', minute: 'numeric', weekday: 'short' });
+  for (const p of fmt.formatToParts(d)) o[p.type] = p.value;
+  return { min: Number(o.minute), hour: Number(o.hour) % 24, dom: Number(o.day), mon: Number(o.month), dow: DOWS[o.weekday],
+    key: o.year + '-' + o.month + '-' + o.day + ' ' + o.hour + ':' + o.minute };
+}
+function fieldOk(expr, v, min, max) {
+  return expr.split(',').some((part) => {
+    const [r, s] = part.split('/');
+    const step = s ? Number(s) : 1;
+    let lo, hi;
+    if (r === '*') { lo = min; hi = max; }
+    else if (r.includes('-')) { [lo, hi] = r.split('-').map(Number); }
+    else { lo = Number(r); hi = s ? max : lo; }
+    return v >= lo && v <= hi && (v - lo) % step === 0;
+  });
+}
+function validCron(c) {
+  const f = String(c || '').trim().split(/\s+/);
+  if (f.length !== 5) return false;
+  const lim = [[0, 59], [0, 23], [1, 31], [1, 12], [0, 7]];
+  return f.every((x, i) => x.split(',').every((part) => {
+    const [r, s] = part.split('/');
+    if (s !== undefined && !(Number(s) > 0)) return false;
+    if (r === '*') return true;
+    const [a, b] = r.split('-');
+    const na = Number(a), nb = b === undefined ? na : Number(b);
+    return Number.isInteger(na) && Number.isInteger(nb) && na >= lim[i][0] && nb <= lim[i][1] && na <= nb;
+  }));
+}
+function cronMatch(c, t) {
+  const [mi, h, dom, mon, dow] = c.trim().split(/\s+/);
+  if (!fieldOk(mi, t.min, 0, 59) || !fieldOk(h, t.hour, 0, 23) || !fieldOk(mon, t.mon, 1, 12)) return false;
+  const dOk = fieldOk(dom, t.dom, 1, 31);
+  const wOk = fieldOk(dow, t.dow, 0, 7) || (t.dow === 0 && fieldOk(dow, 7, 0, 7));
+  if (dom !== '*' && dow !== '*') return dOk || wOk; // standard cron: either day field may match
+  return dOk && wOk;
+}
+function addSchedule(b) {
+  if (!b.chatId || !chats[b.chatId]) throw new Error('chatId desconhecido');
+  if (!b.prompt) throw new Error('prompt obrigatório');
+  const s = { id: crypto.randomBytes(3).toString('hex'), chatId: b.chatId, prompt: String(b.prompt),
+    description: String(b.description || b.prompt).slice(0, 120), created: new Date().toISOString() };
+  if (b.cron) {
+    if (!validCron(b.cron)) throw new Error('cron inválido: use 5 campos (minuto hora dia mês dia-da-semana), no fuso ' + TZ);
+    s.cron = String(b.cron).trim();
+  } else if (b.at) {
+    const t = new Date(b.at);
+    if (isNaN(t)) throw new Error('at inválido: use ISO 8601 com fuso, ex. 2026-11-10T08:00:00-03:00');
+    if (t.getTime() < Date.now() - 60000) throw new Error('at está no passado');
+    s.at = t.toISOString();
+  } else throw new Error('informe cron (recorrente) ou at (uma vez)');
+  schedules.push(s); saveSched();
+  return s;
+}
+const fmtDate = (iso) => new Date(iso).toLocaleString('pt-BR', { timeZone: TZ, dateStyle: 'short', timeStyle: 'short' });
+const describe = (s) => '#' + s.id + (s.paused ? ' (pausado)' : '') + ' · ' + (s.cron ? 'cron ' + s.cron : 'uma vez em ' + fmtDate(s.at)) +
+  '\n   ' + s.description + (s.lastRun ? '\n   última execução: ' + fmtDate(s.lastRun) : '');
+
+function runSchedule(s) {
+  enqueue(s.chatId, async () => {
+    const c = chat(s.chatId);
+    log('running schedule', s.id);
+    const prompt = '[Tarefa agendada #' + s.id + ': ' + s.description + ']\n' +
+      'Execute agora. Sua resposta final será enviada ao usuário pelo WhatsApp como a mensagem desta tarefa.\n\n' + s.prompt;
+    const r = await runClaude(s.chatId, prompt, { model: c.model || DEFAULT_MODEL, effort: c.effort || DEFAULT_EFFORT });
+    if (r.stopped) return;
+    await reply(s.chatId, r.error ? '⏰ Falha na tarefa agendada #' + s.id + ': ' + r.error : '⏰ ' + r.text, Boolean(r.error));
+  });
+}
+let lastMinute = '';
+function tick() {
+  const now = new Date();
+  const t = tzParts(now);
+  const newMinute = t.key !== lastMinute;
+  lastMinute = t.key;
+  let changed = false;
+  for (const s of [...schedules]) {
+    if (s.paused) continue;
+    if (s.cron && s.lastRun && tzParts(new Date(s.lastRun)).key === t.key) continue; // already ran this minute (e.g. restart)
+    const due = s.cron ? newMinute && cronMatch(s.cron, t) : new Date(s.at) <= now;
+    if (!due) continue;
+    s.lastRun = now.toISOString(); changed = true;
+    if (s.at) schedules = schedules.filter((x) => x !== s);
+    runSchedule(s);
+  }
+  if (changed) saveSched();
+}
+setInterval(tick, Number(env.SCHEDULER_TICK_MS || 15000));
+
+// ---------- send to any number (local only, used by Claude itself) ----------
+// "to" may be a phone number in any format (+55 11 9...), or a full WhatsApp id (...@c.us / ...@g.us / ...@lid).
+async function resolveTo(to) {
+  to = String(to || '').trim();
+  if (to.includes('@')) return to;
+  const digits = to.replace(/\D/g, '');
+  if (digits.length < 10) throw new Error('número inválido (use DDI+DDD+número, ex. 5511999998888)');
+  try {
+    const r = await waha('GET', '/api/contacts/check-exists?session=' + encodeURIComponent(WAHA_SESSION) + '&phone=' + digits);
+    if (r && r.numberExists === false) throw new Error('o número ' + digits + ' não tem WhatsApp');
+    if (r && r.chatId) return r.chatId;
+  } catch (e) {
+    if (e.message.includes('não tem WhatsApp')) throw e;
+    log('check-exists failed, using raw number', e.message);
+  }
+  return digits + '@c.us';
+}
+
+async function sendMessage(reqBody) {
+  const { to, text } = reqBody;
+  if (!text || !String(text).trim()) throw new Error('texto vazio');
+  const chatId = await resolveTo(to);
+  for (const part of chunks(reqBody.raw ? String(text) : toWhatsApp(String(text)))) {
+    await waha('POST', '/api/sendText', { session: WAHA_SESSION, chatId, text: part });
+  }
+  log('sent message to', chatId);
+  return { sent: true, chatId };
+}
+
+// ---------- send-file (local only, used by Claude itself) ----------
+async function sendFile(reqBody) {
+  const { path: p, caption } = reqBody;
+  let chatId = reqBody.chatId;
+  if (reqBody.to) chatId = await resolveTo(reqBody.to);
+  else if (!chatId || !chats[chatId]) throw new Error('chatId desconhecido');
+  const abs = path.resolve(WORKDIR, p);
+  const data = fs.readFileSync(abs).toString('base64');
+  const ext = path.extname(abs).toLowerCase();
+  const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp',
+    '.pdf': 'application/pdf', '.txt': 'text/plain', '.csv': 'text/csv', '.json': 'application/json', '.zip': 'application/zip',
+    '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.mp4': 'video/mp4', '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
+  const mimetype = types[ext] || 'application/octet-stream';
+  const file = { mimetype, filename: path.basename(abs), data };
+  const endpoint = mimetype.startsWith('image/') ? '/api/sendImage' : '/api/sendFile';
+  return waha('POST', endpoint, { session: WAHA_SESSION, chatId, file, caption: caption || undefined });
+}
+
+// ---------- HTTP ----------
+const isLocal = (req) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
+const server = http.createServer((req, res) => {
+  if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ ok: true, allowed: ALLOWED.length, running: running.size }));
+  }
+  const bufs = [];
+  req.on('data', (d) => bufs.push(d));
+  req.on('end', async () => {
+    const raw = Buffer.concat(bufs);
+    const u = new URL(req.url, 'http://local');
+    if (u.pathname.startsWith('/schedules')) {
+      if (!isLocal(req)) { res.writeHead(403); return res.end(); }
+      try {
+        let out;
+        if (req.method === 'GET') {
+          const cid = u.searchParams.get('chatId');
+          out = schedules.filter((s) => !cid || s.chatId === cid);
+        } else if (req.method === 'POST') {
+          out = addSchedule(JSON.parse(raw.toString('utf8') || '{}'));
+        } else if (req.method === 'DELETE') {
+          const id = u.pathname.split('/')[2];
+          const n = schedules.length;
+          schedules = schedules.filter((s) => s.id !== id);
+          if (n === schedules.length) throw new Error('id não encontrado');
+          saveSched();
+          out = { deleted: id };
+        } else throw new Error('método não suportado');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(out, null, 2));
+      } catch (e) {
+        res.writeHead(400); return res.end('erro: ' + e.message);
+      }
+    }
+    if (req.method === 'POST' && req.url === '/send') {
+      if (!isLocal(req)) { res.writeHead(403); return res.end(); }
+      try {
+        const out = await sendMessage(JSON.parse(raw.toString('utf8') || '{}'));
+        res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(out));
+      } catch (e) {
+        res.writeHead(400); return res.end('erro: ' + e.message);
+      }
+    }
+    if (req.method === 'POST' && req.url === '/send-file') {
+      if (!isLocal(req)) { res.writeHead(403); return res.end(); }
+      try {
+        await sendFile(JSON.parse(raw.toString('utf8')));
+        res.writeHead(200); return res.end('enviado');
+      } catch (e) {
+        res.writeHead(500); return res.end('erro: ' + e.message);
+      }
+    }
+    if (req.method !== 'POST' || !req.url.startsWith('/webhook')) { res.writeHead(404); return res.end(); }
+    if (WEBHOOK_HMAC_KEY) {
+      const got = String(req.headers['x-webhook-hmac'] || '');
+      const want = crypto.createHmac('sha512', WEBHOOK_HMAC_KEY).update(raw).digest('hex');
+      if (got.length !== want.length || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want))) {
+        log('rejected webhook: bad hmac');
+        res.writeHead(401); return res.end();
+      }
+    }
+    res.writeHead(200); res.end('ok');
+    let evt;
+    try { evt = JSON.parse(raw.toString('utf8')); } catch { return; }
+    if (evt.session && evt.session !== WAHA_SESSION) return;
+    if (evt.event === 'message' || evt.event === 'message.any') handleMessage(evt.payload).catch((e) => log('handle error', e.message));
+  });
+});
+
+server.listen(PORT, () => {
+  log('bridge listening on', PORT, '| session', WAHA_SESSION, '| allowed numbers', ALLOWED.length, '| mode', PERMISSION_MODE);
+  if (!ALLOWED.length) log('WARNING: ALLOWED_NUMBERS is empty, every message will be ignored');
+});

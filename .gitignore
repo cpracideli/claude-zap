@@ -1,0 +1,7 @@
+node_modules/
+.env
+coolify.env
+*.env
+docker-compose.local.yml
+test/tmp*/
+test/tmp*

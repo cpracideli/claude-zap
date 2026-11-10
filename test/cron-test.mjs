@@ -1,0 +1,30 @@
+// Waits for a minute rollover and checks that cron schedules fire (and only the matching ones).
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+const dir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'));
+const tmp = path.join(dir, 'tmp2'); fs.rmSync(tmp, { recursive: true, force: true }); fs.mkdirSync(path.join(tmp, '.bridge'), { recursive: true });
+const C = '5511999990000@c.us';
+fs.writeFileSync(path.join(tmp, '.bridge', 'chats.json'), JSON.stringify({ [C]: {} }));
+fs.writeFileSync(path.join(tmp, 'claude.mjs'), `const a=process.argv.slice(2);console.log(JSON.stringify({result:'RAN:'+a[a.indexOf('-p')+1].split('\\n')[0],session_id:'s'}))`);
+const sent = [];
+const waha = http.createServer((req, res) => { let b = ''; req.on('data', (d) => (b += d)); req.on('end', () => { if (req.url === '/api/sendText') sent.push(JSON.parse(b).text); res.end('{}'); }); }).listen(4021);
+const bridge = spawn(process.execPath, [path.join(dir, '..', 'bridge', 'bridge.mjs')], { env: { ...process.env, PORT: '4022', WAHA_URL: 'http://localhost:4021',
+  WAHA_API_KEY: 'k', WAHA_SESSION: 'S', ALLOWED_NUMBERS: '5511999990000', CLAUDE_BIN: path.join(tmp, 'claude.mjs'), HOME: tmp, SCHEDULER_TICK_MS: '1000', TZ: 'America/Sao_Paulo' }, stdio: 'ignore' });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+await sleep(800);
+const post = (b) => fetch('http://127.0.0.1:4022/schedules', { method: 'POST', body: JSON.stringify({ chatId: C, ...b }) });
+await post({ cron: '* * * * *', description: 'todo minuto', prompt: 'p1' });
+await post({ cron: '*/2 * * * *', description: 'minuto par', prompt: 'p2' });
+await post({ cron: '0 3 * * 1-5', description: 'nunca agora (3h)', prompt: 'p3' });
+const now = new Date();
+const wait = 60000 - (now.getSeconds() * 1000 + now.getMilliseconds()) + 3000;
+console.log('waiting', Math.round(wait / 1000), 's for minute rollover');
+await sleep(wait);
+const minute = new Date().getMinutes();
+console.log('minute now', minute, '(even=' + (minute % 2 === 0) + ')');
+console.log('sent:', sent);
+const ok = sent.some((s) => s.includes('todo minuto')) && (minute % 2 === 0) === sent.some((s) => s.includes('minuto par')) && !sent.some((s) => s.includes('3h'));
+console.log(ok ? 'CRON OK' : 'CRON FAIL');
+bridge.kill(); waha.close(); process.exit(0);
