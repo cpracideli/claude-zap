@@ -33,6 +33,7 @@ services:
       - CLAUDE_TIMEOUT_SECONDS=${CLAUDE_TIMEOUT_SECONDS:-1800}
       - CLAUDE_EFFORT=${CLAUDE_EFFORT}
       - TZ=${TZ:-America/Sao_Paulo}
+      - WEBHOOK_HMAC_KEY=${WEBHOOK_HMAC_KEY}
       - DISABLE_AUTOUPDATER=1
     volumes:
       - claude-home:/home/node

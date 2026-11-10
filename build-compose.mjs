@@ -40,6 +40,7 @@ const compose = `services:
       - CLAUDE_TIMEOUT_SECONDS=${D}{CLAUDE_TIMEOUT_SECONDS:-1800}
       - CLAUDE_EFFORT=${D}{CLAUDE_EFFORT}
       - TZ=${D}{TZ:-America/Sao_Paulo}
+      - WEBHOOK_HMAC_KEY=${D}{WEBHOOK_HMAC_KEY}
       - DISABLE_AUTOUPDATER=1
     volumes:
       - claude-home:/home/node
