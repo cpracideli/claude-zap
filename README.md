@@ -66,12 +66,18 @@ Click **Deploy**. The first start takes a few minutes: it installs `sudo`, basic
 
 ### 6. Connect WAHA to the bridge (webhook)
 
-1. In the WAHA dashboard, open your session's settings and add a webhook:
-   - **URL:** `http://claude-zap:3000/webhook`
-   - **Events:** `message`
-2. Save. The compose file joins the bridge to Coolify's shared `coolify` Docker network with the fixed alias `claude-zap`, so this internal URL keeps working across redeploys (Coolify appends a timestamp to the container name on every deploy, so don't use the container name).
+WAHA reaches the bridge over Coolify's internal `coolify` Docker network. Two settings make that work and keep the address stable:
 
-> WAHA must also be on the `coolify` network. Services created from Coolify templates usually are; if not, enable **Connect to Predefined Network** in WAHA's settings. Run only one claude-zap per server, or change the alias in `build-compose.mjs`.
+1. In the bridge service, open **Advanced** and set:
+   - **Predefined network:** `Connect to predefined network`
+   - **Container naming:** `Consistent name (no rolling updates)`, with **Custom container name** `claude-zap`
+2. **Redeploy** the bridge. The container is now always named `claude-bridge-claude-zap`. (Without step 1, Coolify appends a timestamp to the name on every deploy and the webhook breaks.)
+3. In the WAHA dashboard, open your session's settings and add a webhook:
+   - **URL:** `http://claude-bridge-claude-zap:3000/webhook`
+   - **Events:** `message`
+4. Save (WAHA restarts the session).
+
+> WAHA must also be on the `coolify` network (Coolify's WAHA template usually is). Make sure `WAHA_SESSION` in the bridge matches the session name exactly; events from other sessions are ignored silently.
 
 ### 7. Test it
 

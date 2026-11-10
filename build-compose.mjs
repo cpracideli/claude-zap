@@ -55,18 +55,8 @@ ${indented}
       retries: 3
       start_period: 300s
     restart: unless-stopped
-    networks:
-      default: {}
-      coolify:
-        # Stable name for the WAHA webhook: http://claude-zap:3000/webhook
-        # (Coolify adds a timestamp to the container name on every deploy).
-        aliases:
-          - claude-zap
 volumes:
   claude-home:
-networks:
-  coolify:
-    external: true
 `;
 fs.writeFileSync(path.join(dir, 'docker-compose.yml'), compose);
 fs.writeFileSync(path.join(dir, 'compose.b64'), Buffer.from(compose).toString('base64'));
