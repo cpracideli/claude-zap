@@ -188,7 +188,17 @@ The bridge code lives in this repository. `docker-compose.yml` embeds `bridge/br
 1. Edit `bridge/bridge.mjs`.
 2. Run `node build-compose.mjs` (it also refuses code that contains a `$`, which Docker Compose would try to interpolate).
 3. Run the tests (see below), commit and push.
-4. In Coolify, click **Redeploy** on the bridge.
+4. In Coolify, update the file mount, then redeploy. **Coolify does not rewrite `content:` file mounts on redeploy**: it keeps the copy it stored the first time, so a plain redeploy keeps running the old bridge. Either open the resource → **Persistent Storage** → `/app/bridge.mjs` and paste the new `bridge/bridge.mjs`, or use the API:
+
+   ```bash
+   # find the file storage uuid
+   curl -s -H "Authorization: Bearer TOKEN" https://COOLIFY/api/v1/applications/APP_UUID/storages
+   # replace its content (JSON body: {"uuid": "...", "type": "file", "content": "<bridge.mjs>"})
+   curl -s -X PATCH -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
+     https://COOLIFY/api/v1/applications/APP_UUID/storages --data @storage.json
+   ```
+
+   Then click **Redeploy**. Check `GET /health`: its `version` is a hash of the running `bridge.mjs` and must change after the update.
 
 Data (sessions, chat settings, schedules, installed tools, MCP config) lives in the `claude-home` volume and survives redeploys. Thanks to the consistent container name, the webhook keeps working.
 
@@ -222,6 +232,7 @@ To move to a new Coolify resource: create it (steps 3 to 5), deploy once so the 
 |---|---|
 | No reply at all | Check, in order: the bridge is **Running (healthy)**; the WAHA session is `WORKING`; the webhook URL is `http://claude-bridge-claude-zap:3000/webhook` with event `message`; `WAHA_SESSION` matches the session name **exactly**; you are writing **from** a number in `ALLOWED_NUMBERS` **to** the bot's number. |
 | Health check from the `coolify` network says `EAI_AGAIN` | The name does not resolve: redo step 5 (predefined network + consistent name) and redeploy. |
+| A redeploy did not change the bot's behaviour | Coolify kept the old `/app/bridge.mjs` file mount. Update it as described in [Updating](#updating) and compare the `version` in `/health`. |
 | It broke after a redeploy | Container naming went back to "Generated name". Redo step 5 and keep the webhook URL from step 7. |
 | `/help` works but questions fail | Claude is not authenticated: check `CLAUDE_CODE_OAUTH_TOKEN`, or generate a new one with `claude setup-token`. |
 | Media is not received | Your WAHA edition may not download media (needs WAHA Plus). |

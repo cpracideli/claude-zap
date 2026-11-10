@@ -27,6 +27,8 @@ const TIMEOUT_MS = Number(env.CLAUDE_TIMEOUT_SECONDS || 1800) * 1000;
 const TZ = env.TZ || 'America/Sao_Paulo';
 const MAX_CHUNK = 3500;
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+// Short hash of this file: shows in /health and in the startup log, so you can tell which code is really running.
+const VERSION = crypto.createHash('sha256').update(fs.readFileSync(new URL(import.meta.url))).digest('hex').slice(0, 12);
 
 fs.mkdirSync(INBOX, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -126,7 +128,8 @@ function liveStatus(chatId) {
   let id = null;
   let last = '';
   const ready = waha('POST', '/api/sendText', { session: WAHA_SESSION, chatId, text: '⏳ trabalhando...' })
-    .then((r) => { id = msgIdOf(r); }).catch((e) => log('status start failed', e.message));
+    .then((r) => { id = msgIdOf(r); log('status message', id ? 'started' : 'started without id (edits disabled)'); })
+    .catch((e) => log('status start failed', e.message));
   let queue = Promise.resolve();
   const push = async () => {
     await ready;
@@ -145,7 +148,10 @@ function liveStatus(chatId) {
       clearInterval(timer);
       await ready;
       await queue;
-      if (id) await waha('DELETE', msgPath(chatId, id) + '?onlyLocally=false').catch((e) => log('status delete failed', e.message));
+      if (id) {
+        await waha('DELETE', msgPath(chatId, id) + '?onlyLocally=false')
+          .then(() => log('status message deleted')).catch((e) => log('status delete failed', e.message));
+      }
     },
   };
 }
@@ -626,7 +632,7 @@ const isLocal = (req) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.s
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true, allowed: ALLOWED.length, running: running.size }));
+    return res.end(JSON.stringify({ ok: true, version: VERSION, allowed: ALLOWED.length, running: running.size }));
   }
   const bufs = [];
   req.on('data', (d) => bufs.push(d));
@@ -703,7 +709,7 @@ async function notifyStartup() {
   const text = phrases[Math.floor(Math.random() * phrases.length)];
   for (const number of ALLOWED) {
     for (let attempt = 1; attempt <= 5; attempt++) {
-      try { await sendMessage({ to: number, text, raw: true }); break; }
+      try { await sendMessage({ to: number, text, raw: true }); log('startup notice sent'); break; }
       catch (e) {
         log('startup notice to', number, 'attempt', attempt, 'failed:', e.message);
         await new Promise((r) => setTimeout(r, 15000));
@@ -713,7 +719,7 @@ async function notifyStartup() {
 }
 
 server.listen(PORT, () => {
-  log('bridge listening on', PORT, '| session', WAHA_SESSION, '| allowed numbers', ALLOWED.length, '| mode', PERMISSION_MODE);
+  log('bridge listening on', PORT, '| version', VERSION, '| session', WAHA_SESSION, '| allowed numbers', ALLOWED.length, '| mode', PERMISSION_MODE);
   if (!ALLOWED.length) log('WARNING: ALLOWED_NUMBERS is empty, every message will be ignored');
   if (env.STARTUP_NOTICE !== 'false') setTimeout(notifyStartup, 10000);
 });
