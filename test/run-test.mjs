@@ -75,8 +75,8 @@ await step('agendamento: criar cron do minuto atual + at em 2s + inválidos', as
   console.log('  chat desconhecido ->', await post({ chatId: 'x@c.us', cron: '0 8 * * *', prompt: 'x' }));
   await sleep(4000);
 });
-await step('/agenda (único já rodou e sumiu; cron mostra última execução)', () => hook('/agenda'));
-await step('/pausar e /cancelar', async () => { await hook('/pausar ' + ids.cron); await hook('/cancelar #' + ids.cron); await hook('/agenda'); });
+await step('/schedules (único já rodou e sumiu; cron mostra última execução)', () => hook('/schedules'));
+await step('/pause e /cancel', async () => { await hook('/pause ' + ids.cron); await hook('/cancel #' + ids.cron); await hook('/schedules'); });
 await step('/help', () => hook('/help'));
 console.log('\ninbox:', fs.readdirSync(path.join(tmp, 'workspace', 'inbox')));
 console.log('state:', fs.readFileSync(path.join(tmp, '.bridge', 'chats.json'), 'utf8').replace(/\s+/g, ' '));

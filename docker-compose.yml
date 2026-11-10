@@ -179,7 +179,7 @@ services:
               '  Uma vez: troque "cron" por "at":"2026-11-10T15:00:00-03:00" (ISO 8601 com fuso).',
               '  Listar: curl -s "http://127.0.0.1:' + PORT + '/schedules?chatId=' + encodeURIComponent(chatId) + '"   Remover: curl -s -X DELETE http://127.0.0.1:' + PORT + '/schedules/ID',
               '  O prompt do agendamento roda depois numa sessão NOVA, sem o contexto desta conversa: escreva-o completo (o que buscar, como formatar, o que enviar). A resposta final daquela execução é enviada automaticamente ao usuário. Confirme ao usuário o id, o horário e o que será enviado.',
-              'Comandos da ponte que o usuário pode usar: /help, /new, /status, /model, /effort, /stop, /enviar, /agenda, /pausar, /cancelar.',
+              'Comandos da ponte que o usuário pode usar: /help, /new, /status, /usage, /log, /model, /effort, /stop, /send, /schedules, /pause, /resume, /cancel.',
             ].join('\n');
           }
 
@@ -203,7 +203,7 @@ services:
               child.on('error', (e) => done({ error: e.message }));
               child.on('close', (code, signal) => {
                 if (signal && !timedOut) return done({ stopped: true });
-                if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido' });
+                if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
                 try {
                   const j = JSON.parse(out);
                   done({ text: j.result || '', sessionId: j.session_id, isError: j.is_error,
@@ -230,18 +230,39 @@ services:
 
           const fmtDur = (ms) => (ms >= 60000 ? Math.round(ms / 60000) + ' min' : Math.round(ms / 1000) + ' s');
 
+          // ---------- run history, usage and audit ----------
+          const AUDIT_FILE = path.join(DATA_DIR, 'audit.log');
+          function audit(entry) {
+            try { fs.appendFileSync(AUDIT_FILE, JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n'); }
+            catch (e) { log('audit write failed', e.message); }
+          }
+          // Keeps the last 20 runs per chat (for /log) and running totals (for /usage).
+          function recordRun(chatId, entry) {
+            const c = chat(chatId);
+            c.runs = [...(c.runs || []), { at: new Date().toISOString(), ...entry }].slice(-20);
+            c.totals = c.totals || { runs: 0, cost: 0, ms: 0, errors: 0 };
+            c.totals.runs += 1;
+            c.totals.cost += entry.cost || 0;
+            c.totals.ms += entry.ms || 0;
+            if (entry.error) c.totals.errors += 1;
+            save();
+          }
+
           // ---------- commands (answered immediately, outside the queue) ----------
           const HELP = [
             '*Comandos*',
             '/new: começa uma conversa nova (mantém modelo e esforço)',
-            '/status: sessão, modelo, tarefa em andamento e último uso',
-            '/model [opus|sonnet|haiku|fable|<id>|padrao]: troca o modelo desta conversa (fica salvo)',
-            '/effort [low|medium|high|xhigh|max|padrao]: nível de esforço (fica salvo)',
+            '/status: sessão, modelo, tarefa em andamento e totais',
+            '/log [n]: últimas n execuções (padrão 5) com horário, duração, custo e erros',
+            '/usage: total de execuções, tempo e custo desta conversa',
+            '/model [opus|sonnet|haiku|fable|<id>|default]: troca o modelo desta conversa (fica salvo)',
+            '/effort [low|medium|high|xhigh|max|default]: nível de esforço (fica salvo)',
             '/stop: interrompe a tarefa em andamento',
-            '/enviar <número> <mensagem>: manda uma mensagem para outro número (direto, sem passar pelo Claude)',
-            '/agenda: lista os agendamentos',
-            '/pausar <id>: pausa ou retoma um agendamento',
-            '/cancelar <id>: remove um agendamento',
+            '/send <número> <mensagem>: manda uma mensagem para outro número (direto, sem passar pelo Claude)',
+            '/schedules: lista os agendamentos',
+            '/pause <id>: pausa ou retoma um agendamento',
+            '/resume <id>: retoma um agendamento pausado',
+            '/cancel <id>: remove um agendamento',
             '/help: esta lista',
             'Para agendar, peça em linguagem natural: "todo dia às 8h me mande a previsão do tempo".',
             'Qualquer outro texto vai para o Claude Code. Imagens, áudios e documentos são salvos em inbox/ e o caminho é passado ao Claude.',
@@ -252,34 +273,35 @@ services:
             const cmd = cmdRaw.toLowerCase();
             const arg = rest.join(' ').trim();
             const c = chat(chatId);
-            const isDefault = (a) => ['padrao', 'padrão', 'default', 'reset'].includes(a.toLowerCase());
+            const isDefault = (a) => ['default', 'padrao', 'padrão', 'reset'].includes(a.toLowerCase());
             switch (cmd) {
-              case '/help': case '/ajuda': return reply(chatId, HELP, true);
-              case '/new': case '/reset': case '/nova':
+              case '/help': return reply(chatId, HELP, true);
+              case '/new':
                 delete c.session; save();
                 return reply(chatId, 'Nova conversa iniciada. Modelo: ' + (c.model || DEFAULT_MODEL || 'padrão') + '.', true);
-              case '/model': case '/modelo':
-                if (!arg) return reply(chatId, 'Modelo atual: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Use /model opus, /model sonnet, /model haiku ou /model padrao.', true);
+              case '/model':
+                if (!arg) return reply(chatId, 'Modelo atual: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Use /model opus, /model sonnet, /model haiku ou /model default.', true);
                 if (isDefault(arg)) delete c.model; else c.model = arg;
                 save();
                 return reply(chatId, 'Modelo desta conversa: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Vale a partir da próxima mensagem.', true);
-              case '/effort': case '/esforco': case '/esforço':
-                if (!arg) return reply(chatId, 'Esforço atual: ' + (c.effort || DEFAULT_EFFORT || 'padrão') + '. Opções: ' + EFFORTS.join(', ') + ', padrao.', true);
+              case '/effort':
+                if (!arg) return reply(chatId, 'Esforço atual: ' + (c.effort || DEFAULT_EFFORT || 'padrão') + '. Opções: ' + EFFORTS.join(', ') + ', default.', true);
                 if (isDefault(arg)) delete c.effort;
                 else if (EFFORTS.includes(arg.toLowerCase())) c.effort = arg.toLowerCase();
-                else return reply(chatId, 'Nível inválido. Opções: ' + EFFORTS.join(', ') + ', padrao.', true);
+                else return reply(chatId, 'Nível inválido. Opções: ' + EFFORTS.join(', ') + ', default.', true);
                 save();
                 return reply(chatId, 'Esforço desta conversa: ' + (c.effort || DEFAULT_EFFORT || 'padrão') + '.', true);
-              case '/stop': case '/parar': {
+              case '/stop': {
                 const r = running.get(chatId);
                 if (!r) return reply(chatId, 'Nada em andamento.', true);
                 r.child.kill('SIGTERM');
                 return reply(chatId, 'Interrompido após ' + fmtDur(Date.now() - r.started) + '. A conversa continua; mande a próxima mensagem.', true);
               }
-              case '/status': case '/ping': {
+              case '/status': {
                 const r = running.get(chatId);
                 const q = Math.max(0, (pending.get(chatId) || 0) - (r ? 1 : 0));
                 const u = c.lastUsage;
+                const t = c.totals;
                 return reply(chatId, [
                   '*Status*',
                   'Sessão: ' + (c.session ? c.session.slice(0, 8) : 'nenhuma (próxima mensagem inicia uma)'),
@@ -288,27 +310,50 @@ services:
                   r ? 'Em andamento há ' + fmtDur(Date.now() - r.started) + ': "' + r.prompt + '"' : 'Ocioso',
                   q ? 'Na fila: ' + q : '',
                   u ? 'Última resposta: ' + fmtDur(u.ms || 0) + ', ' + (u.turns || 0) + ' passos' : '',
+                  t ? 'Total: ' + t.runs + ' execuções, ' + t.errors + ' com erro (use /usage para detalhes)' : '',
                 ].filter(Boolean).join('\n'), true);
               }
-              case '/enviar': case '/send': case '/msg': {
+              case '/usage': {
+                const t = c.totals || { runs: 0, cost: 0, ms: 0, errors: 0 };
+                return reply(chatId, [
+                  '*Uso desta conversa*',
+                  'Execuções: ' + t.runs + ' (com erro: ' + t.errors + ')',
+                  'Tempo total: ' + fmtDur(t.ms),
+                  'Custo estimado: USD ' + t.cost.toFixed(4),
+                ].join('\n'), true);
+              }
+              case '/log': {
+                const n = Math.min(Math.max(parseInt(arg, 10) || 5, 1), 20);
+                const runs = (c.runs || []).slice(-n).reverse();
+                if (!runs.length) return reply(chatId, 'Nenhuma execução nesta conversa ainda.', true);
+                const lines = runs.map((r) => fmtDate(r.at) + ' · ' + (r.error ? 'erro' : 'ok') + ' · ' + fmtDur(r.ms || 0) +
+                  (r.cost ? ' · USD ' + r.cost.toFixed(4) : '') + '\n   "' + r.prompt + '"' +
+                  (r.error ? '\n   ' + String(r.error).slice(0, 200) : ''));
+                return reply(chatId, '*Últimas ' + runs.length + ' execuções*\n' + lines.join('\n'), true);
+              }
+              case '/send': {
                 const argRaw = body.trim().slice(cmdRaw.length).trim();
                 const m = argRaw.match(/^(\S+@\S+|\+?\d[\d().-]*(?:\s\d[\d().-]*)*)\s+([\s\S]+)/);
-                if (!m) return reply(chatId, 'Uso: /enviar <número> <mensagem>\nEx.: /enviar +55 11 99999-8888 oi, tudo bem?', true);
+                if (!m) return reply(chatId, 'Uso: /send <número> <mensagem>\nEx.: /send +55 11 99999-8888 oi, tudo bem?', true);
                 try {
                   const out = await sendMessage({ to: m[1], text: m[2] });
                   return reply(chatId, 'Enviado para ' + out.chatId.split('@')[0] + '.', true);
                 } catch (e) { return reply(chatId, 'Não enviado: ' + e.message, true); }
               }
-              case '/agenda': case '/agendamentos': {
+              case '/schedules': {
                 const mine = schedules.filter((s) => s.chatId === chatId);
                 if (!mine.length) return reply(chatId, 'Nenhum agendamento. Peça em linguagem natural, ex.: "todo dia às 8h me mande a previsão do tempo".', true);
                 return reply(chatId, '*Agendamentos* (fuso ' + TZ + ')\n' + mine.map(describe).join('\n'), true);
               }
-              case '/cancelar': case '/pausar': case '/retomar': {
+              case '/cancel': case '/pause': case '/resume': {
                 const s = schedules.find((x) => x.chatId === chatId && x.id === arg.replace('#', ''));
-                if (!s) return reply(chatId, 'Agendamento não encontrado. Veja os ids com /agenda.', true);
-                if (cmd === '/cancelar') { schedules = schedules.filter((x) => x !== s); saveSched(); return reply(chatId, 'Agendamento #' + s.id + ' removido.', true); }
-                s.paused = cmd === '/retomar' ? false : !s.paused; saveSched();
+                if (!s) return reply(chatId, 'Agendamento não encontrado. Veja os ids com /schedules.', true);
+                if (cmd === '/cancel') {
+                  schedules = schedules.filter((x) => x !== s); saveSched();
+                  audit({ action: 'schedule-delete', chatId, id: s.id });
+                  return reply(chatId, 'Agendamento #' + s.id + ' removido.', true);
+                }
+                s.paused = cmd === '/resume' ? false : !s.paused; saveSched();
                 return reply(chatId, 'Agendamento #' + s.id + (s.paused ? ' pausado.' : ' ativo.'), true);
               }
               default: return null; // not a bridge command: goes to Claude (e.g. /compact or custom slash commands)
@@ -382,17 +427,25 @@ services:
               typing();
               const keepTyping = setInterval(typing, 20000);
               const opts = { model: c.model || DEFAULT_MODEL, effort: c.effort || DEFAULT_EFFORT, resume: c.session };
+              const started = Date.now();
               let r = await runClaude(chatId, body, opts);
-              if (r.error && c.session && !r.stopped) {
+              // Retry from a fresh session only when resuming the old one failed. Not on timeouts or user stops:
+              // re-running a timed-out task from scratch would run it twice and could repeat side effects.
+              if (r.error && c.session && !r.stopped && !r.timedOut) {
                 log('resume failed, starting fresh:', r.error);
                 delete c.session;
                 r = await runClaude(chatId, body, { ...opts, resume: undefined });
               }
               clearInterval(keepTyping);
               waha('POST', '/api/stopTyping', { session: WAHA_SESSION, chatId }).catch(() => {});
-              if (r.stopped) return;
+              if (r.stopped) {
+                recordRun(chatId, { prompt: body.slice(0, 80), ms: Date.now() - started, error: 'interrompido pelo usuário' });
+                return;
+              }
               if (r.sessionId) c.session = r.sessionId;
               if (r.usage) c.lastUsage = r.usage;
+              recordRun(chatId, { prompt: body.slice(0, 80), ms: r.usage ? r.usage.ms : Date.now() - started,
+                cost: r.usage ? r.usage.cost : 0, error: r.error });
               save();
               await reply(chatId, r.error ? 'Erro ao executar o Claude Code: ' + r.error : r.text, Boolean(r.error));
             });
@@ -460,6 +513,7 @@ services:
               s.at = t.toISOString();
             } else throw new Error('informe cron (recorrente) ou at (uma vez)');
             schedules.push(s); saveSched();
+            audit({ action: 'schedule-add', chatId: s.chatId, id: s.id, cron: s.cron || null, at: s.at || null, description: s.description });
             return s;
           }
           const fmtDate = (iso) => new Date(iso).toLocaleString('pt-BR', { timeZone: TZ, dateStyle: 'short', timeStyle: 'short' });
@@ -472,8 +526,11 @@ services:
               log('running schedule', s.id);
               const prompt = '[Tarefa agendada #' + s.id + ': ' + s.description + ']\n' +
                 'Execute agora. Sua resposta final será enviada ao usuário pelo WhatsApp como a mensagem desta tarefa.\n\n' + s.prompt;
+              const started = Date.now();
               const r = await runClaude(s.chatId, prompt, { model: c.model || DEFAULT_MODEL, effort: c.effort || DEFAULT_EFFORT });
               if (r.stopped) return;
+              recordRun(s.chatId, { prompt: '[agendamento #' + s.id + '] ' + s.description.slice(0, 60),
+                ms: r.usage ? r.usage.ms : Date.now() - started, cost: r.usage ? r.usage.cost : 0, error: r.error });
               await reply(s.chatId, r.error ? '⏰ Falha na tarefa agendada #' + s.id + ': ' + r.error : '⏰ ' + r.text, Boolean(r.error));
             });
           }
@@ -523,6 +580,7 @@ services:
               await waha('POST', '/api/sendText', { session: WAHA_SESSION, chatId, text: part });
             }
             log('sent message to', chatId);
+            audit({ action: 'send', to: chatId, chars: String(text).length, preview: String(text).slice(0, 80) });
             return { sent: true, chatId };
           }
 
@@ -542,7 +600,9 @@ services:
             const mimetype = types[ext] || 'application/octet-stream';
             const file = { mimetype, filename: path.basename(abs), data };
             const endpoint = mimetype.startsWith('image/') ? '/api/sendImage' : '/api/sendFile';
-            return waha('POST', endpoint, { session: WAHA_SESSION, chatId, file, caption: caption || undefined });
+            const result = await waha('POST', endpoint, { session: WAHA_SESSION, chatId, file, caption: caption || undefined });
+            audit({ action: 'send-file', to: chatId, file: abs, bytes: fs.statSync(abs).size, caption: caption || null });
+            return result;
           }
 
           // ---------- HTTP ----------
@@ -572,6 +632,7 @@ services:
                     schedules = schedules.filter((s) => s.id !== id);
                     if (n === schedules.length) throw new Error('id não encontrado');
                     saveSched();
+                    audit({ action: 'schedule-delete', id, via: 'api' });
                     out = { deleted: id };
                   } else throw new Error('método não suportado');
                   res.writeHead(200, { 'Content-Type': 'application/json' });

@@ -26,8 +26,8 @@ console.log('grupo        ->', await p('/send', { to: '1203@g.us', text: 'oi' })
 console.log('file to      ->', await p('/send-file', { to: '5511900000000', path: 'a.pdf' }));
 console.log('file chat ?? ->', await p('/send-file', { chatId: 'x@c.us', path: 'a.pdf' }));
 const hook = async (body) => { await fetch('http://127.0.0.1:4032/webhook', { method: 'POST', body: JSON.stringify({ event: 'message', session: 'S', payload: { id: 'm' + Math.random(), from: '5511999990000@c.us', fromMe: false, body } }) }); await new Promise((r) => setTimeout(r, 400)); };
-await hook('/enviar +55 11 99402-6755 oi, tudo bem?\nlinha 2');
-await hook('/enviar 5500123456789 oi');
-await hook('/enviar oi');
+await hook('/send +55 11 99402-6755 oi, tudo bem?\nlinha 2');
+await hook('/send 5500123456789 oi');
+await hook('/send oi');
 calls.forEach((c) => console.log('  waha:', c));
 bridge.kill(); waha.close(); process.exit(0);

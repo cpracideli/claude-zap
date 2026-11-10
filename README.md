@@ -129,18 +129,23 @@ From **your own** WhatsApp (a number in `ALLOWED_NUMBERS`), send `/help` to the 
 | `/new` | Starts a fresh conversation (keeps the model and effort). |
 | `/model opus` (`sonnet`, `haiku`, `padrao`) | Changes the model for this chat. Saved. |
 | `/effort high` (`low` … `max`, `padrao`) | Changes the effort level for this chat. Saved. |
-| `/status` | Session, model, what is running, queue. |
+| `/status` | Session, model, what is running, queue, totals. |
+| `/usage` | Total runs, errors, time and estimated cost for this chat. |
+| `/log [n]` | Last *n* runs (default 5, max 20) with time, duration, cost and errors. |
 | `/stop` | Interrupts the current task. The conversation continues. |
-| `/enviar +55 11 99999-8888 hello` | Sends a WhatsApp message to another number, directly from the bridge. |
-| `/agenda` | Lists scheduled tasks. |
-| `/pausar <id>` / `/cancelar <id>` | Pauses (toggles) or deletes a scheduled task. |
+| `/send +55 11 99999-8888 hello` | Sends a WhatsApp message to another number, directly from the bridge. |
+| `/schedules` | Lists scheduled tasks. |
+| `/pause <id>` / `/resume <id>` | Pauses (toggles) or resumes a scheduled task. |
+| `/cancel <id>` | Deletes a scheduled task. |
 | `/help` | Lists the commands. |
+
+Commands are in English. The old Portuguese names (`/enviar`, `/agenda`, `/pausar`, `/cancelar`, `/esforco`, ...) were removed.
 
 The bot answers in Brazilian Portuguese by default (see `systemPrompt()` in `bridge/bridge.mjs` to change it).
 
 **Scheduling** works in plain language: "every day at 8am send me the top AI news" or "remind me tomorrow at 3pm to call John". Claude creates the schedule through the bridge; results arrive prefixed with ⏰.
 
-**Messaging others:** ask Claude ("tell +55 11 98888-7777 I'm 10 minutes late") or use `/enviar`. Messages go out from the bot's number. Replies from that person do not reach Claude.
+**Messaging others:** ask Claude ("tell +55 11 98888-7777 I'm 10 minutes late") or use `/send`. Messages go out from the bot's number. Replies from that person do not reach Claude.
 
 **Installing tools:** ask Claude to install anything ("install the Playwright MCP"). It has passwordless `sudo`. New MCP servers are available from the next message.
 
@@ -171,6 +176,7 @@ The bot answers in Brazilian Portuguese by default (see `systemPrompt()` in `bri
 - **Access control is the number allowlist.** Messages from numbers not in `ALLOWED_NUMBERS`, from groups, channels and statuses are ignored. Whoever controls an allowed number controls the bot.
 - **The webhook is internal.** It is reached over the private `coolify` Docker network. Do not add a public domain to the bridge unless you also set `WEBHOOK_HMAC_KEY` (in the bridge's environment and as the HMAC key in WAHA).
 - **Internal endpoints** (`/send`, `/send-file`, `/schedules`) only accept connections from `127.0.0.1`, so only processes inside the container can use them.
+- **Audit log:** every outgoing message, file sent, and schedule created or deleted is appended to `~/.bridge/audit.log` (JSON lines, in the `claude-home` volume). It records what was sent and to whom, not a full copy of files.
 - **Secrets live only in Coolify**, never in the repository. Rotate any token that was ever pasted in a chat or a log: run `claude setup-token` again, change the WAHA API key, and regenerate Coolify API tokens.
 
 ---
@@ -219,7 +225,7 @@ To move to a new Coolify resource: create it (steps 3 to 5), deploy once so the 
 | It broke after a redeploy | Container naming went back to "Generated name". Redo step 5 and keep the webhook URL from step 7. |
 | `/help` works but questions fail | Claude is not authenticated: check `CLAUDE_CODE_OAUTH_TOKEN`, or generate a new one with `claude setup-token`. |
 | Media is not received | Your WAHA edition may not download media (needs WAHA Plus). |
-| Schedules do not fire | Check `TZ`; send `/agenda` to confirm the schedule exists; look for `running schedule` in the logs. |
+| Schedules do not fire | Check `TZ`; send `/schedules` to confirm the schedule exists; look for `running schedule` in the logs. |
 | Playwright or Chromium missing | Ask the bot to install it; `sudo` works and browser files persist in `/home/node`. |
 
 The bridge logs (Coolify → resource → **Logs**) show rejected and ignored messages.
@@ -233,7 +239,7 @@ No dependencies: plain Node.js 22.
 ```bash
 node test/run-test.mjs     # fake WAHA + fake Claude: commands, queue, media, schedules
 node test/cron-test.mjs    # waits for a minute boundary and checks cron matching
-node test/send-test.mjs    # sending to other numbers, /enviar, files
+node test/send-test.mjs    # sending to other numbers, /send, files
 node build-compose.mjs     # regenerate docker-compose.yml from bridge/bridge.mjs
 ```
 
