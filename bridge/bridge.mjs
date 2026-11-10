@@ -692,7 +692,23 @@ const server = http.createServer((req, res) => {
   });
 });
 
+// Tell each allowed number that the service is up. Retries, because WAHA may not be ready right after boot.
+async function notifyStartup() {
+  const text = '✅ Serviço no ar. Claude Code está pronto para receber mensagens (' +
+    new Date().toLocaleString('pt-BR', { timeZone: TZ }) + ').';
+  for (const number of ALLOWED) {
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      try { await sendMessage({ to: number, text, raw: true }); break; }
+      catch (e) {
+        log('startup notice to', number, 'attempt', attempt, 'failed:', e.message);
+        await new Promise((r) => setTimeout(r, 15000));
+      }
+    }
+  }
+}
+
 server.listen(PORT, () => {
   log('bridge listening on', PORT, '| session', WAHA_SESSION, '| allowed numbers', ALLOWED.length, '| mode', PERMISSION_MODE);
   if (!ALLOWED.length) log('WARNING: ALLOWED_NUMBERS is empty, every message will be ignored');
+  if (env.STARTUP_NOTICE !== 'false') setTimeout(notifyStartup, 10000);
 });
