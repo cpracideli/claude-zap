@@ -737,8 +737,13 @@ services:
 
           // Tell each allowed number that the service is up. Retries, because WAHA may not be ready right after boot.
           async function notifyStartup() {
-            const text = '✅ Serviço no ar. Claude Code está pronto para receber mensagens (' +
-              new Date().toLocaleString('pt-BR', { timeZone: TZ }) + ').';
+            // Natural, varied wording. Only sent to ALLOWED_NUMBERS, never to anyone else.
+            const phrases = [
+              'Oi! Aqui é o Claude. O serviço acabou de subir e já está pronto para uso.',
+              'Olá, tudo certo por aqui. O serviço já está no ar e disponível para você mandar mensagens.',
+              'Oi, só avisando que o serviço voltou e já está pronto para uso.',
+            ];
+            const text = phrases[Math.floor(Math.random() * phrases.length)];
             for (const number of ALLOWED) {
               for (let attempt = 1; attempt <= 5; attempt++) {
                 try { await sendMessage({ to: number, text, raw: true }); break; }
