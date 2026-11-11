@@ -18,6 +18,8 @@ const ALLOWED = String(env.ALLOWED_NUMBERS || '').split(/[,;\n]+/).map((n) => n.
 const CLAUDE_BIN = env.CLAUDE_BIN || 'claude';
 const AGY_BIN = env.AGY_BIN || path.join(env.HOME || '/tmp', '.local', 'bin', 'agy');
 const PROVIDERS = { claude: 'Claude Code', antigravity: 'Antigravity' };
+// Claude keeps its memory notes here; Antigravity gets the same folder so it can read them too.
+const MEMORY_DIR = env.MEMORY_DIR || path.join(env.HOME || '/tmp', '.claude', 'projects', '-home-node-workspace', 'memory');
 const WORKDIR = env.CLAUDE_WORKDIR || path.join(env.HOME || '/tmp', 'workspace');
 const INBOX = path.join(WORKDIR, 'inbox');
 const DATA_DIR = env.DATA_DIR || path.join(env.HOME || '/tmp', '.bridge');
@@ -243,6 +245,7 @@ function runClaude(chatId, prompt, opts, onActivity) {
 function runAntigravity(chatId, prompt, opts) {
   return new Promise((resolve) => {
     const args = ['-p', prompt, '--output-format', 'json'];
+    if (fs.existsSync(MEMORY_DIR)) args.push('--add-dir', MEMORY_DIR);
     if (PERMISSION_MODE === 'bypassPermissions') args.push('--dangerously-skip-permissions');
     if (opts.model) args.push('--model', opts.model);
     if (opts.effort) args.push('--effort', opts.effort);
@@ -272,12 +275,25 @@ function runAntigravity(chatId, prompt, opts) {
   });
 }
 
+// Instructions for Antigravity: the same bridge rules as Claude, plus where memory and tools are.
+function antigravityPrompt(chatId) {
+  const memory = fs.existsSync(MEMORY_DIR)
+    ? 'Memória do Caio: leia primeiro o arquivo MEMORY.md na pasta ' + MEMORY_DIR + ' e abra os arquivos que forem relevantes para o pedido. Lá estão os dados de contato, acessos e preferências.'
+    : 'Não há pasta de memória configurada.';
+  return [
+    systemPrompt(chatId),
+    memory,
+    'Você é o Antigravity respondendo pela ponte. Use as mesmas credenciais e ferramentas do ambiente: GitHub (gh já autenticado), Coolify, WAHA, Gmail e os scripts em ~/bin. Os arquivos de acesso ficam em ~/.config.',
+    'Para instalar servidores MCP neste agente, use: agy mcp add -- <nome> <comando> (ou a URL, para servidores HTTP). Não use o comando claude mcp.',
+  ].join('\n\n');
+}
+
 // One entry point for chat jobs and schedules: runs the provider chosen for this chat.
 function runAgent(chatId, prompt, opts, onActivity) {
   const c = chat(chatId);
   if (c.provider === 'antigravity') {
     const first = !opts.resume;
-    const text = first ? systemPrompt(chatId) + '\n\n---\n\n' + prompt : prompt;
+    const text = first ? antigravityPrompt(chatId) + '\n\n---\n\n' + prompt : prompt;
     return runAntigravity(chatId, text, { model: c.agyModel || '', effort: c.effort || DEFAULT_EFFORT, resume: opts.resume });
   }
   return runClaude(chatId, prompt, opts, onActivity);
