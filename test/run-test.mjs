@@ -78,6 +78,9 @@ await step('agendamento: criar cron do minuto atual + at em 2s + inválidos', as
 await step('/schedules (único já rodou e sumiu; cron mostra última execução)', () => hook('/schedules'));
 await step('/pause e /cancel', async () => { await hook('/pause ' + ids.cron); await hook('/cancel #' + ids.cron); await hook('/schedules'); });
 await step('/help', () => hook('/help'));
+await step('/model sem argumento (menu numerado, pois o WAHA falso nao cria enquete) e resposta 2', async () => { await hook('/model'); await hook('2'); });
+await step('/help e resposta 1 (status)', async () => { await hook('/help'); await hook('1'); });
+await step('numero fora de menu vai para o Claude', () => hook('7'));
 console.log('\ninbox:', fs.readdirSync(path.join(tmp, 'workspace', 'inbox')));
 console.log('state:', fs.readFileSync(path.join(tmp, '.bridge', 'chats.json'), 'utf8').replace(/\s+/g, ' '));
 bridge.kill(); waha.close(); process.exit(0);

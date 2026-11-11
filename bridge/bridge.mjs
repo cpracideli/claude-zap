@@ -269,7 +269,7 @@ function recordRun(chatId, entry) {
 
 // ---------- commands (answered immediately, outside the queue) ----------
 const HELP = [
-  '*Comandos*',
+  '*Todos os comandos*',
   '/new: começa uma conversa nova (mantém modelo e esforço)',
   '/status: sessão, modelo, tarefa em andamento e totais',
   '/log [n]: últimas n execuções (padrão 5) com horário, duração, custo e erros',
@@ -287,6 +287,59 @@ const HELP = [
   'Qualquer outro texto vai para o Claude Code. Imagens, áudios e documentos são salvos em inbox/ e o caminho é passado ao Claude.',
 ].join('\n');
 
+// ---------- tap-to-choose: WhatsApp polls, with a numbered menu as fallback ----------
+// Buttons and list messages only work on the official WhatsApp Business API; polls work on WAHA Core.
+const MODEL_CHOICES = [['Opus', '/model opus'], ['Sonnet', '/model sonnet'], ['Haiku', '/model haiku'], ['Fable', '/model fable'], ['Padrão da conta', '/model default']];
+const EFFORT_CHOICES = [['low', '/effort low'], ['medium', '/effort medium'], ['high', '/effort high'], ['xhigh', '/effort xhigh'], ['max', '/effort max'], ['Padrão', '/effort default']];
+const HELP_MENU = [['Status', '/status'], ['Nova conversa', '/new'], ['Trocar modelo', '/model'], ['Trocar esforço', '/effort'],
+  ['Uso e custo', '/usage'], ['Últimas execuções', '/log'], ['Agendamentos', '/schedules'], ['Interromper tarefa', '/stop']];
+const MENU_TTL = 120000;
+const menus = new Map();  // chatId -> { at, options: [command] }   numbered menu waiting for a "1", "2"...
+const polls = new Map();  // poll message id (last segment) -> { chatId, options: { label: command } }
+const pollKey = (id) => String(id || '').split('_').pop();
+
+async function sendMenu(chatId, title, choices, footer) {
+  menus.set(chatId, { at: Date.now(), options: choices.map((x) => x[1]) });
+  const lines = choices.map((x, i) => (i + 1) + '. ' + x[0]);
+  return reply(chatId, '*' + title + '*\n' + lines.join('\n') + '\n\nResponda com o número.' + (footer ? '\n\n' + footer : ''), true);
+}
+
+async function sendChoice(chatId, title, choices) {
+  try {
+    const r = await waha('POST', '/api/sendPoll', { session: WAHA_SESSION, chatId,
+      poll: { name: title, options: choices.map((x) => x[0]), multipleAnswers: false } });
+    const id = msgIdOf(r);
+    if (!id) throw new Error('poll sem id');
+    polls.set(pollKey(id), { chatId, options: Object.fromEntries(choices) });
+    if (polls.size > 200) polls.delete(polls.keys().next().value);
+    return;
+  } catch (e) {
+    log('poll failed, using numbered menu:', e.message);
+  }
+  return sendMenu(chatId, title, choices);
+}
+
+// A vote on one of our polls runs the matching command, as if it had been typed.
+const seenVotes = new Set();
+async function handlePollVote(payload) {
+  const vote = payload && payload.vote;
+  const poll = payload && payload.poll;
+  if (!vote || !poll || vote.fromMe) return;
+  const picked = (vote.selectedOptions || [])[0];
+  if (!picked) return; // vote removed
+  const entry = polls.get(pollKey(poll.id));
+  if (!entry) return log('vote on unknown poll ignored');
+  const voteKey = String(vote.id || '') + '|' + picked;
+  if (seenVotes.has(voteKey)) return;
+  seenVotes.add(voteKey); if (seenVotes.size > 2000) seenVotes.clear();
+  const number = await senderNumber({ from: vote.from, participant: vote.participant, _data: vote._data });
+  if (!ALLOWED.includes(number)) return log('ignored vote from non-allowed sender');
+  const cmd = entry.options[picked];
+  if (!cmd) return;
+  log('poll vote ->', cmd);
+  await command(entry.chatId, cmd);
+}
+
 async function command(chatId, body) {
   const [cmdRaw, ...rest] = body.trim().split(/\s+/);
   const cmd = cmdRaw.toLowerCase();
@@ -294,17 +347,17 @@ async function command(chatId, body) {
   const c = chat(chatId);
   const isDefault = (a) => ['default', 'padrao', 'padrão', 'reset'].includes(a.toLowerCase());
   switch (cmd) {
-    case '/help': return reply(chatId, HELP, true);
+    case '/help': return sendMenu(chatId, 'O que você quer fazer?', HELP_MENU, HELP);
     case '/new':
       delete c.session; save();
       return reply(chatId, 'Nova conversa iniciada. Modelo: ' + (c.model || DEFAULT_MODEL || 'padrão') + '.', true);
     case '/model':
-      if (!arg) return reply(chatId, 'Modelo atual: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Use /model opus, /model sonnet, /model haiku ou /model default.', true);
+      if (!arg) return sendChoice(chatId, 'Modelo atual: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Escolha o novo:', MODEL_CHOICES);
       if (isDefault(arg)) delete c.model; else c.model = arg;
       save();
       return reply(chatId, 'Modelo desta conversa: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Vale a partir da próxima mensagem.', true);
     case '/effort':
-      if (!arg) return reply(chatId, 'Esforço atual: ' + (c.effort || DEFAULT_EFFORT || 'padrão') + '. Opções: ' + EFFORTS.join(', ') + ', default.', true);
+      if (!arg) return sendChoice(chatId, 'Esforço atual: ' + (c.effort || DEFAULT_EFFORT || 'padrão') + '. Escolha o novo:', EFFORT_CHOICES);
       if (isDefault(arg)) delete c.effort;
       else if (EFFORTS.includes(arg.toLowerCase())) c.effort = arg.toLowerCase();
       else return reply(chatId, 'Nível inválido. Opções: ' + EFFORTS.join(', ') + ', default.', true);
@@ -410,6 +463,14 @@ async function handleMessage(msg) {
   }
   waha('POST', '/api/sendSeen', { session: WAHA_SESSION, chatId }).catch(() => {});
   let body = String(msg.body || '').trim();
+
+  // A bare number answers a numbered menu sent in the last 2 minutes; anything else cancels the menu.
+  const menu = menus.get(chatId);
+  if (menu) {
+    menus.delete(chatId);
+    const n = body.length <= 2 && /^\d+(?![\s\S])/.test(body) ? Number(body) : 0;
+    if (Date.now() - menu.at < MENU_TTL && n >= 1 && n <= menu.options.length) body = menu.options[n - 1];
+  }
 
   if (body.startsWith('/')) {
     const handled = await command(chatId, body);
@@ -695,6 +756,7 @@ const server = http.createServer((req, res) => {
     try { evt = JSON.parse(raw.toString('utf8')); } catch { return; }
     if (evt.session && evt.session !== WAHA_SESSION) return;
     if (evt.event === 'message' || evt.event === 'message.any') handleMessage(evt.payload).catch((e) => log('handle error', e.message));
+    if (evt.event === 'poll.vote') handlePollVote(evt.payload).catch((e) => log('vote error', e.message));
   });
 });
 

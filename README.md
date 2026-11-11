@@ -110,7 +110,7 @@ Expected: `{"ok":true,"allowed":1,"running":0}`. (`curl` is not in this image, s
 1. Open the WAHA dashboard → **Sessions** → click the gear icon of **your bot's session**.
 2. Scroll to **Webhooks** and add (or edit) one:
    - **URL:** `http://claude-bridge-claude-zap:3000/webhook`
-   - **Events:** `message`
+   - **Events:** `message` and `poll.vote` (the second one lets `/model` and `/effort` be answered by tapping a poll option)
    - Leave HMAC and custom headers empty.
 3. Click **Update**. WAHA restarts the session; wait until it is `WORKING` again.
 
@@ -137,7 +137,7 @@ From **your own** WhatsApp (a number in `ALLOWED_NUMBERS`), send `/help` to the 
 | `/schedules` | Lists scheduled tasks. |
 | `/pause <id>` / `/resume <id>` | Pauses (toggles) or resumes a scheduled task. |
 | `/cancel <id>` | Deletes a scheduled task. |
-| `/help` | Lists the commands. |
+| `/help` | Shows a numbered menu of the common commands (reply with the number) and the full command list. |
 
 Commands are in English. The old Portuguese names (`/enviar`, `/agenda`, `/pausar`, `/cancelar`, `/esforco`, ...) were removed.
 
