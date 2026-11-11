@@ -16,6 +16,8 @@ const WAHA_SESSION = env.WAHA_SESSION || 'default';
 const WEBHOOK_HMAC_KEY = env.WEBHOOK_HMAC_KEY || '';
 const ALLOWED = String(env.ALLOWED_NUMBERS || '').split(/[,;\n]+/).map((n) => n.replace(/\D/g, '')).filter(Boolean);
 const CLAUDE_BIN = env.CLAUDE_BIN || 'claude';
+const AGY_BIN = env.AGY_BIN || path.join(env.HOME || '/tmp', '.local', 'bin', 'agy');
+const PROVIDERS = { claude: 'Claude Code', antigravity: 'Antigravity' };
 const WORKDIR = env.CLAUDE_WORKDIR || path.join(env.HOME || '/tmp', 'workspace');
 const INBOX = path.join(WORKDIR, 'inbox');
 const DATA_DIR = env.DATA_DIR || path.join(env.HOME || '/tmp', '.bridge');
@@ -234,6 +236,53 @@ function runClaude(chatId, prompt, opts, onActivity) {
   });
 }
 
+// ---------- Antigravity (agy) provider ----------
+// Runs `agy -p` in print mode. It keeps its own conversations (--conversation <id>), so each chat stores
+// the agy conversation id separately from the Claude session. The bridge's instructions are sent in the
+// first prompt of a new agy conversation, because agy has no --append-system-prompt.
+function runAntigravity(chatId, prompt, opts) {
+  return new Promise((resolve) => {
+    const args = ['-p', prompt, '--output-format', 'json'];
+    if (PERMISSION_MODE === 'bypassPermissions') args.push('--dangerously-skip-permissions');
+    if (opts.model) args.push('--model', opts.model);
+    if (opts.effort) args.push('--effort', opts.effort);
+    if (opts.resume) args.push('--conversation', opts.resume);
+    const started = Date.now();
+    const child = spawn(AGY_BIN, args, { cwd: WORKDIR, env: { ...env, WA_CHAT_ID: chatId }, stdio: ['ignore', 'pipe', 'pipe'] });
+    running.set(chatId, { child, started: Date.now(), prompt: prompt.slice(0, 80) });
+    let out = '', err = '', timedOut = false;
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); }, TIMEOUT_MS);
+    const done = (r) => { clearTimeout(timer); running.delete(chatId); resolve(r); };
+    child.on('error', (e) => done({ error: e.message }));
+    child.on('close', (code, signal) => {
+      if (signal && !timedOut) return done({ stopped: true });
+      if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
+      try {
+        const j = JSON.parse(out);
+        if (j.status && j.status !== 'SUCCESS') return done({ error: 'Antigravity: ' + j.status, sessionId: j.conversation_id });
+        const u = j.usage || {};
+        done({ text: j.response || '', sessionId: j.conversation_id, provider: 'antigravity',
+          usage: { cost: 0, ms: Math.round((j.duration_seconds || (Date.now() - started) / 1000) * 1000), turns: j.num_turns || 0 } });
+      } catch {
+        done({ error: 'agy saiu com código ' + code + ': ' + (err || out).slice(-500) });
+      }
+    });
+  });
+}
+
+// One entry point for chat jobs and schedules: runs the provider chosen for this chat.
+function runAgent(chatId, prompt, opts, onActivity) {
+  const c = chat(chatId);
+  if (c.provider === 'antigravity') {
+    const first = !opts.resume;
+    const text = first ? systemPrompt(chatId) + '\n\n---\n\n' + prompt : prompt;
+    return runAntigravity(chatId, text, { model: c.agyModel || '', effort: c.effort || DEFAULT_EFFORT, resume: opts.resume });
+  }
+  return runClaude(chatId, prompt, opts, onActivity);
+}
+
 // ---------- queue / running ----------
 const queues = new Map();   // chatId -> promise chain
 const pending = new Map();  // chatId -> number of queued jobs
@@ -274,6 +323,7 @@ const HELP = [
   '/status: sessão, modelo, tarefa em andamento e totais',
   '/log [n]: últimas n execuções (padrão 5) com horário, duração, custo e erros',
   '/usage: total de execuções, tempo e custo desta conversa',
+  '/provider [claude|antigravity]: escolhe quem responde nesta conversa (fica salvo)',
   '/model [opus|sonnet|haiku|fable|<id>|default]: troca o modelo desta conversa (fica salvo)',
   '/effort [low|medium|high|xhigh|max|default]: nível de esforço (fica salvo)',
   '/stop: interrompe a tarefa em andamento',
@@ -292,7 +342,10 @@ const HELP = [
 const MODEL_CHOICES = [['Opus', '/model opus'], ['Sonnet', '/model sonnet'], ['Haiku', '/model haiku'], ['Fable', '/model fable'], ['Padrão da conta', '/model default']];
 const EFFORT_CHOICES = [['low', '/effort low'], ['medium', '/effort medium'], ['high', '/effort high'], ['xhigh', '/effort xhigh'], ['max', '/effort max'], ['Padrão', '/effort default']];
 const HELP_MENU = [['Status', '/status'], ['Nova conversa', '/new'], ['Trocar modelo', '/model'], ['Trocar esforço', '/effort'],
-  ['Uso e custo', '/usage'], ['Últimas execuções', '/log'], ['Agendamentos', '/schedules'], ['Interromper tarefa', '/stop']];
+  ['Uso e custo', '/usage'], ['Últimas execuções', '/log'], ['Agendamentos', '/schedules'], ['Interromper tarefa', '/stop'], ['Trocar provedor', '/provider']];
+const PROVIDER_CHOICES = [['Claude Code', '/provider claude'], ['Antigravity', '/provider antigravity']];
+const AGY_MODEL_CHOICES = [['Gemini 3.8 Flash', '/model gemini-3.8-flash-medium'], ['Gemini 4 Argon', '/model gemini-4-argon-medium'],
+  ['Claude Opus 5.5', '/model claude-opus-5-5-medium'], ['Claude Sonnet 5.5', '/model claude-sonnet-5-5-medium'], ['GPT-OSS 120B', '/model gpt-oss-120b-medium'], ['Padrão', '/model default']];
 const MENU_TTL = 120000;
 const menus = new Map();  // chatId -> { at, options: [command] }   numbered menu waiting for a "1", "2"...
 const polls = new Map();  // poll message id (last segment) -> { chatId, options: { label: command } }
@@ -349,9 +402,19 @@ async function command(chatId, body) {
   switch (cmd) {
     case '/help': return sendMenu(chatId, 'O que você quer fazer?', HELP_MENU, HELP);
     case '/new':
-      delete c.session; save();
+      delete c.session; delete c.agySession; save();
       return reply(chatId, 'Nova conversa iniciada. Modelo: ' + (c.model || DEFAULT_MODEL || 'padrão') + '.', true);
+    case '/provider': {
+      const cur = PROVIDERS[c.provider || 'claude'];
+      if (!arg) return sendChoice(chatId, 'Provedor atual: ' + cur + '. Escolha:', PROVIDER_CHOICES);
+      const a = arg.toLowerCase(); const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : a;
+      if (!PROVIDERS[want]) return reply(chatId, 'Provedor inválido. Opções: claude, antigravity.', true);
+      c.provider = want; save();
+      return reply(chatId, 'Provedor desta conversa: ' + PROVIDERS[want] + '. Vale a partir da próxima mensagem. Use /new para começar do zero no novo provedor.', true);
+    }
     case '/model':
+      if (!arg && c.provider === 'antigravity') return sendChoice(chatId, 'Modelo Antigravity atual: ' + (c.agyModel || 'padrão') + '. Escolha:', AGY_MODEL_CHOICES);
+      if (c.provider === 'antigravity' && arg) { if (isDefault(arg)) delete c.agyModel; else c.agyModel = arg; save(); return reply(chatId, 'Modelo desta conversa (Antigravity): ' + (c.agyModel || 'padrão') + '.', true); }
       if (!arg) return sendChoice(chatId, 'Modelo atual: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Escolha o novo:', MODEL_CHOICES);
       if (isDefault(arg)) delete c.model; else c.model = arg;
       save();
@@ -376,7 +439,8 @@ async function command(chatId, body) {
       const t = c.totals;
       return reply(chatId, [
         '*Status*',
-        'Sessão: ' + (c.session ? c.session.slice(0, 8) : 'nenhuma (próxima mensagem inicia uma)'),
+        'Provedor: ' + PROVIDERS[c.provider || 'claude'],
+        'Sessão: ' + (((c.provider === 'antigravity' ? c.agySession : c.session) || '').slice(0, 8) || 'nenhuma (próxima mensagem inicia uma)'),
         'Modelo: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + ' | Esforço: ' + (c.effort || DEFAULT_EFFORT || 'padrão'),
         'Permissões: ' + PERMISSION_MODE,
         r ? 'Em andamento há ' + fmtDur(Date.now() - r.started) + ': "' + r.prompt + '"' : 'Ocioso',
@@ -506,17 +570,18 @@ async function handleMessage(msg) {
     const typing = () => waha('POST', '/api/startTyping', { session: WAHA_SESSION, chatId }).catch(() => {});
     typing();
     const keepTyping = setInterval(typing, 20000);
-    const opts = { model: c.model || DEFAULT_MODEL, effort: c.effort || DEFAULT_EFFORT, resume: c.session };
+    const agy = c.provider === 'antigravity';
+    const opts = { model: c.model || DEFAULT_MODEL, effort: c.effort || DEFAULT_EFFORT, resume: agy ? c.agySession : c.session };
     const started = Date.now();
     const status = liveStatus(chatId);
     const onActivity = (label) => status.activity(label);
-    let r = await runClaude(chatId, body, opts, onActivity);
+    let r = await runAgent(chatId, body, opts, onActivity);
     // Retry from a fresh session only when resuming the old one failed. Not on timeouts or user stops:
     // re-running a timed-out task from scratch would run it twice and could repeat side effects.
-    if (r.error && c.session && !r.stopped && !r.timedOut) {
+    if (r.error && opts.resume && !r.stopped && !r.timedOut) {
       log('resume failed, starting fresh:', r.error);
-      delete c.session;
-      r = await runClaude(chatId, body, { ...opts, resume: undefined }, onActivity);
+      if (agy) delete c.agySession; else delete c.session;
+      r = await runAgent(chatId, body, { ...opts, resume: undefined }, onActivity);
     }
     clearInterval(keepTyping);
     waha('POST', '/api/stopTyping', { session: WAHA_SESSION, chatId }).catch(() => {});
@@ -525,12 +590,12 @@ async function handleMessage(msg) {
       recordRun(chatId, { prompt: body.slice(0, 80), ms: Date.now() - started, error: 'interrompido pelo usuário' });
       return;
     }
-    if (r.sessionId) c.session = r.sessionId;
+    if (r.sessionId) { if (agy) c.agySession = r.sessionId; else c.session = r.sessionId; }
     if (r.usage) c.lastUsage = r.usage;
     recordRun(chatId, { prompt: body.slice(0, 80), ms: r.usage ? r.usage.ms : Date.now() - started,
       cost: r.usage ? r.usage.cost : 0, error: r.error });
     save();
-    await reply(chatId, r.error ? 'Erro ao executar o Claude Code: ' + r.error : r.text, Boolean(r.error));
+    await reply(chatId, r.error ? 'Erro ao executar ' + PROVIDERS[agy ? 'antigravity' : 'claude'] + ': ' + r.error : r.text, Boolean(r.error));
   });
 }
 
@@ -610,7 +675,7 @@ function runSchedule(s) {
     const prompt = '[Tarefa agendada #' + s.id + ': ' + s.description + ']\n' +
       'Execute agora. Sua resposta final será enviada ao usuário pelo WhatsApp como a mensagem desta tarefa.\n\n' + s.prompt;
     const started = Date.now();
-    const r = await runClaude(s.chatId, prompt, { model: c.model || DEFAULT_MODEL, effort: c.effort || DEFAULT_EFFORT });
+    const r = await runAgent(s.chatId, prompt, { model: c.model || DEFAULT_MODEL, effort: c.effort || DEFAULT_EFFORT });
     if (r.stopped) return;
     recordRun(s.chatId, { prompt: '[agendamento #' + s.id + '] ' + s.description.slice(0, 60),
       ms: r.usage ? r.usage.ms : Date.now() - started, cost: r.usage ? r.usage.cost : 0, error: r.error });

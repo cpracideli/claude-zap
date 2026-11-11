@@ -18,6 +18,15 @@ const out = () => { console.log(JSON.stringify({ type: 'system', subtype: 'init'
 if (p === 'slow') setTimeout(out, 5000); else out();
 `);
 
+const fakeAgy = path.join(tmp, 'agy.mjs');
+fs.writeFileSync(fakeAgy, '#!/usr/bin/env node\n'); fs.chmodSync(fakeAgy, 0o755);
+fs.appendFileSync(fakeAgy, `
+const a = process.argv.slice(2);
+const get = (f) => a.includes(f) ? a[a.indexOf(f) + 1] : null;
+const conv = get('--conversation') || 'agy-1';
+console.log(JSON.stringify({ conversation_id: conv, status: 'SUCCESS', response: 'AGY:' + get('-p').split('\\n').slice(-1)[0] + ' |model=' + get('--model') + ' |conv=' + get('--conversation') + ' |sys=' + get('-p').includes('---'), duration_seconds: 1.5, num_turns: 1 }));
+`);
+
 const sent = [];
 const waha = http.createServer((req, res) => {
   let b = []; req.on('data', (d) => b.push(d)); req.on('end', () => {
@@ -33,7 +42,7 @@ const waha = http.createServer((req, res) => {
 
 const bridge = spawn(process.execPath, [path.join(dir, '..', 'bridge', 'bridge.mjs')], {
   env: { ...process.env, PORT: '4012', WAHA_URL: 'http://localhost:4011/', WAHA_API_KEY: 'k', WAHA_SESSION: 'S',
-    ALLOWED_NUMBERS: '+55 11 99999-0000', CLAUDE_BIN: fakeClaude, HOME: tmp, CLAUDE_PERMISSION_MODE: 'bypassPermissions', SCHEDULER_TICK_MS: '1000', TZ: 'America/Sao_Paulo', CLAUDE_EFFORT: '' },
+    ALLOWED_NUMBERS: '+55 11 99999-0000', CLAUDE_BIN: fakeClaude, AGY_BIN: fakeAgy, HOME: tmp, CLAUDE_PERMISSION_MODE: 'bypassPermissions', SCHEDULER_TICK_MS: '1000', TZ: 'America/Sao_Paulo', CLAUDE_EFFORT: '' },
   stdio: 'inherit',
 });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -81,6 +90,8 @@ await step('/help', () => hook('/help'));
 await step('/model sem argumento (menu numerado, pois o WAHA falso nao cria enquete) e resposta 2', async () => { await hook('/model'); await hook('2'); });
 await step('/help e resposta 1 (status)', async () => { await hook('/help'); await hook('1'); });
 await step('numero fora de menu vai para o Claude', () => hook('7'));
+await step('/provider antigravity, depois mensagem vai para o agy (com instruções na 1ª vez)', async () => { await hook('/provider antigravity'); await hook('oi agy'); await hook('segunda'); });
+await step('/provider claude volta ao Claude', async () => { await hook('/provider claude'); await hook('volta'); });
 console.log('\ninbox:', fs.readdirSync(path.join(tmp, 'workspace', 'inbox')));
 console.log('state:', fs.readFileSync(path.join(tmp, '.bridge', 'chats.json'), 'utf8').replace(/\s+/g, ' '));
 bridge.kill(); waha.close(); process.exit(0);
