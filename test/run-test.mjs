@@ -23,8 +23,14 @@ fs.writeFileSync(fakeAgy, '#!/usr/bin/env node\n'); fs.chmodSync(fakeAgy, 0o755)
 fs.appendFileSync(fakeAgy, `
 const a = process.argv.slice(2);
 const get = (f) => a.includes(f) ? a[a.indexOf(f) + 1] : null;
+if (a[0] === 'models') {
+  if (a.includes('--output-format') || a.includes('--json')) { console.error('unknown flag'); process.exit(2); }
+  console.log('Available models:\\n  gemini-9-flash-low      Gemini 9 Flash (Low)\\n  gemini-9-flash-medium   Gemini 9 Flash (Medium)\\n  gemini-9-flash-high     Gemini 9 Flash (High)\\n* gemini-9-pro-high       Gemini 9 Pro (High)  (current)\\n  claude-opus-9-9         Claude Opus 9.9\\n  orchestrator            Orchestrator');
+  process.exit(0);
+}
+if (get('-p') === '/effort') { console.log(JSON.stringify(get('--model') === 'claude-opus-9-9' ? { adjustable: true, current: 'medium', available: ['low', 'medium', 'high', 'max'] } : { adjustable: false })); process.exit(0); }
 const conv = get('--conversation') || 'agy-1';
-console.log(JSON.stringify({ conversation_id: conv, status: 'SUCCESS', response: 'AGY:' + get('-p').split('\\n').slice(-1)[0] + ' |model=' + get('--model') + ' |conv=' + get('--conversation') + ' |sys=' + get('-p').includes('---'), duration_seconds: 1.5, num_turns: 1 }));
+console.log(JSON.stringify({ conversation_id: conv, status: 'SUCCESS', response: 'AGY:' + get('-p').split('\\n').slice(-1)[0] + ' |model=' + get('--model') + ' |effort=' + get('--effort') + ' |conv=' + get('--conversation') + ' |sys=' + get('-p').includes('---'), duration_seconds: 1.5, num_turns: 1 }));
 `);
 
 const sent = [];
@@ -91,6 +97,11 @@ await step('/model sem argumento (menu numerado, pois o WAHA falso nao cria enqu
 await step('/help e resposta 1 (status)', async () => { await hook('/help'); await hook('1'); });
 await step('numero fora de menu vai para o Claude', () => hook('7'));
 await step('/provider antigravity, depois mensagem vai para o agy (com instruções na 1ª vez)', async () => { await hook('/provider antigravity'); await hook('oi agy'); await hook('segunda'); });
+await step('agy: /model lista dinâmica (menu numerado) e escolhe 2 = Gemini 9 Pro', async () => { await hook('/model'); await hook('2'); });
+await step('agy: /effort mostra só os níveis do modelo (high) e mensagem usa a variante', async () => { await hook('/effort'); await hook('/effort low'); await hook('msg pro'); });
+await step('agy: /model gemini-9-flash + /effort high -> variante -high, sem --effort', async () => { await hook('/model gemini-9-flash'); await hook('/effort high'); await hook('msg flash'); });
+await step('agy: id antigo com sufixo, modelo inexistente', async () => { await hook('/model gemini-9-flash-low'); await hook('msg low'); await hook('/model gemini-3.8-flash-medium'); });
+await step('agy: modelo sem variantes usa --effort (níveis vindos de /effort)', async () => { await hook('/model claude-opus-9-9'); await hook('/effort max'); await hook('msg opus'); await hook('/status'); });
 await step('/provider claude volta ao Claude', async () => { await hook('/provider claude'); await hook('volta'); });
 console.log('\ninbox:', fs.readdirSync(path.join(tmp, 'workspace', 'inbox')));
 console.log('state:', fs.readFileSync(path.join(tmp, '.bridge', 'chats.json'), 'utf8').replace(/\s+/g, ' '));

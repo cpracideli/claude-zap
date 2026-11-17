@@ -275,6 +275,142 @@ function runAntigravity(chatId, prompt, opts) {
   });
 }
 
+// ---------- Antigravity model catalog, read live from `agy models` ----------
+// Google ships new Gemini models often, so the menu is never hard-coded. Model ids may carry the effort as a
+// suffix (gemini-x-flash-medium): those are grouped into one model with its effort variants.
+const AGY_CATALOG_TTL = 10 * 60 * 1000;
+const EFFORT_SUFFIX = new RegExp('^(.+)-(' + EFFORTS.join('|') + ')(?:-preview)?\x24', 'i');
+let agyCatalog = { at: 0, models: [], raw: '' };
+const agyEffortCache = new Map(); // model id -> [effort]
+
+function execAgy(args, ms = 30000) {
+  return new Promise((resolve) => {
+    let out = '', err = '';
+    let child;
+    try { child = spawn(AGY_BIN, args, { cwd: WORKDIR, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
+    catch (e) { return resolve({ code: -1, out: '', err: e.message }); }
+    const timer = setTimeout(() => child.kill('SIGTERM'), ms);
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, out, err: e.message }); });
+    child.on('close', (code) => { clearTimeout(timer); resolve({ code, out, err }); });
+  });
+}
+
+const stripAnsi = (s) => String(s).replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+// "gemini-3.8-flash" -> "Gemini 3.8 Flash", "claude-opus-5-5" -> "Claude Opus 5.5"
+const prettyModel = (id) => id.replace(/(\d)-(?=\d)/g, '\x241.').split(/[-_]/).filter(Boolean)
+  .map((w) => (['gpt', 'oss'].includes(w.toLowerCase()) ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1))).join(' ');
+
+// Turns `agy models` output (JSON or a text table/list) into [{ id, label, efforts?: [] }].
+function parseAgyModels(out) {
+  const text = stripAnsi(out).trim();
+  const found = [];
+  try {
+    const j = JSON.parse(text);
+    const arr = Array.isArray(j) ? j : (j.models || j.data || j.items || []);
+    for (const m of arr) {
+      if (typeof m === 'string') { found.push({ id: m }); continue; }
+      const id = m.id || m.model || m.slug || m.name;
+      if (!id) continue;
+      const ef = m.efforts || m.effort_levels || m.effortLevels || m.reasoning_efforts || m.available_efforts || m.availableEfforts;
+      found.push({ id: String(id), label: m.display_name || m.displayName || m.label || m.title || (m.name !== id ? m.name : ''),
+        efforts: Array.isArray(ef) ? ef.map((x) => String(x.id || x.name || x).toLowerCase()).filter((x) => EFFORTS.includes(x)) : undefined });
+    }
+    if (found.length) return found;
+  } catch {}
+  // Text: take the first model-looking token of each line (lowercase, with a dash), the rest is its label.
+  const idRe = /(?:^|[\s*>|•\-]\s*)([a-z][a-z0-9]*(?:[.-][a-z0-9]+)+(?:@[a-z0-9.-]+)?)(?=\s|[|,(]|(?![\s\S]))/;
+  for (const line of text.split('\n')) {
+    const t = line.trim();
+    if (!t || /^(usage|error|available models|warning)/i.test(t)) continue;
+    // a dashed id anywhere, or a one-word id in the first column of a table ("orchestrator   Orchestrator")
+    const m = t.match(idRe) || t.match(/^[*>•\-\s]*([a-z][a-z0-9._]*)\s{2,}\S/);
+    if (!m) continue;
+    const rest = t.slice(t.indexOf(m[1]) + m[1].length).replace(/[|()\[\]*]/g, ' ').replace(/\b(current|default|selected)\b/gi, '').replace(/\s+/g, ' ').trim();
+    found.push({ id: m[1], label: rest && !new RegExp('^[a-z0-9.-]+\x24').test(rest) && rest.length < 40 ? rest : '' });
+  }
+  return found;
+}
+
+// Groups variants: [{ base, label, ids: [id], variants: { effort: id }, efforts: [effort] }]
+function groupAgyModels(list) {
+  const map = new Map();
+  for (const m of list) {
+    const s = m.id.match(EFFORT_SUFFIX);
+    const base = s ? s[1] : m.id;
+    const g = map.get(base) || { base, label: '', ids: [], variants: {}, efforts: [] };
+    g.ids.push(m.id);
+    if (s) g.variants[s[2].toLowerCase()] = m.id;
+    if (m.efforts) g.efforts = m.efforts;
+    if (!g.label && m.label) g.label = m.label.replace(new RegExp('\\s*[(-]?\\s*(' + EFFORTS.join('|') + ')\\s*\\)?\\s*\x24', 'i'), '');
+    map.set(base, g);
+  }
+  for (const g of map.values()) {
+    if (!g.label) g.label = prettyModel(g.base);
+    const fromVariants = Object.keys(g.variants);
+    if (fromVariants.length) g.efforts = fromVariants;
+    g.efforts = EFFORTS.filter((e) => g.efforts.includes(e));
+  }
+  return [...map.values()];
+}
+
+async function refreshAgyCatalog(force) {
+  if (!force && agyCatalog.models.length && Date.now() - agyCatalog.at < AGY_CATALOG_TTL) return agyCatalog;
+  for (const args of [['models', '--output-format', 'json'], ['models', '--json'], ['models']]) {
+    const r = await execAgy(args, 30000);
+    if (r.code !== 0) continue;
+    const models = groupAgyModels(parseAgyModels(r.out));
+    if (models.length) { agyCatalog = { at: Date.now(), models, raw: r.out }; return agyCatalog; }
+  }
+  log('agy models: could not read the model list, keeping', agyCatalog.models.length, 'cached');
+  return agyCatalog;
+}
+
+// Finds the catalog entry for what the user typed or what is stored: base id, full variant id or label.
+function findAgyModel(value) {
+  if (!value) return null;
+  const v = value.toLowerCase().trim();
+  return agyCatalog.models.find((g) => g.base.toLowerCase() === v || g.ids.some((id) => id.toLowerCase() === v))
+    || agyCatalog.models.find((g) => g.label.toLowerCase() === v)
+    || null;
+}
+
+// Effort levels for a model that has no variants in its id: ask agy itself (`/effort` in print mode).
+async function agyEfforts(g) {
+  if (!g) return ['low', 'medium', 'high'];
+  if (g.efforts.length) return g.efforts;
+  if (agyEffortCache.has(g.base)) return agyEffortCache.get(g.base);
+  const r = await execAgy(['-p', '/effort', '--output-format', 'json', '--model', g.base], 20000);
+  let list = [];
+  const walk = (x, key) => {
+    if (Array.isArray(x)) { if (/avail|tier|level|option|effort/i.test(key || '')) for (const y of x) if (EFFORTS.includes(String(y).toLowerCase())) list.push(String(y).toLowerCase()); x.forEach((y) => walk(y, key)); }
+    else if (x && typeof x === 'object') for (const [k, y] of Object.entries(x)) walk(y, k);
+  };
+  try { walk(JSON.parse(stripAnsi(r.out))); } catch {}
+  if (!list.length) { const m = stripAnsi(r.out + ' ' + r.err).match(/available:\s*([a-z, ]+)/i); if (m) list = m[1].split(/[,\s]+/).filter((x) => EFFORTS.includes(x)); }
+  if (!list.length && /not adjustable|fixed|takes no|doesn.t support|does not support/i.test(r.out + r.err)) list = [];
+  else if (!list.length) list = ['low', 'medium', 'high'];
+  list = EFFORTS.filter((e) => list.includes(e));
+  agyEffortCache.set(g.base, list);
+  return list;
+}
+
+// What actually goes to `agy`: a variant id when the model encodes effort in its id, else --model + --effort.
+function resolveAgyRun(c) {
+  const g = findAgyModel(c.agyModel);
+  if (!g) return { model: c.agyModel || '', effort: c.agyEffort || '' };
+  if (Object.keys(g.variants).length) {
+    const stored = (c.agyModel.match(EFFORT_SUFFIX) || [])[2];
+    const want = (c.agyEffort || (stored && stored.toLowerCase()) || '');
+    const eff = g.variants[want] ? want : (g.variants.medium ? 'medium' : g.efforts[Math.floor(g.efforts.length / 2)]);
+    return { model: g.variants[eff] || g.ids[0], effort: '' };
+  }
+  const effort = c.agyEffort && (!agyEffortCache.has(g.base) || agyEffortCache.get(g.base).includes(c.agyEffort)) ? c.agyEffort : '';
+  return { model: g.ids[0], effort };
+}
+const agyModelLabel = (c) => { const g = findAgyModel(c.agyModel); return g ? g.label + ' (' + g.base + ')' : (c.agyModel || 'padrão'); };
+
 // Instructions for Antigravity: the same bridge rules as Claude, plus where memory and tools are.
 function antigravityPrompt(chatId) {
   const memory = fs.existsSync(MEMORY_DIR)
@@ -294,7 +430,8 @@ function runAgent(chatId, prompt, opts, onActivity) {
   if (c.provider === 'antigravity') {
     const first = !opts.resume;
     const text = first ? antigravityPrompt(chatId) + '\n\n---\n\n' + prompt : prompt;
-    return runAntigravity(chatId, text, { model: c.agyModel || '', effort: c.effort || DEFAULT_EFFORT, resume: opts.resume });
+    const pick = resolveAgyRun(c);
+    return runAntigravity(chatId, text, { model: pick.model, effort: pick.effort, resume: opts.resume });
   }
   return runClaude(chatId, prompt, opts, onActivity);
 }
@@ -340,8 +477,8 @@ const HELP = [
   '/log [n]: últimas n execuções (padrão 5) com horário, duração, custo e erros',
   '/usage: total de execuções, tempo e custo desta conversa',
   '/provider [claude|antigravity]: escolhe quem responde nesta conversa (fica salvo)',
-  '/model [opus|sonnet|haiku|fable|<id>|default]: troca o modelo desta conversa (fica salvo)',
-  '/effort [low|medium|high|xhigh|max|default]: nível de esforço (fica salvo)',
+  '/model [opus|sonnet|haiku|fable|<id>|default]: troca o modelo desta conversa (fica salvo). No Antigravity, a lista vem ao vivo do agy models',
+  '/effort [low|medium|high|xhigh|max|default]: nível de esforço (fica salvo). No Antigravity, mostra só os níveis do modelo escolhido',
   '/stop: interrompe a tarefa em andamento',
   '/send <número> <mensagem>: manda uma mensagem para outro número (direto, sem passar pelo Claude)',
   '/schedules: lista os agendamentos',
@@ -360,8 +497,6 @@ const EFFORT_CHOICES = [['low', '/effort low'], ['medium', '/effort medium'], ['
 const HELP_MENU = [['Status', '/status'], ['Nova conversa', '/new'], ['Trocar modelo', '/model'], ['Trocar esforço', '/effort'],
   ['Uso e custo', '/usage'], ['Últimas execuções', '/log'], ['Agendamentos', '/schedules'], ['Interromper tarefa', '/stop'], ['Trocar provedor', '/provider']];
 const PROVIDER_CHOICES = [['Claude Code', '/provider claude'], ['Antigravity', '/provider antigravity']];
-const AGY_MODEL_CHOICES = [['Gemini 3.8 Flash', '/model gemini-3.8-flash-medium'], ['Gemini 4 Argon', '/model gemini-4-argon-medium'],
-  ['Claude Opus 5.5', '/model claude-opus-5-5-medium'], ['Claude Sonnet 5.5', '/model claude-sonnet-5-5-medium'], ['GPT-OSS 120B', '/model gpt-oss-120b-medium'], ['Padrão', '/model default']];
 const MENU_TTL = 120000;
 const menus = new Map();  // chatId -> { at, options: [command] }   numbered menu waiting for a "1", "2"...
 const polls = new Map();  // poll message id (last segment) -> { chatId, options: { label: command } }
@@ -374,6 +509,7 @@ async function sendMenu(chatId, title, choices, footer) {
 }
 
 async function sendChoice(chatId, title, choices) {
+  if (choices.length > 12) return sendMenu(chatId, title, choices); // WhatsApp polls take at most 12 options
   try {
     const r = await waha('POST', '/api/sendPoll', { session: WAHA_SESSION, chatId,
       poll: { name: title, options: choices.map((x) => x[0]), multipleAnswers: false } });
@@ -409,6 +545,43 @@ async function handlePollVote(payload) {
   await command(entry.chatId, cmd);
 }
 
+// /model and /effort when this chat uses Antigravity: the options come from `agy models`, read live.
+async function agyModelCommand(chatId, c, arg, isDefault) {
+  if (arg && isDefault(arg)) { delete c.agyModel; delete c.agyEffort; save(); return reply(chatId, 'Modelo desta conversa (Antigravity): padrão.', true); }
+  const cat = await refreshAgyCatalog(!arg);
+  if (!arg) {
+    if (!cat.models.length) return reply(chatId, 'Não consegui ler a lista de modelos do Antigravity (agy models). Você ainda pode usar /model <id>.', true);
+    const choices = cat.models.map((g) => [g.label, '/model ' + g.base]);
+    choices.push(['Padrão', '/model default']);
+    return sendChoice(chatId, 'Modelo Antigravity atual: ' + agyModelLabel(c) + '. Escolha:', choices);
+  }
+  const g = findAgyModel(arg);
+  if (!g && cat.models.length) return reply(chatId, 'Modelo não encontrado no Antigravity. Disponíveis: ' + cat.models.map((x) => x.base).join(', ') + '.', true);
+  const suffix = (arg.match(EFFORT_SUFFIX) || [])[2];
+  c.agyModel = g ? g.base : arg;
+  if (suffix && g && g.variants[suffix.toLowerCase()]) c.agyEffort = suffix.toLowerCase();
+  else if (c.agyEffort && g && Object.keys(g.variants).length && !g.variants[c.agyEffort]) delete c.agyEffort;
+  save();
+  const efforts = g ? await agyEfforts(g) : [];
+  return reply(chatId, 'Modelo desta conversa (Antigravity): ' + agyModelLabel(c) + '.' + (efforts.length ? ' Esforços disponíveis: ' + efforts.join(', ') + ' (use /effort).' : ''), true);
+}
+
+async function agyEffortCommand(chatId, c, arg, isDefault) {
+  await refreshAgyCatalog(false);
+  const g = findAgyModel(c.agyModel);
+  const efforts = await agyEfforts(g);
+  if (!arg) {
+    if (!efforts.length) return reply(chatId, 'O modelo ' + agyModelLabel(c) + ' não tem níveis de esforço ajustáveis.', true);
+    return sendChoice(chatId, 'Esforço atual (' + agyModelLabel(c) + '): ' + (c.agyEffort || 'padrão') + '. Escolha:',
+      [...efforts.map((e) => [e, '/effort ' + e]), ['Padrão', '/effort default']]);
+  }
+  if (isDefault(arg)) delete c.agyEffort;
+  else if (efforts.includes(arg.toLowerCase())) c.agyEffort = arg.toLowerCase();
+  else return reply(chatId, 'Nível inválido para ' + agyModelLabel(c) + '. Opções: ' + (efforts.join(', ') || 'nenhuma') + ', default.', true);
+  save();
+  return reply(chatId, 'Esforço desta conversa (Antigravity): ' + (c.agyEffort || 'padrão') + '.', true);
+}
+
 async function command(chatId, body) {
   const [cmdRaw, ...rest] = body.trim().split(/\s+/);
   const cmd = cmdRaw.toLowerCase();
@@ -429,13 +602,13 @@ async function command(chatId, body) {
       return reply(chatId, 'Provedor desta conversa: ' + PROVIDERS[want] + '. Vale a partir da próxima mensagem. Use /new para começar do zero no novo provedor.', true);
     }
     case '/model':
-      if (!arg && c.provider === 'antigravity') return sendChoice(chatId, 'Modelo Antigravity atual: ' + (c.agyModel || 'padrão') + '. Escolha:', AGY_MODEL_CHOICES);
-      if (c.provider === 'antigravity' && arg) { if (isDefault(arg)) delete c.agyModel; else c.agyModel = arg; save(); return reply(chatId, 'Modelo desta conversa (Antigravity): ' + (c.agyModel || 'padrão') + '.', true); }
+      if (c.provider === 'antigravity') return agyModelCommand(chatId, c, arg, isDefault);
       if (!arg) return sendChoice(chatId, 'Modelo atual: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Escolha o novo:', MODEL_CHOICES);
       if (isDefault(arg)) delete c.model; else c.model = arg;
       save();
       return reply(chatId, 'Modelo desta conversa: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Vale a partir da próxima mensagem.', true);
     case '/effort':
+      if (c.provider === 'antigravity') return agyEffortCommand(chatId, c, arg, isDefault);
       if (!arg) return sendChoice(chatId, 'Esforço atual: ' + (c.effort || DEFAULT_EFFORT || 'padrão') + '. Escolha o novo:', EFFORT_CHOICES);
       if (isDefault(arg)) delete c.effort;
       else if (EFFORTS.includes(arg.toLowerCase())) c.effort = arg.toLowerCase();
@@ -457,7 +630,9 @@ async function command(chatId, body) {
         '*Status*',
         'Provedor: ' + PROVIDERS[c.provider || 'claude'],
         'Sessão: ' + (((c.provider === 'antigravity' ? c.agySession : c.session) || '').slice(0, 8) || 'nenhuma (próxima mensagem inicia uma)'),
-        'Modelo: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + ' | Esforço: ' + (c.effort || DEFAULT_EFFORT || 'padrão'),
+        c.provider === 'antigravity'
+          ? 'Modelo: ' + agyModelLabel(c) + ' | Esforço: ' + (c.agyEffort || 'padrão') + ' | enviado ao agy: ' + (resolveAgyRun(c).model || 'padrão')
+          : 'Modelo: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + ' | Esforço: ' + (c.effort || DEFAULT_EFFORT || 'padrão'),
         'Permissões: ' + PERMISSION_MODE,
         r ? 'Em andamento há ' + fmtDur(Date.now() - r.started) + ': "' + r.prompt + '"' : 'Ocioso',
         q ? 'Na fila: ' + q : '',
@@ -865,4 +1040,9 @@ server.listen(PORT, () => {
   log('bridge listening on', PORT, '| version', VERSION, '| session', WAHA_SESSION, '| allowed numbers', ALLOWED.length, '| mode', PERMISSION_MODE);
   if (!ALLOWED.length) log('WARNING: ALLOWED_NUMBERS is empty, every message will be ignored');
   if (env.STARTUP_NOTICE !== 'false') setTimeout(notifyStartup, 10000);
+  // Read the Antigravity model list once at boot, so the log shows what agy offers right now.
+  if (fs.existsSync(AGY_BIN)) refreshAgyCatalog(true).then((cat) => {
+    log('agy models:', cat.models.map((g) => g.base + (g.efforts.length ? '[' + g.efforts.join('/') + ']' : '')).join(', ') || 'none');
+    log('agy models raw:', JSON.stringify(stripAnsi(cat.raw).slice(0, 1500)));
+  }).catch((e) => log('agy models failed', e.message));
 });
