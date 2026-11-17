@@ -477,7 +477,17 @@ services:
             } catch { return false; }
           }
           async function ensureAiMemory() {
-            if (env.AI_MEMORY === 'off' || aiMemory.child) return;
+            if (env.AI_MEMORY === 'off') return;
+            if (aiMemory.child) { // ours is running: refresh the status, and show its log once if it never answers
+              const healthy = await aiMemoryHealthy();
+              if (healthy && aiMemory.status !== 'ok') log('ai-memory: healthy at', AI_MEMORY_URL);
+              if (!healthy && aiMemory.status === 'iniciando') {
+                let tail = ''; try { tail = fs.readFileSync(AI_MEMORY_LOG, 'utf8').slice(-1200); } catch {}
+                log('ai-memory: running but /healthz does not answer at', AI_MEMORY_URL, '| log tail:', JSON.stringify(tail));
+              }
+              aiMemory.status = healthy ? 'ok' : 'rodando, sem resposta em /healthz';
+              return;
+            }
             const bin = aiMemoryBin();
             if (!bin) { aiMemory.status = 'não instalado'; return; }
             if (await aiMemoryHealthy()) { aiMemory.status = 'ok'; aiMemory.backoff = 5000; return; }
