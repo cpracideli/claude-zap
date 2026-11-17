@@ -26,7 +26,7 @@ const compose = `services:
     environment:
       - HOME=/home/node
       - NPM_CONFIG_PREFIX=/home/node/.npm-global
-      - PATH=/home/node/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - PATH=/home/node/.npm-global/bin:/home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       - PORT=3000
       - WAHA_URL=${D}{WAHA_URL}
       - WAHA_SESSION=${D}{WAHA_SESSION:-default}

@@ -411,6 +411,52 @@ function resolveAgyRun(c) {
 }
 const agyModelLabel = (c) => { const g = findAgyModel(c.agyModel); return g ? g.label + ' (' + g.base + ')' : (c.agyModel || 'padrão'); };
 
+// ---------- ai-memory server (github.com/akitaonrails/ai-memory) ----------
+// Its installer starts the server as a systemd --user service, and containers have no systemd, so after every
+// redeploy the server was simply gone (MCP calls and hooks failed silently). The bridge now keeps it running:
+// it starts `ai-memory serve` when nothing answers /healthz, restarts it with backoff, and checks every minute.
+// Turn off with AI_MEMORY=off. Binary and data live in the persistent home volume.
+const AI_MEMORY_URL = String(env.AI_MEMORY_SERVER_URL || 'http://127.0.0.1:49374').replace(/\/+(?![\s\S])/, '');
+const AI_MEMORY_LOG = path.join(DATA_DIR, 'ai-memory.log');
+const aiMemory = { child: null, status: 'off', restarts: 0, backoff: 5000, timer: null };
+function findBin(name, extra) {
+  const dirs = [...(extra || []), ...String(env.PATH || '').split(':')];
+  for (const d of dirs) { const f = path.join(d, name); try { fs.accessSync(f, fs.constants.X_OK); return f; } catch {} }
+  return '';
+}
+const aiMemoryBin = () => env.AI_MEMORY_BIN || findBin('ai-memory', [path.join(env.HOME || '/tmp', '.local', 'bin'),
+  path.join(env.HOME || '/tmp', '.cargo', 'bin'), path.join(env.HOME || '/tmp', '.local', 'share', 'mise', 'shims')]);
+async function aiMemoryHealthy() {
+  try {
+    const r = await fetch(AI_MEMORY_URL + '/healthz', { signal: AbortSignal.timeout(3000) });
+    const j = await r.json();
+    return r.ok && j && j.status === 'ok';
+  } catch { return false; }
+}
+async function ensureAiMemory() {
+  if (env.AI_MEMORY === 'off' || aiMemory.child) return;
+  const bin = aiMemoryBin();
+  if (!bin) { aiMemory.status = 'não instalado'; return; }
+  if (await aiMemoryHealthy()) { aiMemory.status = 'ok'; aiMemory.backoff = 5000; return; }
+  if (aiMemory.timer) return; // a restart is already scheduled
+  const out = fs.openSync(AI_MEMORY_LOG, 'a');
+  log('ai-memory: starting', bin, 'serve');
+  const child = spawn(bin, ['serve', '--transport', 'http', '--enable-web'], { cwd: env.HOME || '/tmp', env, stdio: ['ignore', out, out] });
+  fs.closeSync(out);
+  aiMemory.child = child; aiMemory.status = 'iniciando';
+  const started = Date.now();
+  child.on('error', (e) => log('ai-memory: failed to start:', e.message));
+  child.on('close', (code, signal) => {
+    aiMemory.child = null; aiMemory.status = 'parado (código ' + (signal || code) + ')';
+    if (Date.now() - started > 60000) aiMemory.backoff = 5000; // ran fine for a while: restart fast
+    log('ai-memory: exited with', signal || code, '| restarting in', aiMemory.backoff / 1000, 's | see', AI_MEMORY_LOG);
+    aiMemory.restarts += 1;
+    aiMemory.timer = setTimeout(() => { aiMemory.timer = null; ensureAiMemory().catch(() => {}); }, aiMemory.backoff);
+    aiMemory.backoff = Math.min(aiMemory.backoff * 2, 300000);
+  });
+  setTimeout(async () => { if (aiMemory.child === child && await aiMemoryHealthy()) { aiMemory.status = 'ok'; log('ai-memory: healthy at', AI_MEMORY_URL); } }, 5000);
+}
+
 // Instructions for Antigravity: the same bridge rules as Claude, plus where memory and tools are.
 function antigravityPrompt(chatId) {
   const memory = fs.existsSync(MEMORY_DIR)
@@ -633,7 +679,7 @@ async function command(chatId, body) {
         c.provider === 'antigravity'
           ? 'Modelo: ' + agyModelLabel(c) + ' | Esforço: ' + (c.agyEffort || 'padrão') + ' | enviado ao agy: ' + (resolveAgyRun(c).model || 'padrão')
           : 'Modelo: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + ' | Esforço: ' + (c.effort || DEFAULT_EFFORT || 'padrão'),
-        'Permissões: ' + PERMISSION_MODE,
+        'Permissões: ' + PERMISSION_MODE + ' | ai-memory: ' + aiMemory.status,
         r ? 'Em andamento há ' + fmtDur(Date.now() - r.started) + ': "' + r.prompt + '"' : 'Ocioso',
         q ? 'Na fila: ' + q : '',
         u ? 'Última resposta: ' + fmtDur(u.ms || 0) + ', ' + (u.turns || 0) + ' passos' : '',
@@ -949,7 +995,8 @@ const isLocal = (req) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.s
 const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true, version: VERSION, allowed: ALLOWED.length, running: running.size }));
+    return res.end(JSON.stringify({ ok: true, version: VERSION, allowed: ALLOWED.length, running: running.size,
+      aiMemory: { status: aiMemory.status, restarts: aiMemory.restarts, supervised: Boolean(aiMemory.child) } }));
   }
   const bufs = [];
   req.on('data', (d) => bufs.push(d));
@@ -1040,6 +1087,8 @@ server.listen(PORT, () => {
   log('bridge listening on', PORT, '| version', VERSION, '| session', WAHA_SESSION, '| allowed numbers', ALLOWED.length, '| mode', PERMISSION_MODE);
   if (!ALLOWED.length) log('WARNING: ALLOWED_NUMBERS is empty, every message will be ignored');
   if (env.STARTUP_NOTICE !== 'false') setTimeout(notifyStartup, 10000);
+  ensureAiMemory().then(() => log('ai-memory:', aiMemory.status)).catch((e) => log('ai-memory check failed', e.message));
+  setInterval(() => ensureAiMemory().catch(() => {}), 60000).unref();
   // Read the Antigravity model list once at boot, so the log shows what agy offers right now.
   if (fs.existsSync(AGY_BIN)) refreshAgyCatalog(true).then((cat) => {
     log('agy models:', cat.models.map((g) => g.base + (g.efforts.length ? '[' + g.efforts.join('/') + ']' : '')).join(', ') || 'none');

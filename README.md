@@ -167,6 +167,8 @@ The bot answers in Brazilian Portuguese by default (see `systemPrompt()` in `bri
 | `CLAUDE_EFFORT` | account default | Default effort |
 | `CLAUDE_TIMEOUT_SECONDS` | `1800` | Maximum duration of one task |
 | `TZ` | `America/Sao_Paulo` | Timezone for schedules and the prompt |
+| `AI_MEMORY` | `on` | Set to `off` to stop the bridge from supervising the [ai-memory](https://github.com/akitaonrails/ai-memory) server |
+| `AI_MEMORY_SERVER_URL` | `http://127.0.0.1:49374` | Where the bridge checks `/healthz` before starting `ai-memory serve` |
 
 ---
 
@@ -232,6 +234,8 @@ To move to a new Coolify resource: create it (steps 3 to 5), deploy once so the 
 |---|---|
 | No reply at all | Check, in order: the bridge is **Running (healthy)**; the WAHA session is `WORKING`; the webhook URL is `http://claude-bridge-claude-zap:3000/webhook` with event `message`; `WAHA_SESSION` matches the session name **exactly**; you are writing **from** a number in `ALLOWED_NUMBERS` **to** the bot's number. |
 | Health check from the `coolify` network says `EAI_AGAIN` | The name does not resolve: redo step 5 (predefined network + consistent name) and redeploy. |
+| Antigravity `/model` shows no models | The menu comes live from `agy models`. Check that `agy` is signed in; the boot log line `agy models raw:` shows what it returned. |
+| ai-memory stopped after a redeploy | Its installer uses a systemd user service, which containers lack. The bridge now starts `ai-memory serve` itself when `~/.local/bin/ai-memory` exists and restarts it if it dies. See `/health` → `aiMemory` and `~/.bridge/ai-memory.log`. |
 | A redeploy did not change the bot's behaviour | Coolify kept the old `/app/bridge.mjs` file mount. Update it as described in [Updating](#updating) and compare the `version` in `/health`. |
 | It broke after a redeploy | Container naming went back to "Generated name". Redo step 5 and keep the webhook URL from step 7. |
 | `/help` works but questions fail | Claude is not authenticated: check `CLAUDE_CODE_OAUTH_TOKEN`, or generate a new one with `claude setup-token`. |
