@@ -1187,6 +1187,7 @@ services:
               providers: [
                 { id: 'claude', name: PROVIDERS.claude, installed: Boolean(versionCache.claude), version: versionCache.claude,
                   auth: env.CLAUDE_CODE_OAUTH_TOKEN ? 'Assinatura (CLAUDE_CODE_OAUTH_TOKEN)' : env.ANTHROPIC_API_KEY ? 'API key (ANTHROPIC_API_KEY)' : 'sem credencial',
+                  authKind: env.CLAUDE_CODE_OAUTH_TOKEN ? 'oauth' : env.ANTHROPIC_API_KEY ? 'apikey' : 'none',
                   models: CLAUDE_MODELS, efforts: EFFORTS, defaultModel: defModel(), defaultEffort: defEffort(),
                   envModel: ENV_MODEL, envEffort: ENV_EFFORT, permissionMode: PERMISSION_MODE },
                 { id: 'antigravity', name: PROVIDERS.antigravity, installed: agyInstalled, version: versionCache.agy,
