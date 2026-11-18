@@ -1113,10 +1113,39 @@ services:
             return out;
           }
 
-          function webSend(chatId, text) {
+          // Files sent from the web chat: saved in INBOX like WhatsApp media, and the path goes to the agent.
+          const WEB_MAX_FILE = 25 * 1024 * 1024;
+          function saveWebFiles(files) {
+            const out = [];
+            for (const f of Array.isArray(files) ? files.slice(0, 10) : []) {
+              const buf = Buffer.from(String(f.data || ''), 'base64');
+              if (!buf.length) continue;
+              if (buf.length > WEB_MAX_FILE) throw new Error('arquivo grande demais (máx. 25 MB): ' + f.name);
+              const type = String(f.type || 'application/octet-stream').slice(0, 100);
+              const ext = path.extname(String(f.name || '')) || '.' + (type.split('/')[1] || 'bin').split(';')[0];
+              const base = path.basename(String(f.name || 'arquivo'), path.extname(String(f.name || ''))).replace(/[^\w.-]+/g, '_').slice(0, 60) || 'arquivo';
+              const name = 'web-' + new Date().toISOString().replace(/[:.]/g, '-') + '-' + crypto.randomBytes(2).toString('hex') + '_' + base + ext.replace(/[^\w.]/g, '');
+              fs.writeFileSync(path.join(INBOX, name), buf);
+              out.push({ name: String(f.name || name).slice(0, 120), type, size: buf.length, file: name, voice: Boolean(f.voice) });
+            }
+            return out;
+          }
+          function promptWithFiles(text, files, transcript) {
+            if (!files.length) return text;
+            const notes = files.map((f) => {
+              const kind = f.voice ? 'uma mensagem de voz' : f.type.startsWith('image/') ? 'uma imagem' : f.type.startsWith('audio/') ? 'um áudio' : f.type.startsWith('video/') ? 'um vídeo' : 'um arquivo';
+              return '[O usuário enviou ' + kind + ' (' + f.type + ', ' + f.name + ') salvo em ' + path.join(INBOX, f.file) + ']';
+            });
+            if (transcript) notes.push('[Transcrição automática da mensagem de voz, feita no navegador: ' + transcript + ']');
+            return notes.join('\n') + '\n\n' + (text || (transcript ? 'Responda à mensagem de voz.' : 'Analise o conteúdo e responda.'));
+          }
+
+          function webSend(chatId, text, files = [], transcript = '') {
             const c = chat(chatId);
-            webAppend(chatId, { role: 'user', text });
-            if (!c.title || c.title === 'Nova conversa') { c.title = text.replace(/\s+/g, ' ').slice(0, 60); save(); }
+            webAppend(chatId, { role: 'user', text, ...(files.length ? { files } : {}), ...(transcript ? { transcript } : {}) });
+            const label = text || transcript || (files[0] && (files[0].voice ? 'Mensagem de voz' : files[0].name)) || '';
+            if (!c.title || c.title === 'Nova conversa') { c.title = label.replace(/\s+/g, ' ').slice(0, 60); save(); }
+            const prompt = promptWithFiles(text, files, transcript);
             enqueue(chatId, async () => {
               const agy = providerOf(c) === 'antigravity';
               const opts = { model: c.model || defModel(), effort: c.effort || defEffort(), resume: agy ? c.agySession : c.session };
@@ -1124,17 +1153,17 @@ services:
               const tools = [];
               const onEvent = (ev) => { for (const e of webEventsFrom(ev, tools)) webEmit(chatId, e); };
               const started = Date.now();
-              let r = await runAgent(chatId, text, opts, null, onEvent);
+              let r = await runAgent(chatId, prompt, opts, null, onEvent);
               if (r.error && opts.resume && !r.stopped && !r.timedOut) {
                 log('web: resume failed, starting fresh:', r.error);
                 if (agy) delete c.agySession; else delete c.session;
                 webEmit(chatId, { type: 'text', text: '(a sessão anterior não abriu; começando uma nova)' });
-                r = await runAgent(chatId, text, { ...opts, resume: undefined }, null, onEvent);
+                r = await runAgent(chatId, prompt, { ...opts, resume: undefined }, null, onEvent);
               }
               if (r.sessionId) { if (agy) c.agySession = r.sessionId; else c.session = r.sessionId; }
               if (r.usage) c.lastUsage = r.usage;
               const ms = r.usage ? r.usage.ms : Date.now() - started;
-              recordRun(chatId, { prompt: text.slice(0, 80), ms, cost: r.usage ? r.usage.cost : 0, error: r.stopped ? 'interrompido pelo usuário' : r.error });
+              recordRun(chatId, { prompt: label.slice(0, 80), ms, cost: r.usage ? r.usage.cost : 0, error: r.stopped ? 'interrompido pelo usuário' : r.error });
               webAppend(chatId, {
                 role: 'assistant', provider: providerOf(c), tools,
                 text: r.stopped ? '(interrompido)' : r.error ? 'Erro: ' + r.error : r.text,
@@ -1342,9 +1371,21 @@ services:
                 const id = 'web:' + b;
                 if (!chats[id]) return send(404, { error: 'conversa não encontrada' });
                 const text = String(body.text || '').trim();
-                if (!text) throw new Error('mensagem vazia');
-                webSend(id, text);
+                const transcript = String(body.transcript || '').trim().slice(0, 4000);
+                const files = saveWebFiles(body.files);
+                if (!text && !files.length) throw new Error('mensagem vazia');
+                webSend(id, text, files, transcript);
                 return send(202, { queued: true, ahead: Math.max(0, (pending.get(id) || 1) - 1) });
+              }
+              if (a === 'web' && b === 'files' && c2 && m === 'GET') {
+                const name = path.basename(c2);
+                const file = path.join(INBOX, name);
+                if (!name.startsWith('web-') || !fs.existsSync(file)) return send(404, { error: 'arquivo não encontrado' });
+                const ext = path.extname(name).toLowerCase();
+                const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic',
+                  '.pdf': 'application/pdf', '.webm': 'audio/webm', '.ogg': 'audio/ogg', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.mp4': 'video/mp4', '.wav': 'audio/wav', '.txt': 'text/plain' };
+                res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream', 'Content-Length': fs.statSync(file).size, 'Cache-Control': 'private, max-age=86400' });
+                return fs.createReadStream(file).pipe(res);
               }
               if (a === 'web' && b && c2 === 'events' && m === 'GET') {
                 const id = 'web:' + b;

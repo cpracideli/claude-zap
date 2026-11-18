@@ -95,6 +95,23 @@ try {
   check('stop', stop.body.stopped && h3.stopped, { stop: stop.body, h3 });
 
   const patched = await api('PATCH', '/chats/' + encodeURIComponent('web:' + id), { model: 'opus', reset: true });
+  // attachments + voice transcript
+  const f2 = await api('POST', '/web', {});
+  const id2 = f2.body.id.slice(4);
+  const png = Buffer.from('89504e470d0a1a0a', 'hex').toString('base64');
+  const up = await api('POST', '/web/' + id2 + '/messages', { text: '', transcript: 'qual o clima', files: [{ name: 'foto 1.png', type: 'image/png', data: png }, { name: 'voz.webm', type: 'audio/webm', data: png, voice: true }] });
+  check('attachments accepted', up.status === 202, up);
+  await wait(900);
+  const h4 = (await api('GET', '/web/' + id2 + '/messages')).body;
+  const u4 = h4.messages[0], a4 = h4.messages.at(-1);
+  check('attachments saved in history', u4.files.length === 2 && u4.files[0].file.startsWith('web-') && u4.files[1].voice && u4.transcript === 'qual o clima', u4);
+  check('agent gets file paths + transcript', a4.text.includes('inbox') && a4.text.includes('mensagem de voz') && a4.text.includes('qual o clima'), a4.text);
+  check('title from transcript', h4.chat.title === 'qual o clima', h4.chat);
+  const fr = await fetch(base + '/web/files/' + u4.files[0].file, { headers: { Authorization: 'Bearer ' + TOKEN } });
+  check('file served', fr.status === 200 && fr.headers.get('content-type') === 'image/png' && (await fr.arrayBuffer()).byteLength === 8);
+  check('file path traversal blocked', (await api('GET', '/web/files/' + encodeURIComponent('../web/x.json'))).status === 404);
+  check('empty message rejected', (await api('POST', '/web/' + id2 + '/messages', { text: '', files: [] })).status === 400);
+
   check('patch chat', patched.body.model === 'opus' && !patched.body.session, patched.body);
   check('patch rejects bad provider', (await api('PATCH', '/chats/' + encodeURIComponent('web:' + id), { provider: 'gpt' })).status === 400);
   check('chats list', (await api('GET', '/chats')).body.some((c) => c.id === 'web:' + id));
