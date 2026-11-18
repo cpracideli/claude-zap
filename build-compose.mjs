@@ -41,6 +41,7 @@ const compose = `services:
       - CLAUDE_EFFORT=${D}{CLAUDE_EFFORT}
       - TZ=${D}{TZ:-America/Sao_Paulo}
       - WEBHOOK_HMAC_KEY=${D}{WEBHOOK_HMAC_KEY}
+      - BRIDGE_ADMIN_TOKEN=${D}{BRIDGE_ADMIN_TOKEN}
       - DISABLE_AUTOUPDATER=1
     volumes:
       - claude-home:/home/node

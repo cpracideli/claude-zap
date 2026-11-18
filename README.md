@@ -169,6 +169,11 @@ The bot answers in Brazilian Portuguese by default (see `systemPrompt()` in `bri
 | `TZ` | `America/Sao_Paulo` | Timezone for schedules and the prompt |
 | `AI_MEMORY` | `on` | Set to `off` to stop the bridge from supervising the [ai-memory](https://github.com/akitaonrails/ai-memory) server |
 | `AI_MEMORY_SERVER_URL` | `http://127.0.0.1:49374` | Where the bridge checks `/healthz` before starting `ai-memory serve` |
+| `BRIDGE_ADMIN_TOKEN` | (empty) | Turns on the `/admin` API used by the [Agent Control](https://github.com/cpracideli/agent-control-panel) web panel (web chat, MCP, providers, schedules). Empty = API off |
+
+### Web panel (Agent Control)
+
+With `BRIDGE_ADMIN_TOKEN` set, the bridge serves `/admin/*` on the internal network (Bearer token required). The [agent-control-panel](https://github.com/cpracideli/agent-control-panel) uses it to chat with the agent from the browser (conversations `web:<id>`, streamed live), manage MCP servers (`claude mcp add-json/remove`, `agy mcp`), pick the provider/model/effort per conversation and globally, manage schedules, send WhatsApp messages and read the audit log. Set the same token on the panel.
 
 ---
 

@@ -34,6 +34,7 @@ services:
       - CLAUDE_EFFORT=${CLAUDE_EFFORT}
       - TZ=${TZ:-America/Sao_Paulo}
       - WEBHOOK_HMAC_KEY=${WEBHOOK_HMAC_KEY}
+      - BRIDGE_ADMIN_TOKEN=${BRIDGE_ADMIN_TOKEN}
       - DISABLE_AUTOUPDATER=1
     volumes:
       - claude-home:/home/node
@@ -68,8 +69,8 @@ services:
           const DATA_DIR = env.DATA_DIR || path.join(env.HOME || '/tmp', '.bridge');
           const PERMISSION_MODE = env.CLAUDE_PERMISSION_MODE || 'default';
           const ALLOWED_TOOLS = env.CLAUDE_ALLOWED_TOOLS || 'Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,TodoWrite';
-          const DEFAULT_MODEL = env.CLAUDE_MODEL || '';
-          const DEFAULT_EFFORT = env.CLAUDE_EFFORT || '';
+          const ENV_MODEL = env.CLAUDE_MODEL || '';
+          const ENV_EFFORT = env.CLAUDE_EFFORT || '';
           const TIMEOUT_MS = Number(env.CLAUDE_TIMEOUT_SECONDS || 1800) * 1000;
           const TZ = env.TZ || 'America/Sao_Paulo';
           const MAX_CHUNK = 3500;
@@ -92,6 +93,17 @@ services:
           } catch {}
           const save = () => fs.writeFileSync(STATE_FILE, JSON.stringify(chats, null, 2));
           const chat = (id) => (chats[id] = chats[id] || {});
+
+          // Global settings changed from the web panel: default provider for chats that never picked one, default model/effort.
+          const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+          let settings = {};
+          try { settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); } catch {}
+          const saveSettings = () => fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+          const providerOf = (c) => c.provider || settings.defaultProvider || 'claude';
+          const defModel = () => settings.claudeModel || ENV_MODEL;
+          const defEffort = () => settings.claudeEffort || ENV_EFFORT;
+          // Conversations started from the web panel use ids "web:<hex>". Their replies go to a history file, not to WhatsApp.
+          const isWeb = (chatId) => String(chatId).startsWith('web:');
 
           const log = (...a) => console.log(new Date().toISOString(), ...a);
           const wahaBase = () => {
@@ -161,6 +173,7 @@ services:
           }
 
           async function reply(chatId, text, raw) {
+            if (isWeb(chatId)) return webAppend(chatId, { role: 'assistant', text: String(text) });
             for (const part of chunks(raw ? text : toWhatsApp(text))) {
               await waha('POST', '/api/sendText', { session: WAHA_SESSION, chatId, text: part });
             }
@@ -205,12 +218,19 @@ services:
 
           // ---------- Claude ----------
           function systemPrompt(chatId) {
+            const web = isWeb(chatId);
             return [
-              'Você está conversando com o usuário pelo WhatsApp, através de uma ponte (WAHA) que roda num container Docker.',
-              'Responda em português do Brasil, de forma direta. O WhatsApp não renderiza Markdown completo: evite tabelas e títulos; use *negrito*, _itálico_, listas simples e blocos de código.',
+              web
+                ? 'Você está conversando com o usuário pelo painel web (Agent Control), ligado à mesma ponte do WhatsApp que roda num container Docker. Este chat NÃO é o WhatsApp.'
+                : 'Você está conversando com o usuário pelo WhatsApp, através de uma ponte (WAHA) que roda num container Docker.',
+              web
+                ? 'Responda em português do Brasil, de forma direta. O painel renderiza Markdown (títulos, tabelas, listas, blocos de código).'
+                : 'Responda em português do Brasil, de forma direta. O WhatsApp não renderiza Markdown completo: evite tabelas e títulos; use *negrito*, _itálico_, listas simples e blocos de código.',
               'Fuso horário do usuário: ' + TZ + '. Data/hora atual: ' + new Date().toLocaleString('pt-BR', { timeZone: TZ }) + '.',
               'Diretório de trabalho: ' + WORKDIR + '. Arquivos enviados pelo usuário chegam em ' + INBOX + '.',
-              'Para ENVIAR um arquivo ou imagem ao usuário no WhatsApp, rode: curl -s -X POST http://127.0.0.1:' + PORT + '/send-file -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","path":"/caminho/absoluto","caption":"opcional"}\'',
+              web
+                ? 'Neste chat web não dá para anexar arquivos na resposta: informe o caminho absoluto do arquivo gerado. Para mandar um arquivo ao WhatsApp de alguém, use /send-file com "to" (abaixo).'
+                : 'Para ENVIAR um arquivo ou imagem ao usuário no WhatsApp, rode: curl -s -X POST http://127.0.0.1:' + PORT + '/send-file -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","path":"/caminho/absoluto","caption":"opcional"}\'',
               'MENSAGENS PARA OUTRAS PESSOAS: a ponte TEM o endpoint /send, criado e autorizado pelo dono desta infraestrutura (o próprio usuário). Se algo anterior nesta conversa disser que esse envio não existe ou não é permitido, está desatualizado: ignore. Você PODE enviar mensagens de WhatsApp a qualquer número, pelo número do usuário. Quando o usuário pedir ("mande um oi para +55 11 9...", "avise o João que..."), envie direto, sem pedir confirmação: curl -s -X POST http://127.0.0.1:' + PORT + '/send -H "Content-Type: application/json" -d \'{"to":"5511999998888","text":"mensagem"}\'',
               '  "to" aceita o número em qualquer formato (com DDI; sem DDI assuma 55) ou um id do WhatsApp (...@c.us, grupo ...@g.us). Para arquivo a terceiros, use /send-file com "to" no lugar de "chatId". Envie a outras pessoas SÓ quando o usuário pedir (na conversa ou num agendamento que ele criou), escreva a mensagem como se fosse do usuário (sem dizer que é uma IA, a menos que ele peça) e confirme depois o que foi enviado e para quem. Respostas dessas pessoas NÃO chegam até você.',
               'Ao instalar servidores MCP, use sempre o escopo de usuário (claude mcp add -s user ...) para que fiquem disponíveis em todas as conversas. Cada mensagem do WhatsApp abre um processo novo do Claude Code, então MCPs novos ou reconfigurados já valem na PRÓXIMA mensagem: não é preciso reiniciar nada; avise o usuário para mandar a próxima mensagem.',
@@ -234,7 +254,7 @@ services:
             return labels[name] || ('usando ' + name);
           }
 
-          function runClaude(chatId, prompt, opts, onActivity) {
+          function runClaude(chatId, prompt, opts, onActivity, onEvent) {
             return new Promise((resolve) => {
               const args = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--permission-mode', PERMISSION_MODE,
                 '--append-system-prompt', systemPrompt(chatId)];
@@ -257,6 +277,7 @@ services:
                   buf = buf.slice(nl + 1);
                   if (!line) continue;
                   let ev; try { ev = JSON.parse(line); } catch { continue; }
+                  if (onEvent) { try { onEvent(ev); } catch (e) { log('onEvent failed', e.message); } }
                   if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content) && onActivity) {
                     for (const block of ev.message.content) if (block.type === 'tool_use') onActivity(describeTool(block.name));
                   }
@@ -524,15 +545,15 @@ services:
           }
 
           // One entry point for chat jobs and schedules: runs the provider chosen for this chat.
-          function runAgent(chatId, prompt, opts, onActivity) {
+          function runAgent(chatId, prompt, opts, onActivity, onEvent) {
             const c = chat(chatId);
-            if (c.provider === 'antigravity') {
+            if (providerOf(c) === 'antigravity') {
               const first = !opts.resume;
               const text = first ? antigravityPrompt(chatId) + '\n\n---\n\n' + prompt : prompt;
               const pick = resolveAgyRun(c);
               return runAntigravity(chatId, text, { model: pick.model, effort: pick.effort, resume: opts.resume });
             }
-            return runClaude(chatId, prompt, opts, onActivity);
+            return runClaude(chatId, prompt, opts, onActivity, onEvent);
           }
 
           // ---------- queue / running ----------
@@ -691,9 +712,9 @@ services:
               case '/help': return sendMenu(chatId, 'O que você quer fazer?', HELP_MENU, HELP);
               case '/new':
                 delete c.session; delete c.agySession; save();
-                return reply(chatId, 'Nova conversa iniciada. Modelo: ' + (c.model || DEFAULT_MODEL || 'padrão') + '.', true);
+                return reply(chatId, 'Nova conversa iniciada. Modelo: ' + (c.model || defModel() || 'padrão') + '.', true);
               case '/provider': {
-                const cur = PROVIDERS[c.provider || 'claude'];
+                const cur = PROVIDERS[providerOf(c)];
                 if (!arg) return sendChoice(chatId, 'Provedor atual: ' + cur + '. Escolha:', PROVIDER_CHOICES);
                 const a = arg.toLowerCase(); const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : a;
                 if (!PROVIDERS[want]) return reply(chatId, 'Provedor inválido. Opções: claude, antigravity.', true);
@@ -701,19 +722,19 @@ services:
                 return reply(chatId, 'Provedor desta conversa: ' + PROVIDERS[want] + '. Vale a partir da próxima mensagem. Use /new para começar do zero no novo provedor.', true);
               }
               case '/model':
-                if (c.provider === 'antigravity') return agyModelCommand(chatId, c, arg, isDefault);
-                if (!arg) return sendChoice(chatId, 'Modelo atual: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Escolha o novo:', MODEL_CHOICES);
+                if (providerOf(c) === 'antigravity') return agyModelCommand(chatId, c, arg, isDefault);
+                if (!arg) return sendChoice(chatId, 'Modelo atual: ' + (c.model || defModel() || 'padrão da conta') + '. Escolha o novo:', MODEL_CHOICES);
                 if (isDefault(arg)) delete c.model; else c.model = arg;
                 save();
-                return reply(chatId, 'Modelo desta conversa: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + '. Vale a partir da próxima mensagem.', true);
+                return reply(chatId, 'Modelo desta conversa: ' + (c.model || defModel() || 'padrão da conta') + '. Vale a partir da próxima mensagem.', true);
               case '/effort':
-                if (c.provider === 'antigravity') return agyEffortCommand(chatId, c, arg, isDefault);
-                if (!arg) return sendChoice(chatId, 'Esforço atual: ' + (c.effort || DEFAULT_EFFORT || 'padrão') + '. Escolha o novo:', EFFORT_CHOICES);
+                if (providerOf(c) === 'antigravity') return agyEffortCommand(chatId, c, arg, isDefault);
+                if (!arg) return sendChoice(chatId, 'Esforço atual: ' + (c.effort || defEffort() || 'padrão') + '. Escolha o novo:', EFFORT_CHOICES);
                 if (isDefault(arg)) delete c.effort;
                 else if (EFFORTS.includes(arg.toLowerCase())) c.effort = arg.toLowerCase();
                 else return reply(chatId, 'Nível inválido. Opções: ' + EFFORTS.join(', ') + ', default.', true);
                 save();
-                return reply(chatId, 'Esforço desta conversa: ' + (c.effort || DEFAULT_EFFORT || 'padrão') + '.', true);
+                return reply(chatId, 'Esforço desta conversa: ' + (c.effort || defEffort() || 'padrão') + '.', true);
               case '/stop': {
                 const r = running.get(chatId);
                 if (!r) return reply(chatId, 'Nada em andamento.', true);
@@ -727,11 +748,11 @@ services:
                 const t = c.totals;
                 return reply(chatId, [
                   '*Status*',
-                  'Provedor: ' + PROVIDERS[c.provider || 'claude'],
-                  'Sessão: ' + (((c.provider === 'antigravity' ? c.agySession : c.session) || '').slice(0, 8) || 'nenhuma (próxima mensagem inicia uma)'),
-                  c.provider === 'antigravity'
+                  'Provedor: ' + PROVIDERS[providerOf(c)],
+                  'Sessão: ' + (((providerOf(c) === 'antigravity' ? c.agySession : c.session) || '').slice(0, 8) || 'nenhuma (próxima mensagem inicia uma)'),
+                  providerOf(c) === 'antigravity'
                     ? 'Modelo: ' + agyModelLabel(c) + ' | Esforço: ' + (c.agyEffort || 'padrão') + ' | enviado ao agy: ' + (resolveAgyRun(c).model || 'padrão')
-                    : 'Modelo: ' + (c.model || DEFAULT_MODEL || 'padrão da conta') + ' | Esforço: ' + (c.effort || DEFAULT_EFFORT || 'padrão'),
+                    : 'Modelo: ' + (c.model || defModel() || 'padrão da conta') + ' | Esforço: ' + (c.effort || defEffort() || 'padrão'),
                   'Permissões: ' + PERMISSION_MODE + ' | ai-memory: ' + aiMemory.status,
                   r ? 'Em andamento há ' + fmtDur(Date.now() - r.started) + ': "' + r.prompt + '"' : 'Ocioso',
                   q ? 'Na fila: ' + q : '',
@@ -860,8 +881,8 @@ services:
               const typing = () => waha('POST', '/api/startTyping', { session: WAHA_SESSION, chatId }).catch(() => {});
               typing();
               const keepTyping = setInterval(typing, 20000);
-              const agy = c.provider === 'antigravity';
-              const opts = { model: c.model || DEFAULT_MODEL, effort: c.effort || DEFAULT_EFFORT, resume: agy ? c.agySession : c.session };
+              const agy = providerOf(c) === 'antigravity';
+              const opts = { model: c.model || defModel(), effort: c.effort || defEffort(), resume: agy ? c.agySession : c.session };
               const started = Date.now();
               const status = liveStatus(chatId);
               const onActivity = (label) => status.activity(label);
@@ -965,7 +986,7 @@ services:
               const prompt = '[Tarefa agendada #' + s.id + ': ' + s.description + ']\n' +
                 'Execute agora. Sua resposta final será enviada ao usuário pelo WhatsApp como a mensagem desta tarefa.\n\n' + s.prompt;
               const started = Date.now();
-              const r = await runAgent(s.chatId, prompt, { model: c.model || DEFAULT_MODEL, effort: c.effort || DEFAULT_EFFORT });
+              const r = await runAgent(s.chatId, prompt, { model: c.model || defModel(), effort: c.effort || defEffort() });
               if (r.stopped) return;
               recordRun(s.chatId, { prompt: '[agendamento #' + s.id + '] ' + s.description.slice(0, 60),
                 ms: r.usage ? r.usage.ms : Date.now() - started, cost: r.usage ? r.usage.cost : 0, error: r.error });
@@ -1043,6 +1064,339 @@ services:
             return result;
           }
 
+          // ---------- web chat (conversations started from the Agent Control panel) ----------
+          const WEB_DIR = path.join(DATA_DIR, 'web');
+          fs.mkdirSync(WEB_DIR, { recursive: true });
+          const webFile = (chatId) => path.join(WEB_DIR, String(chatId).slice(4).replace(/[^a-f0-9]/g, '') + '.json');
+          const webListeners = new Map(); // chatId -> Set(fn(event))
+          function webHistory(chatId) {
+            try { return JSON.parse(fs.readFileSync(webFile(chatId), 'utf8')); } catch { return []; }
+          }
+          function webEmit(chatId, ev) {
+            for (const fn of webListeners.get(chatId) || []) { try { fn(ev); } catch {} }
+          }
+          function webAppend(chatId, msg) {
+            const m = { id: crypto.randomBytes(4).toString('hex'), at: new Date().toISOString(), ...msg };
+            const h = webHistory(chatId);
+            h.push(m);
+            fs.writeFileSync(webFile(chatId), JSON.stringify(h.slice(-500)));
+            webEmit(chatId, { type: 'message', message: m });
+            return m;
+          }
+          const clip = (s, n) => { s = typeof s === 'string' ? s : JSON.stringify(s); return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); };
+
+          // Turns Claude Code stream-json events into small events for the panel: text, tool calls, tool results.
+          function webEventsFrom(ev, tools) {
+            const out = [];
+            if (ev.type === 'system' && ev.subtype === 'init') {
+              out.push({ type: 'init', model: ev.model, mcp: (ev.mcp_servers || []).map((s) => ({ name: s.name, status: s.status })) });
+            }
+            if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
+              for (const b of ev.message.content) {
+                if (b.type === 'text' && b.text) out.push({ type: 'text', text: b.text });
+                if (b.type === 'tool_use') {
+                  const t = { id: b.id, name: b.name, input: clip(b.input, 600) };
+                  tools.push(t);
+                  out.push({ type: 'tool', ...t });
+                }
+              }
+            }
+            if (ev.type === 'user' && ev.message && Array.isArray(ev.message.content)) {
+              for (const b of ev.message.content) {
+                if (b.type !== 'tool_result') continue;
+                const text = Array.isArray(b.content) ? b.content.map((x) => x.text || '').join('\n') : b.content;
+                const t = tools.find((x) => x.id === b.tool_use_id);
+                if (t) { t.result = clip(text, 800); t.isError = Boolean(b.is_error); }
+                out.push({ type: 'tool_result', id: b.tool_use_id, text: clip(text, 800), isError: Boolean(b.is_error) });
+              }
+            }
+            return out;
+          }
+
+          function webSend(chatId, text) {
+            const c = chat(chatId);
+            webAppend(chatId, { role: 'user', text });
+            if (!c.title || c.title === 'Nova conversa') { c.title = text.replace(/\s+/g, ' ').slice(0, 60); save(); }
+            enqueue(chatId, async () => {
+              const agy = providerOf(c) === 'antigravity';
+              const opts = { model: c.model || defModel(), effort: c.effort || defEffort(), resume: agy ? c.agySession : c.session };
+              webEmit(chatId, { type: 'start', provider: providerOf(c) });
+              const tools = [];
+              const onEvent = (ev) => { for (const e of webEventsFrom(ev, tools)) webEmit(chatId, e); };
+              const started = Date.now();
+              let r = await runAgent(chatId, text, opts, null, onEvent);
+              if (r.error && opts.resume && !r.stopped && !r.timedOut) {
+                log('web: resume failed, starting fresh:', r.error);
+                if (agy) delete c.agySession; else delete c.session;
+                webEmit(chatId, { type: 'text', text: '(a sessão anterior não abriu; começando uma nova)' });
+                r = await runAgent(chatId, text, { ...opts, resume: undefined }, null, onEvent);
+              }
+              if (r.sessionId) { if (agy) c.agySession = r.sessionId; else c.session = r.sessionId; }
+              if (r.usage) c.lastUsage = r.usage;
+              const ms = r.usage ? r.usage.ms : Date.now() - started;
+              recordRun(chatId, { prompt: text.slice(0, 80), ms, cost: r.usage ? r.usage.cost : 0, error: r.stopped ? 'interrompido pelo usuário' : r.error });
+              webAppend(chatId, {
+                role: 'assistant', provider: providerOf(c), tools,
+                text: r.stopped ? '(interrompido)' : r.error ? 'Erro: ' + r.error : r.text,
+                error: Boolean(r.error), stopped: Boolean(r.stopped),
+                usage: { ms, cost: r.usage ? r.usage.cost : 0, turns: r.usage ? r.usage.turns : 0 },
+              });
+              webEmit(chatId, { type: 'idle' });
+            });
+          }
+
+          // ---------- admin API for the Agent Control panel ----------
+          // Reached over the private coolify network at http://claude-bridge-claude-zap:3000/admin/...
+          // Every call needs "Authorization: Bearer <BRIDGE_ADMIN_TOKEN>". Without that variable the API is off.
+          const ADMIN_TOKEN = env.BRIDGE_ADMIN_TOKEN || '';
+          const CLAUDE_MODELS = [{ id: 'opus', label: 'Opus' }, { id: 'sonnet', label: 'Sonnet' }, { id: 'haiku', label: 'Haiku' }, { id: 'fable', label: 'Fable' }];
+
+          function adminAuthorized(req) {
+            if (!ADMIN_TOKEN) return false;
+            const got = Buffer.from(String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
+            const want = Buffer.from(ADMIN_TOKEN);
+            return got.length === want.length && crypto.timingSafeEqual(got, want);
+          }
+
+          function execCmd(bin, args, ms = 60000) {
+            const isScript = bin.endsWith('.mjs') || bin.endsWith('.js');
+            return new Promise((resolve) => {
+              let out = '', err = '';
+              let child;
+              try { child = spawn(isScript ? process.execPath : bin, isScript ? [bin, ...args] : args, { cwd: WORKDIR, env, stdio: ['ignore', 'pipe', 'pipe'] }); }
+              catch (e) { return resolve({ code: -1, out: '', err: e.message }); }
+              const timer = setTimeout(() => child.kill('SIGTERM'), ms);
+              child.stdout.on('data', (d) => { out += d; });
+              child.stderr.on('data', (d) => { err += d; });
+              child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, out, err: e.message }); });
+              child.on('close', (code) => { clearTimeout(timer); resolve({ code, out: stripAnsi(out), err: stripAnsi(err) }); });
+            });
+          }
+
+          let versionCache = { at: 0, claude: '', agy: '' };
+          async function providersInfo() {
+            if (Date.now() - versionCache.at > 10 * 60 * 1000) {
+              const cl = await execCmd(CLAUDE_BIN, ['--version'], 20000);
+              const ag = fs.existsSync(AGY_BIN) ? await execCmd(AGY_BIN, ['--version'], 20000) : null;
+              versionCache = { at: Date.now(), claude: cl.code === 0 ? cl.out.trim() : '', agy: ag && ag.code === 0 ? ag.out.trim() : '' };
+            }
+            const agyInstalled = fs.existsSync(AGY_BIN);
+            const cat = agyInstalled ? await refreshAgyCatalog(false) : { models: [] };
+            return {
+              defaultProvider: settings.defaultProvider || 'claude',
+              providers: [
+                { id: 'claude', name: PROVIDERS.claude, installed: Boolean(versionCache.claude), version: versionCache.claude,
+                  auth: env.CLAUDE_CODE_OAUTH_TOKEN ? 'Assinatura (CLAUDE_CODE_OAUTH_TOKEN)' : env.ANTHROPIC_API_KEY ? 'API key (ANTHROPIC_API_KEY)' : 'sem credencial',
+                  models: CLAUDE_MODELS, efforts: EFFORTS, defaultModel: defModel(), defaultEffort: defEffort(),
+                  envModel: ENV_MODEL, envEffort: ENV_EFFORT, permissionMode: PERMISSION_MODE },
+                { id: 'antigravity', name: PROVIDERS.antigravity, installed: agyInstalled, version: versionCache.agy,
+                  models: cat.models.map((g) => ({ id: g.base, label: g.label, efforts: g.efforts })) },
+              ],
+            };
+          }
+
+          function chatView(id) {
+            const c = chats[id] || {};
+            const r = running.get(id);
+            return {
+              id, kind: isWeb(id) ? 'web' : 'whatsapp', title: c.title || (isWeb(id) ? 'Conversa web' : id.split('@')[0]),
+              provider: providerOf(c), providerSet: Boolean(c.provider),
+              model: c.model || '', effort: c.effort || '', agyModel: c.agyModel || '', agyEffort: c.agyEffort || '',
+              session: c.session || '', agySession: c.agySession || '', created: c.created || '',
+              totals: c.totals || { runs: 0, cost: 0, ms: 0, errors: 0 }, runs: c.runs || [], lastUsage: c.lastUsage || null,
+              running: r ? { started: r.started, prompt: r.prompt } : null,
+              queued: Math.max(0, (pending.get(id) || 0) - (r ? 1 : 0)),
+            };
+          }
+
+          // Claude MCP servers: user scope and local scope live in ~/.claude.json; project scope in WORKDIR/.mcp.json.
+          function claudeMcpConfig() {
+            const out = { user: {}, local: {}, project: {} };
+            try {
+              const j = JSON.parse(fs.readFileSync(path.join(env.HOME || '/tmp', '.claude.json'), 'utf8'));
+              out.user = j.mcpServers || {};
+              out.local = (j.projects && j.projects[WORKDIR] && j.projects[WORKDIR].mcpServers) || {};
+            } catch {}
+            try { out.project = JSON.parse(fs.readFileSync(path.join(WORKDIR, '.mcp.json'), 'utf8')).mcpServers || {}; } catch {}
+            return out;
+          }
+
+          const AGY_MCP_FILES = ['.gemini/antigravity/mcp_config.json', '.antigravity/mcp_config.json', '.antigravity/mcp.json', '.config/antigravity/mcp.json'];
+          async function agyMcp() {
+            if (!fs.existsSync(AGY_BIN)) return { installed: false };
+            const r = await execCmd(AGY_BIN, ['mcp', 'list'], 30000);
+            let config = null, configPath = '';
+            for (const f of AGY_MCP_FILES) {
+              const p = path.join(env.HOME || '/tmp', f);
+              try { config = JSON.parse(fs.readFileSync(p, 'utf8')); configPath = p; break; } catch {}
+            }
+            return { installed: true, list: (r.out + (r.code ? '\n' + r.err : '')).trim(), config, configPath };
+          }
+
+          const validName = (n) => /^[A-Za-z0-9_.-]{1,64}(?![\s\S])/.test(String(n || ''));
+          async function addMcp(b) {
+            if (!validName(b.name)) throw new Error('nome inválido (use letras, números, _ . -)');
+            const transport = b.transport || (b.url ? 'http' : 'stdio');
+            if (transport === 'stdio' && !b.command) throw new Error('informe o comando');
+            if (transport !== 'stdio' && !b.url) throw new Error('informe a URL');
+            let r;
+            if ((b.provider || 'claude') === 'claude') {
+              const cfg = transport === 'stdio'
+                ? { type: 'stdio', command: b.command, args: b.args || [], env: b.env || {} }
+                : { type: transport, url: b.url, headers: b.headers || {} };
+              r = await execCmd(CLAUDE_BIN, ['mcp', 'add-json', '-s', b.scope || 'user', b.name, JSON.stringify(cfg)], 60000);
+            } else {
+              if (!fs.existsSync(AGY_BIN)) throw new Error('agy não está instalado');
+              r = await execCmd(AGY_BIN, transport === 'stdio' ? ['mcp', 'add', '--', b.name, b.command, ...(b.args || [])] : ['mcp', 'add', '--', b.name, b.url], 60000);
+            }
+            audit({ action: 'mcp-add', provider: b.provider || 'claude', name: b.name, transport, ok: r.code === 0 });
+            if (r.code !== 0) throw new Error((r.err || r.out || 'falhou com código ' + r.code).trim().slice(0, 800));
+            return { ok: true, output: (r.out + r.err).trim() };
+          }
+          async function removeMcp(provider, name, scope) {
+            if (!validName(name)) throw new Error('nome inválido');
+            const r = provider === 'antigravity'
+              ? await execCmd(AGY_BIN, ['mcp', 'remove', name], 60000)
+              : await execCmd(CLAUDE_BIN, ['mcp', 'remove', '-s', scope || 'user', name], 60000);
+            audit({ action: 'mcp-remove', provider, name, ok: r.code === 0 });
+            if (r.code !== 0) throw new Error((r.err || r.out || 'falhou com código ' + r.code).trim().slice(0, 800));
+            return { ok: true, output: (r.out + r.err).trim() };
+          }
+
+          function readAudit(n) {
+            try {
+              return fs.readFileSync(AUDIT_FILE, 'utf8').trim().split('\n').slice(-n).reverse()
+                .map((l) => { try { return JSON.parse(l); } catch { return { raw: l }; } });
+            } catch { return []; }
+          }
+
+          async function handleAdmin(req, res, u, raw) {
+            const send = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
+            if (!adminAuthorized(req)) return send(ADMIN_TOKEN ? 401 : 503, { error: ADMIN_TOKEN ? 'não autorizado' : 'BRIDGE_ADMIN_TOKEN não configurado' });
+            const parts = u.pathname.split('/').slice(2).map(decodeURIComponent); // after /admin
+            const m = req.method;
+            let body = {};
+            if (raw.length) { try { body = JSON.parse(raw.toString('utf8')); } catch { return send(400, { error: 'JSON inválido' }); } }
+            const [a, b, c2] = parts;
+            try {
+              if (a === 'overview' && m === 'GET') {
+                return send(200, { version: VERSION, tz: TZ, permissionMode: PERMISSION_MODE, workdir: WORKDIR, uptime: Math.round(process.uptime()),
+                  aiMemory: { status: aiMemory.status, restarts: aiMemory.restarts }, allowed: ALLOWED.length, settings,
+                  running: [...running.entries()].map(([id, r]) => ({ chatId: id, started: r.started, prompt: r.prompt })),
+                  chats: Object.keys(chats).length, schedules: schedules.length });
+              }
+              if (a === 'providers' && m === 'GET') return send(200, await providersInfo());
+              if (a === 'settings' && m === 'PUT') {
+                for (const k of ['defaultProvider', 'claudeModel', 'claudeEffort']) {
+                  if (!(k in body)) continue;
+                  if (!body[k]) delete settings[k]; else settings[k] = String(body[k]);
+                }
+                if (settings.defaultProvider && !PROVIDERS[settings.defaultProvider]) throw new Error('provedor inválido');
+                if (settings.claudeEffort && !EFFORTS.includes(settings.claudeEffort)) throw new Error('esforço inválido');
+                saveSettings();
+                return send(200, settings);
+              }
+              if (a === 'chats' && !b && m === 'GET') {
+                return send(200, Object.keys(chats).map(chatView).sort((x, y) => String((y.runs.at(-1) || {}).at || y.created).localeCompare(String((x.runs.at(-1) || {}).at || x.created))));
+              }
+              if (a === 'chats' && b && !c2 && m === 'PATCH') {
+                if (!chats[b]) return send(404, { error: 'conversa não encontrada' });
+                const c = chats[b];
+                if ('provider' in body) { if (body.provider && !PROVIDERS[body.provider]) throw new Error('provedor inválido'); if (body.provider) c.provider = body.provider; else delete c.provider; }
+                for (const k of ['model', 'effort', 'agyModel', 'agyEffort', 'title']) if (k in body) { if (body[k]) c[k] = String(body[k]); else delete c[k]; }
+                if (c.effort && !EFFORTS.includes(c.effort)) { delete c.effort; throw new Error('esforço inválido'); }
+                if (body.reset) { delete c.session; delete c.agySession; }
+                save();
+                return send(200, chatView(b));
+              }
+              if (a === 'chats' && b && c2 === 'stop' && m === 'POST') {
+                const r = running.get(b);
+                if (!r) return send(200, { stopped: false });
+                r.child.kill('SIGTERM');
+                return send(200, { stopped: true });
+              }
+              if (a === 'chats' && b && !c2 && m === 'DELETE') {
+                if (!isWeb(b)) throw new Error('só conversas web podem ser apagadas');
+                const r = running.get(b); if (r) r.child.kill('SIGTERM');
+                delete chats[b]; save();
+                schedules = schedules.filter((s) => s.chatId !== b); saveSched();
+                try { fs.unlinkSync(webFile(b)); } catch {}
+                return send(200, { deleted: b });
+              }
+              if (a === 'web' && !b && m === 'POST') {
+                const id = 'web:' + crypto.randomBytes(6).toString('hex');
+                const c = chat(id);
+                c.title = body.title || 'Nova conversa'; c.created = new Date().toISOString();
+                if (body.provider && PROVIDERS[body.provider]) c.provider = body.provider;
+                for (const k of ['model', 'effort', 'agyModel', 'agyEffort']) if (body[k]) c[k] = String(body[k]);
+                save();
+                return send(200, chatView(id));
+              }
+              if (a === 'web' && b && c2 === 'messages' && m === 'GET') {
+                const id = 'web:' + b;
+                if (!chats[id]) return send(404, { error: 'conversa não encontrada' });
+                return send(200, { chat: chatView(id), messages: webHistory(id) });
+              }
+              if (a === 'web' && b && c2 === 'messages' && m === 'POST') {
+                const id = 'web:' + b;
+                if (!chats[id]) return send(404, { error: 'conversa não encontrada' });
+                const text = String(body.text || '').trim();
+                if (!text) throw new Error('mensagem vazia');
+                webSend(id, text);
+                return send(202, { queued: true, ahead: Math.max(0, (pending.get(id) || 1) - 1) });
+              }
+              if (a === 'web' && b && c2 === 'events' && m === 'GET') {
+                const id = 'web:' + b;
+                res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+                const write = (ev) => res.write('data: ' + JSON.stringify(ev) + '\n\n');
+                write({ type: 'hello', running: running.has(id) ? { started: running.get(id).started } : null });
+                const set = webListeners.get(id) || new Set();
+                set.add(write); webListeners.set(id, set);
+                const ping = setInterval(() => res.write(': ping\n\n'), 20000);
+                res.on('close', () => { clearInterval(ping); set.delete(write); if (!set.size) webListeners.delete(id); });
+                return;
+              }
+              if (a === 'schedules' && !b && m === 'GET') return send(200, schedules.map((s) => ({ ...s, chatTitle: chatView(s.chatId).title })));
+              if (a === 'schedules' && !b && m === 'POST') return send(200, addSchedule(body));
+              if (a === 'schedules' && b) {
+                const s = schedules.find((x) => x.id === b);
+                if (!s) return send(404, { error: 'agendamento não encontrado' });
+                if (m === 'PATCH') {
+                  if ('paused' in body) s.paused = Boolean(body.paused);
+                  if (body.description) s.description = String(body.description).slice(0, 120);
+                  if (body.prompt) s.prompt = String(body.prompt);
+                  if (body.cron) { if (!validCron(body.cron)) throw new Error('cron inválido'); s.cron = String(body.cron).trim(); }
+                  saveSched();
+                  return send(200, s);
+                }
+                if (m === 'POST' && c2 === 'run') { runSchedule(s); return send(200, { started: true }); }
+                if (m === 'DELETE') {
+                  schedules = schedules.filter((x) => x !== s); saveSched();
+                  audit({ action: 'schedule-delete', id: s.id, via: 'panel' });
+                  return send(200, { deleted: s.id });
+                }
+              }
+              if (a === 'mcp' && !b && m === 'GET') {
+                const agy = await agyMcp();
+                return send(200, { claude: claudeMcpConfig(), antigravity: agy });
+              }
+              if (a === 'mcp' && b === 'status' && m === 'GET') {
+                const r = await execCmd(CLAUDE_BIN, ['mcp', 'list'], 90000);
+                return send(200, { output: (r.out + (r.code ? '\n' + r.err : '')).trim(), code: r.code });
+              }
+              if (a === 'mcp' && !b && m === 'POST') return send(200, await addMcp(body));
+              if (a === 'mcp' && b && c2 && m === 'DELETE') return send(200, await removeMcp(b, c2, u.searchParams.get('scope')));
+              if (a === 'audit' && m === 'GET') return send(200, readAudit(Math.min(Number(u.searchParams.get('n')) || 100, 1000)));
+              if (a === 'send' && m === 'POST') {
+                const out = await sendMessage({ to: body.to, text: body.text, raw: true });
+                return send(200, out);
+              }
+              return send(404, { error: 'rota não encontrada' });
+            } catch (e) {
+              return send(400, { error: e.message });
+            }
+          }
+
           // ---------- HTTP ----------
           const isLocal = (req) => ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
           const server = http.createServer((req, res) => {
@@ -1056,6 +1410,7 @@ services:
             req.on('end', async () => {
               const raw = Buffer.concat(bufs);
               const u = new URL(req.url, 'http://local');
+              if (u.pathname.startsWith('/admin/')) return handleAdmin(req, res, u, raw).catch((e) => { log('admin error', e.message); try { res.writeHead(500); res.end(); } catch {} });
               if (u.pathname.startsWith('/schedules')) {
                 if (!isLocal(req)) { res.writeHead(403); return res.end(); }
                 try {
