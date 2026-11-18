@@ -132,6 +132,34 @@ try {
   check('mcp remove missing fails', (await api('DELETE', '/mcp/claude/playwright')).status === 400);
   check('audit', (await api('GET', '/audit')).body.some((e) => e.action === 'mcp-add'));
 
+  // Antigravity MCP: config in ~/.gemini/config, real handshake for stdio and HTTP, secrets redacted.
+  const agyCfgFile = path.join(tmp, '.gemini', 'config', 'mcp_config.json');
+  fs.mkdirSync(path.dirname(agyCfgFile), { recursive: true });
+  const goodMcp = path.join(tmp, 'good-mcp.mjs');
+  fs.writeFileSync(goodMcp, `process.stdin.on('data', (d) => { const j = JSON.parse(String(d).split('\\n')[0]); process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: j.id, result: { serverInfo: { name: 'good', version: '1' } } }) + '\\n'); }); setInterval(() => {}, 1000);`);
+  const stub = http.createServer((q, s) => { s.writeHead(q.headers.authorization === 'Bearer sekret' ? 200 : 401, { 'Content-Type': 'application/json' }); s.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: { serverInfo: { name: 'stub' } } })); });
+  await new Promise((r) => stub.listen(0, '127.0.0.1', r));
+  const stubUrl = 'http://127.0.0.1:' + stub.address().port + '/mcp';
+  fs.writeFileSync(agyCfgFile, JSON.stringify({ mcpServers: {
+    good: { command: process.execPath, args: [goodMcp], env: { SECRET_ENV: 'abc' } },
+    broken: { command: process.execPath, args: ['-e', 'process.exit(3)'] },
+    remote: { serverUrl: stubUrl, headers: { Authorization: 'Bearer sekret' } },
+    noauth: { serverUrl: stubUrl },
+    off: { command: 'x', disabled: true },
+  } }));
+  const fakeAgy = path.join(tmp, 'no-agy');
+  fs.writeFileSync(fakeAgy, `#!/bin/sh\nif [ "$1 $2" = "mcp add" ]; then echo "$@" > ${JSON.stringify(path.join(tmp, 'agy-add-args'))}; echo added; exit 0; fi\necho "NAME STATUS"\n`, { mode: 0o755 });
+  const agyList = await api('GET', '/mcp');
+  check('agy mcp config path + redaction', agyList.body.antigravity.configPath === agyCfgFile && agyList.body.antigravity.servers.remote.headers.Authorization === '***'
+    && agyList.body.antigravity.servers.good.env.SECRET_ENV === '***' && !JSON.stringify(agyList.body).includes('sekret'), agyList.body.antigravity);
+  const agyStatus = (await api('GET', '/mcp/status?provider=antigravity')).body;
+  check('agy mcp status', agyStatus.servers.good.ok && !agyStatus.servers.broken.ok && agyStatus.servers.remote.ok && !agyStatus.servers.noauth.ok
+    && agyStatus.servers.off.disabled && /good: .* - ✔ Connected/.test(agyStatus.output) && !agyStatus.output.includes('sekret'), agyStatus);
+  const agyAdd = await api('POST', '/mcp', { provider: 'antigravity', name: 'api', transport: 'http', url: 'https://example.com/mcp', headers: { Authorization: 'Bearer t' } });
+  check('agy mcp add passes headers', agyAdd.status === 200 && fs.readFileSync(path.join(tmp, 'agy-add-args'), 'utf8').trim() === 'mcp add --header Authorization: Bearer t -- api https://example.com/mcp', agyAdd);
+  stub.close();
+  fs.rmSync(fakeAgy);
+
   const del = await api('DELETE', '/chats/' + encodeURIComponent('web:' + id));
   check('delete web chat', del.status === 200 && !(await api('GET', '/schedules')).body.length);
   check('cannot delete whatsapp chat', (await api('DELETE', '/chats/' + encodeURIComponent('5511@c.us'))).status === 400);

@@ -1207,16 +1207,89 @@ function claudeMcpConfig() {
   return out;
 }
 
-const AGY_MCP_FILES = ['.gemini/antigravity/mcp_config.json', '.antigravity/mcp_config.json', '.antigravity/mcp.json', '.config/antigravity/mcp.json'];
+// agy 1.5+ keeps its MCP servers in ~/.gemini/config/mcp_config.json; the other paths are older layouts.
+const AGY_MCP_FILES = ['.gemini/config/mcp_config.json', '.gemini/antigravity/mcp_config.json', '.antigravity/mcp_config.json', '.antigravity/mcp.json', '.config/antigravity/mcp.json'];
+function agyMcpConfig() {
+  for (const f of AGY_MCP_FILES) {
+    const p = path.join(env.HOME || '/tmp', f);
+    try { return { config: JSON.parse(fs.readFileSync(p, 'utf8')), configPath: p }; } catch {}
+  }
+  return { config: null, configPath: '' };
+}
+// The panel only needs to see which headers/env vars exist, never their values (tokens).
+function redactMcp(cfg) {
+  const mask = (o) => Object.fromEntries(Object.keys(o || {}).map((k) => [k, '***']));
+  const out = { ...cfg };
+  if (cfg.headers) out.headers = mask(cfg.headers);
+  if (cfg.env) out.env = mask(cfg.env);
+  return out;
+}
+const redactServers = (servers) => Object.fromEntries(Object.entries(servers || {}).map(([n, c]) => [n, redactMcp(c || {})]));
 async function agyMcp() {
   if (!fs.existsSync(AGY_BIN)) return { installed: false };
   const r = await execCmd(AGY_BIN, ['mcp', 'list'], 30000);
-  let config = null, configPath = '';
-  for (const f of AGY_MCP_FILES) {
-    const p = path.join(env.HOME || '/tmp', f);
-    try { config = JSON.parse(fs.readFileSync(p, 'utf8')); configPath = p; break; } catch {}
-  }
-  return { installed: true, list: (r.out + (r.code ? '\n' + r.err : '')).trim(), config, configPath };
+  const { config, configPath } = agyMcpConfig();
+  const servers = redactServers(config && config.mcpServers);
+  return { installed: true, list: (r.out + (r.code ? '\n' + r.err : '')).trim(), config: config ? { ...config, mcpServers: servers } : null, configPath, servers };
+}
+
+// agy has no health check (`agy mcp list` only says enabled/disabled), so the bridge does the MCP
+// handshake itself: spawn the stdio command (or POST to the URL) and wait for the initialize answer.
+const MCP_INIT = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'agent-control', version: '1' } } };
+function probeStdio(cfg, ms) {
+  return new Promise((resolve) => {
+    let child, buf = '', errBuf = '', done = false;
+    const finish = (r) => { if (done) return; done = true; clearTimeout(timer); try { child && child.kill('SIGTERM'); } catch {} resolve(r); };
+    const timer = setTimeout(() => finish({ ok: false, error: 'sem resposta em ' + Math.round(ms / 1000) + 's' + (errBuf.trim() ? ': ' + errBuf.trim().split('\n').pop() : '') }), ms);
+    try { child = spawn(cfg.command, cfg.args || [], { cwd: WORKDIR, env: { ...env, ...(cfg.env || {}) }, stdio: ['pipe', 'pipe', 'pipe'] }); }
+    catch (e) { return finish({ ok: false, error: e.message }); }
+    child.on('error', (e) => finish({ ok: false, error: e.message }));
+    child.on('close', (code) => finish({ ok: false, error: 'processo saiu (código ' + code + ')' + (errBuf.trim() ? ': ' + errBuf.trim().split('\n').pop() : '') }));
+    child.stderr.on('data', (d) => { errBuf = (errBuf + d).slice(-2000); });
+    child.stdout.on('data', (d) => {
+      buf += d;
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        try {
+          const j = JSON.parse(line);
+          if (j.id === 1) finish(j.error ? { ok: false, error: j.error.message || 'erro no initialize' } : { ok: true, server: j.result && j.result.serverInfo });
+        } catch {}
+      }
+    });
+    child.stdin.on('error', () => {});
+    child.stdin.write(JSON.stringify(MCP_INIT) + '\n');
+  });
+}
+async function probeHttp(cfg, ms) {
+  try {
+    const r = await fetch(cfg.serverUrl || cfg.url, {
+      method: 'POST', signal: AbortSignal.timeout(ms),
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream', ...(cfg.headers || {}) },
+      body: JSON.stringify(MCP_INIT),
+    });
+    const text = await r.text();
+    if (!r.ok) return { ok: false, error: 'HTTP ' + r.status + (r.status === 401 || r.status === 403 ? ' (precisa de autenticação)' : '') };
+    const m = text.match(/\{[\s\S]*\}/);
+    const j = m ? JSON.parse(m[0]) : {};
+    return j.error ? { ok: false, error: j.error.message || 'erro no initialize' } : { ok: true, server: j.result && j.result.serverInfo };
+  } catch (e) { return { ok: false, error: e.name === 'TimeoutError' ? 'sem resposta em ' + Math.round(ms / 1000) + 's' : e.message }; }
+}
+async function agyMcpStatus() {
+  if (!fs.existsSync(AGY_BIN)) return { output: 'agy não está instalado', code: 1, servers: {} };
+  const { config } = agyMcpConfig();
+  const entries = Object.entries((config && config.mcpServers) || {});
+  const results = await Promise.all(entries.map(async ([n, cfg]) => {
+    if (cfg.disabled) return [n, { ok: false, disabled: true, status: 'Disabled' }];
+    const r = cfg.command ? await probeStdio(cfg, 45000) : await probeHttp(cfg, 20000);
+    return [n, { ...r, status: r.ok ? '✔ Connected' : '✗ Failed: ' + r.error }];
+  }));
+  const servers = Object.fromEntries(results);
+  const output = results.map(([n, r]) => {
+    const cfg = config.mcpServers[n];
+    return n + ': ' + (cfg.command ? [cfg.command, ...(cfg.args || [])].join(' ') : (cfg.serverUrl || cfg.url) + ' (HTTP)') + ' - ' + r.status;
+  }).join('\n');
+  return { output: output || '(nenhum MCP configurado no Antigravity)', code: 0, servers };
 }
 
 const validName = (n) => /^[A-Za-z0-9_.-]{1,64}(?![\s\S])/.test(String(n || ''));
@@ -1233,7 +1306,11 @@ async function addMcp(b) {
     r = await execCmd(CLAUDE_BIN, ['mcp', 'add-json', '-s', b.scope || 'user', b.name, JSON.stringify(cfg)], 60000);
   } else {
     if (!fs.existsSync(AGY_BIN)) throw new Error('agy não está instalado');
-    r = await execCmd(AGY_BIN, transport === 'stdio' ? ['mcp', 'add', '--', b.name, b.command, ...(b.args || [])] : ['mcp', 'add', '--', b.name, b.url], 60000);
+    // Flags have to come before the name; `--` keeps commands/args that start with '-' intact.
+    const flags = [];
+    if (transport === 'stdio') for (const [k, v] of Object.entries(b.env || {})) flags.push('--env', k + '=' + v);
+    else for (const [k, v] of Object.entries(b.headers || {})) flags.push('--header', k + ': ' + v);
+    r = await execCmd(AGY_BIN, transport === 'stdio' ? ['mcp', 'add', ...flags, '--', b.name, b.command, ...(b.args || [])] : ['mcp', 'add', ...flags, '--', b.name, b.url], 60000);
   }
   audit({ action: 'mcp-add', provider: b.provider || 'claude', name: b.name, transport, ok: r.code === 0 });
   if (r.code !== 0) throw new Error((r.err || r.out || 'falhou com código ' + r.code).trim().slice(0, 800));
@@ -1376,9 +1453,11 @@ async function handleAdmin(req, res, u, raw) {
     }
     if (a === 'mcp' && !b && m === 'GET') {
       const agy = await agyMcp();
-      return send(200, { claude: claudeMcpConfig(), antigravity: agy });
+      const cl = claudeMcpConfig();
+      return send(200, { claude: { user: redactServers(cl.user), local: redactServers(cl.local), project: redactServers(cl.project) }, antigravity: agy });
     }
     if (a === 'mcp' && b === 'status' && m === 'GET') {
+      if (u.searchParams.get('provider') === 'antigravity') return send(200, await agyMcpStatus());
       const r = await execCmd(CLAUDE_BIN, ['mcp', 'list'], 90000);
       return send(200, { output: (r.out + (r.code ? '\n' + r.err : '')).trim(), code: r.code });
     }
