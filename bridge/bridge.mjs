@@ -1041,6 +1041,57 @@ function webAppend(chatId, msg) {
   webEmit(chatId, { type: 'message', message: m });
   return m;
 }
+function webUpdate(chatId, msgId, patch) {
+  const h = webHistory(chatId);
+  const m = h.find((x) => x.id === msgId);
+  if (!m) return null;
+  Object.assign(m, patch);
+  fs.writeFileSync(webFile(chatId), JSON.stringify(h));
+  webEmit(chatId, { type: 'update', id: msgId, patch });
+  return m;
+}
+const HOME_BIN = (n) => path.join(env.HOME || '/tmp', 'bin', n);
+// Voice notes from the panel are transcribed by the bridge (~/bin/transcrever: Groq, local Whisper as fallback),
+// shown under the voice note and handed to the agent, so it doesn't transcribe again.
+async function transcribeFile(file) {
+  if (!fs.existsSync(HOME_BIN('transcrever'))) return null;
+  const r = await execCmd(HOME_BIN('transcrever'), [file], 180000);
+  const mt = /^\[([^\]]+)\]\s*([\s\S]*)$/.exec((r.out || '').trim());
+  return r.code === 0 && mt && mt[2].trim() ? { engine: mt[1].trim(), text: mt[2].trim() } : null;
+}
+// Spoken replies for the panel: ~/bin/falar (Gemini TTS, Piper fallback) to Opus, then AAC/M4A so Safari plays it.
+function speakableText(md) {
+  return String(md || '').replace(/```[\s\S]*?```/g, ' ').replace(/`([^`]+)`/g, '$1').replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').replace(/https?:\/\/\S+/g, ' ').replace(/^\s*[-*+]\s+/gm, '').replace(/^\s*#+\s*/gm, '')
+    .replace(/^\s*>\s?/gm, '').replace(/^\s*\|?[\s:|-]+\|?\s*$/gm, '')
+    .replace(/^\s*\|(.*)\|\s*$/gm, (_, row) => row.split('|').map((x) => x.trim()).filter(Boolean).join(', ') + '. ').replace(/\|/g, ', ').replace(/[*_~#]/g, '').replace(/\s+/g, ' ').trim();
+}
+const ttsJobs = new Map();
+function webTts(chatId, msgId) {
+  const key = chatId + ':' + msgId;
+  if (ttsJobs.has(key)) return ttsJobs.get(key);
+  const job = (async () => {
+    const m = webHistory(chatId).find((x) => x.id === msgId);
+    if (!m || m.role !== 'assistant') throw new Error('mensagem não encontrada');
+    if (m.tts && fs.existsSync(path.join(INBOX, m.tts))) return { file: m.tts, engine: m.ttsEngine };
+    let text = speakableText(m.text);
+    if (!text) throw new Error('nada para falar');
+    if (text.length > 3000) text = text.slice(0, 3000).replace(/[^.!?]*$/, '') || text.slice(0, 3000);
+    const name = 'web-tts-' + String(chatId).slice(4).replace(/[^a-f0-9]/g, '') + '-' + msgId.replace(/[^a-f0-9]/g, '');
+    const ogg = path.join(INBOX, name + '.ogg'), m4a = path.join(INBOX, name + '.m4a');
+    const r = await execCmd(HOME_BIN('falar'), [text, ogg], 240000);
+    if (!fs.existsSync(ogg)) throw new Error('falar falhou: ' + (r.err || r.out).slice(-300));
+    const engine = (/^\[([^\]]+)\]/m.exec(r.out || '') || [])[1] || '';
+    const c = await execCmd('ffmpeg', ['-y', '-loglevel', 'error', '-i', ogg, '-c:a', 'aac', '-b:a', '64k', '-movflags', '+faststart', m4a], 120000);
+    try { fs.unlinkSync(ogg); } catch {}
+    if (c.code !== 0 || !fs.existsSync(m4a)) throw new Error('conversão falhou: ' + c.err.slice(-300));
+    webUpdate(chatId, msgId, { tts: name + '.m4a', ttsEngine: engine });
+    return { file: name + '.m4a', engine };
+  })();
+  ttsJobs.set(key, job);
+  job.finally(() => setTimeout(() => ttsJobs.delete(key), 1000)).catch(() => {});
+  return job;
+}
 const clip = (s, n) => { s = typeof s === 'string' ? s : JSON.stringify(s); return s && s.length > n ? s.slice(0, n) + '…' : (s || ''); };
 
 // Turns Claude Code stream-json events into small events for the panel: text, tool calls, tool results.
@@ -1088,23 +1139,35 @@ function saveWebFiles(files) {
   }
   return out;
 }
-function promptWithFiles(text, files, transcript) {
+function promptWithFiles(text, files, transcript, engine) {
   if (!files.length) return text;
   const notes = files.map((f) => {
     const kind = f.voice ? 'uma mensagem de voz' : f.type.startsWith('image/') ? 'uma imagem' : f.type.startsWith('audio/') ? 'um áudio' : f.type.startsWith('video/') ? 'um vídeo' : 'um arquivo';
     return '[O usuário enviou ' + kind + ' (' + f.type + ', ' + f.name + ') salvo em ' + path.join(INBOX, f.file) + ']';
   });
-  if (transcript) notes.push('[Transcrição automática da mensagem de voz, feita no navegador: ' + transcript + ']');
+  if (transcript) notes.push(engine
+    ? '[Transcrição automática da mensagem de voz, já feita pela ponte com ~/bin/transcrever (motor: ' + engine + '). Não transcreva de novo; ao citar o motor, use este: ' + transcript + ']'
+    : '[Transcrição automática da mensagem de voz, feita no navegador: ' + transcript + ']');
   return notes.join('\n') + '\n\n' + (text || (transcript ? 'Responda à mensagem de voz.' : 'Analise o conteúdo e responda.'));
 }
 
 function webSend(chatId, text, files = [], transcript = '') {
   const c = chat(chatId);
-  webAppend(chatId, { role: 'user', text, ...(files.length ? { files } : {}), ...(transcript ? { transcript } : {}) });
-  const label = text || transcript || (files[0] && (files[0].voice ? 'Mensagem de voz' : files[0].name)) || '';
+  const um = webAppend(chatId, { role: 'user', text, ...(files.length ? { files } : {}), ...(transcript ? { transcript } : {}) });
+  let label = text || transcript || (files[0] && (files[0].voice ? 'Mensagem de voz' : files[0].name)) || '';
   if (!c.title || c.title === 'Nova conversa') { c.title = label.replace(/\s+/g, ' ').slice(0, 60); save(); }
-  const prompt = promptWithFiles(text, files, transcript);
+  // Starts right away (not in the queue) so the text shows under the voice note while an earlier run finishes.
+  const voice = files.find((f) => f.voice || f.type.startsWith('audio/'));
+  const transcribing = voice && !transcript ? transcribeFile(path.join(INBOX, voice.file)).catch(() => null) : null;
+  if (transcribing) transcribing.then((tr) => {
+    if (!tr) return webUpdate(chatId, um.id, { transcriptFailed: true });
+    webUpdate(chatId, um.id, { transcript: tr.text, transcriptEngine: tr.engine });
+    if (c.title === 'Mensagem de voz') { c.title = tr.text.replace(/\s+/g, ' ').slice(0, 60); save(); }
+  });
   enqueue(chatId, async () => {
+    const tr = transcribing ? await transcribing : null;
+    if (tr && !text) label = tr.text;
+    const prompt = promptWithFiles(text, files, tr ? tr.text : transcript, tr ? tr.engine : '');
     const agy = providerOf(c) === 'antigravity';
     const opts = { model: c.model || defModel(), effort: c.effort || defEffort(), resume: agy ? c.agySession : c.session };
     webEmit(chatId, { type: 'start', provider: providerOf(c) });
@@ -1618,6 +1681,11 @@ async function handleAdmin(req, res, u, raw) {
       const id = 'web:' + b;
       if (!chats[id]) return send(404, { error: 'conversa não encontrada' });
       return send(200, { chat: chatView(id), messages: webHistory(id) });
+    }
+    if (a === 'web' && b && c2 === 'tts' && m === 'POST') {
+      const id = 'web:' + b;
+      if (!chats[id]) return send(404, { error: 'conversa não encontrada' });
+      return send(200, await webTts(id, String(body.id || '')));
     }
     if (a === 'web' && b && c2 === 'messages' && m === 'POST') {
       const id = 'web:' + b;
