@@ -1266,6 +1266,61 @@ async function usageReport(nDays = 56) {
   return { claude, antigravity, days, tz: TZ, historySince: { antigravity: fs.existsSync(USAGE_FILE) ? (fs.readFileSync(USAGE_FILE, 'utf8').slice(0, 40).match(/"at":"([^"]+)/) || [])[1] || null : null } };
 }
 
+// ---------- memory explorer: ai-memory wiki pages + Claude Code's own memory files ----------
+// Reads go through ai-memory's REST API (/api/v1, read-only); writes and deletes through its CLI, which
+// indexes and versions the change (memory_restore_page can undo). Local memory lives in MEMORY_DIR as one
+// .md per fact plus the MEMORY.md index.
+const aiMemToken = () => { try { return fs.readFileSync(path.join(HOME_DIR, '.local', 'share', 'ai-memory', 'auth-token'), 'utf8').trim(); } catch { return ''; } };
+async function aiMemGet(p) {
+  const r = await fetch(AI_MEMORY_URL + '/api/v1' + p, { signal: AbortSignal.timeout(15000), headers: { Authorization: 'Bearer ' + aiMemToken() } });
+  if (!r.ok) throw new Error('ai-memory ' + p + ': HTTP ' + r.status);
+  return r.json();
+}
+const memScope = (ws, proj) => '/workspaces/' + encodeURIComponent(ws || 'default') + '/projects/' + encodeURIComponent(proj);
+const safePagePath = (p) => { p = String(p || ''); if (!/^[\w\-./]+\.md$/.test(p) || p.includes('..') || p.startsWith('/')) throw new Error('caminho inválido'); return p; };
+
+function parseFrontmatter(text) {
+  const m = /^---\n([\s\S]*?)\n---\n?/.exec(text);
+  if (!m) return { meta: {}, body: text };
+  const meta = {}; let cur = null;
+  for (const line of m[1].split('\n')) {
+    const kv = /^(\w[\w-]*):\s*(.*)$/.exec(line);
+    if (kv) { cur = kv[1]; meta[cur] = kv[2].replace(/^["']|["']$/g, ''); continue; }
+    const sub = /^\s+(\w[\w-]*):\s*(.*)$/.exec(line);
+    if (sub && cur) { if (typeof meta[cur] !== 'object') meta[cur] = {}; meta[cur][sub[1]] = sub[2]; }
+  }
+  return { meta, body: text.slice(m[0].length) };
+}
+const localMemFile = (name) => { const n = String(name || '').replace(/\.md$/, ''); if (!/^[\w\-.]+$/.test(n) || n === 'MEMORY' || n.startsWith('.')) throw new Error('nome inválido'); return path.join(MEMORY_DIR, n + '.md'); };
+function localMemList() {
+  let files = []; try { files = fs.readdirSync(MEMORY_DIR).filter((f) => f.endsWith('.md') && f !== 'MEMORY.md'); } catch {}
+  const index = (() => { try { return fs.readFileSync(path.join(MEMORY_DIR, 'MEMORY.md'), 'utf8'); } catch { return ''; } })();
+  return files.map((f) => {
+    const full = path.join(MEMORY_DIR, f); const text = fs.readFileSync(full, 'utf8'); const st = fs.statSync(full);
+    const { meta, body } = parseFrontmatter(text);
+    return { file: f, name: meta.name || f.replace(/\.md$/, ''), description: meta.description || '', type: (meta.metadata && meta.metadata.type) || meta.type || '',
+      updated_at: st.mtime.toISOString(), size: st.size, indexed: index.includes('(' + f + ')'), body, raw: text };
+  }).sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+}
+function localMemWrite({ file, name, description, type, body, raw, title }) {
+  const f = localMemFile(file || name);
+  const slug = path.basename(f, '.md');
+  const text = raw != null ? String(raw) : '---\nname: ' + (name || slug) + '\ndescription: ' + String(description || '').replace(/\n/g, ' ') + '\nmetadata:\n  type: ' + (type || 'project') + '\n---\n\n' + String(body || '').trim() + '\n';
+  fs.writeFileSync(f, text);
+  const idx = path.join(MEMORY_DIR, 'MEMORY.md');
+  let index = ''; try { index = fs.readFileSync(idx, 'utf8'); } catch {}
+  if (!index.includes('(' + slug + '.md)')) fs.writeFileSync(idx, index.replace(/\n*$/, '\n') + '- [' + (title || name || slug) + '](' + slug + '.md) — ' + String(description || '').replace(/\n/g, ' ') + '\n');
+  return slug + '.md';
+}
+function localMemDelete(file) {
+  const f = localMemFile(file);
+  const slug = path.basename(f);
+  fs.mkdirSync(path.join(DATA_DIR, 'memory-trash'), { recursive: true });
+  fs.renameSync(f, path.join(DATA_DIR, 'memory-trash', Date.now() + '-' + slug)); // recoverable
+  const idx = path.join(MEMORY_DIR, 'MEMORY.md');
+  try { fs.writeFileSync(idx, fs.readFileSync(idx, 'utf8').split('\n').filter((l) => !l.includes('(' + slug + ')')).join('\n')); } catch {}
+}
+
 // ---------- admin API for the Agent Control panel ----------
 // Reached over the private coolify network at http://claude-bridge-claude-zap:3000/admin/...
 // Every call needs "Authorization: Bearer <BRIDGE_ADMIN_TOKEN>". Without that variable the API is off.
@@ -1478,6 +1533,33 @@ async function handleAdmin(req, res, u, raw) {
   if (raw.length) { try { body = JSON.parse(raw.toString('utf8')); } catch { return send(400, { error: 'JSON inválido' }); } }
   const [a, b, c2] = parts;
   try {
+    if (a === 'memory') {
+      const ws = u.searchParams.get('workspace') || 'default', proj = u.searchParams.get('project') || '';
+      if (b === 'projects' && m === 'GET') return send(200, { projects: await aiMemGet('/projects'), local: { dir: MEMORY_DIR, count: localMemList().length } });
+      if (b === 'pages' && m === 'GET') return send(200, await aiMemGet(memScope(ws, proj) + '/pages'));
+      if (b === 'page' && m === 'GET') return send(200, await aiMemGet(memScope(ws, proj) + '/pages/' + safePagePath(u.searchParams.get('path')).split('/').map(encodeURIComponent).join('/')));
+      if (b === 'page' && m === 'PUT') {
+        const args = ['write-page', '--workspace', body.workspace || ws, '--project', body.project || proj, '--path', safePagePath(body.path), '--title', String(body.title || body.path), '--body', String(body.body || '')];
+        if (body.kind) args.push('--kind', String(body.kind));
+        if (body.tier) args.push('--tier', String(body.tier));
+        for (const t of body.tags || []) args.push('--tag', String(t));
+        if (body.pinned) args.push('--pinned');
+        const r = await execCmd(aiMemoryBin(), args, 60000);
+        if (r.code !== 0) return send(500, { error: (r.err || r.out).split('\n').filter((l) => !/ INFO /.test(l)).join('\n').slice(-600) || 'write-page falhou' });
+        audit({ action: 'memory-write', project: body.project || proj, path: body.path, via: 'panel' });
+        return send(200, { ok: true });
+      }
+      if (b === 'page' && m === 'DELETE') {
+        const pth = safePagePath(u.searchParams.get('path'));
+        const r = await execCmd(aiMemoryBin(), ['delete-page', '--workspace', ws, '--project', proj, '--path', pth], 60000);
+        if (r.code !== 0) return send(500, { error: (r.err || r.out).split('\n').filter((l) => !/ INFO /.test(l)).join('\n').slice(-600) || 'delete-page falhou' });
+        audit({ action: 'memory-delete', project: proj, path: pth, via: 'panel' });
+        return send(200, { ok: true });
+      }
+      if (b === 'local' && m === 'GET') return send(200, { dir: MEMORY_DIR, items: localMemList() });
+      if (b === 'local' && m === 'PUT') { const f = localMemWrite(body); audit({ action: 'memory-local-write', file: f, via: 'panel' }); return send(200, { ok: true, file: f }); }
+      if (b === 'local' && m === 'DELETE') { const f = u.searchParams.get('file'); localMemDelete(f); audit({ action: 'memory-local-delete', file: f, via: 'panel' }); return send(200, { ok: true }); }
+    }
     if (a === 'usage' && m === 'GET') return send(200, await usageReport(Math.min(120, Math.max(7, Number(u.searchParams.get('days')) || 56))));
     if (a === 'overview' && m === 'GET') {
       return send(200, { version: VERSION, tz: TZ, permissionMode: PERMISSION_MODE, workdir: WORKDIR, uptime: Math.round(process.uptime()),
