@@ -251,6 +251,7 @@ function runClaude(chatId, prompt, opts, onActivity, onEvent) {
         if (!final) throw new Error('no result event');
         done({ text: final.result || '', sessionId: final.session_id, isError: final.is_error,
           usage: { cost: final.total_cost_usd, ms: final.duration_ms, turns: final.num_turns } });
+        logUsage('claude', chatId, final.total_cost_usd, final.duration_ms, final.usage);
       } catch {
         done({ error: 'claude saiu com código ' + code + ': ' + (err || out).slice(-500) });
       }
@@ -286,6 +287,7 @@ function runAntigravity(chatId, prompt, opts) {
         const j = JSON.parse(out);
         if (j.status && j.status !== 'SUCCESS') return done({ error: 'Antigravity: ' + j.status, sessionId: j.conversation_id });
         const u = j.usage || {};
+        logUsage('antigravity', chatId, 0, Math.round((j.duration_seconds || 0) * 1000), u);
         done({ text: j.response || '', sessionId: j.conversation_id, provider: 'antigravity',
           usage: { cost: 0, ms: Math.round((j.duration_seconds || (Date.now() - started) / 1000) * 1000), turns: j.num_turns || 0 } });
       } catch {
@@ -1130,6 +1132,140 @@ function webSend(chatId, text, files = [], transcript = '') {
   });
 }
 
+// ---------- usage: plan limits (Claude, Antigravity) and daily history for the panel ----------
+// Every run appends one line to usage.jsonl. Claude's history before that file existed is rebuilt from
+// Claude Code's own transcripts (~/.claude/projects/**/*.jsonl), which carry token counts per message.
+const USAGE_FILE = path.join(DATA_DIR, 'usage.jsonl');
+function logUsage(provider, chatId, cost, ms, u) {
+  try {
+    u = u || {};
+    const line = { at: new Date().toISOString(), provider, web: isWeb(chatId), cost: cost || 0, ms: ms || 0,
+      in: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0), out: (u.output_tokens || 0) + (u.thinking_tokens || 0),
+      cacheRead: u.cache_read_input_tokens || u.cache_read_tokens || 0 };
+    fs.appendFileSync(USAGE_FILE, JSON.stringify(line) + '\n');
+  } catch (e) { log('usage log failed', e.message); }
+}
+const dayKey = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(d));
+const HOME_DIR = env.HOME || '/tmp';
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
+
+const usageCache = { claude: null, agy: null, agyProject: null };
+async function claudeLimits() {
+  const c = usageCache.claude;
+  if (c && Date.now() - c.t < 60000) return c.v;
+  const cred = readJson(path.join(HOME_DIR, '.claude', '.credentials.json'))?.claudeAiOauth;
+  let v;
+  try {
+    if (!cred?.accessToken) throw new Error('Claude Code sem login OAuth');
+    const r = await fetch('https://api.anthropic.com/api/oauth/usage', { signal: AbortSignal.timeout(15000),
+      headers: { Authorization: 'Bearer ' + cred.accessToken, 'anthropic-beta': 'oauth-2025-04-20', 'Content-Type': 'application/json' } });
+    if (!r.ok) throw new Error('HTTP ' + r.status + (r.status === 401 ? ' (token vencido: renova na próxima execução do Claude)' : ''));
+    const j = await r.json();
+    const lim = (k, x) => x && { kind: k, percent: x.utilization ?? null, resetsAt: x.resets_at || null };
+    v = { plan: cred.subscriptionType || null, limits: [lim('session', j.five_hour), lim('weekly', j.seven_day), lim('weekly_opus', j.seven_day_opus), lim('weekly_sonnet', j.seven_day_sonnet)].filter(Boolean),
+      extra: j.extra_usage?.is_enabled ? { used: j.extra_usage.used_credits, limit: j.extra_usage.monthly_limit } : null };
+  } catch (e) {
+    v = { ...(c?.v?.limits ? c.v : {}), error: e.message, stale: Boolean(c?.v?.limits) };
+  }
+  usageCache.claude = { t: Date.now(), v };
+  return v;
+}
+
+async function agyLimits() {
+  const c = usageCache.agy;
+  if (c && Date.now() - c.t < 60000) return c.v;
+  let v;
+  try {
+    const tok = readJson(path.join(HOME_DIR, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'))?.token?.access_token;
+    if (!tok) throw new Error('Antigravity sem login');
+    const call = async (method, body) => {
+      const r = await fetch('https://daily-cloudcode-pa.googleapis.com/v1internal:' + method, { method: 'POST', signal: AbortSignal.timeout(20000),
+        headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json', 'User-Agent': 'antigravity' }, body: JSON.stringify(body) });
+      if (!r.ok) throw new Error(method + ': HTTP ' + r.status + (r.status === 401 ? ' (token vencido: renova na próxima execução do agy)' : ''));
+      return r.json();
+    };
+    if (!usageCache.agyProject) {
+      const la = await call('loadCodeAssist', { metadata: { ideType: 'ANTIGRAVITY' } });
+      usageCache.agyProject = { id: la.cloudaicompanionProject, tier: la.paidTier?.name || la.currentTier?.name || null };
+    }
+    const fm = await call('fetchAvailableModels', usageCache.agyProject.id ? { project: usageCache.agyProject.id } : {});
+    // Models share quota pools: group them by (remaining, reset time).
+    const groups = new Map();
+    for (const [id, m] of Object.entries(fm.models || {})) {
+      const q = m.quotaInfo;
+      if (!q || !q.resetTime || /^(tab_|chat_)/.test(id)) continue;
+      const key = (q.remainingFraction ?? 1) + '|' + q.resetTime;
+      if (!groups.has(key)) groups.set(key, { remaining: q.remainingFraction ?? 1, resetsAt: q.resetTime, models: [] });
+      groups.get(key).models.push(m.displayName || id);
+    }
+    const label = (g) => {
+      const t = g.models.join(' ').toLowerCase();
+      const fam = ['gemini', 'claude', 'gpt'].filter((f) => t.includes(f));
+      return fam.map((f) => (f === 'gpt' ? 'GPT' : f[0].toUpperCase() + f.slice(1))).join(' + ') || 'Modelos';
+    };
+    v = { tier: usageCache.agyProject.tier, groups: [...groups.values()].map((g) => ({ label: label(g), percent: Math.round((1 - g.remaining) * 1000) / 10, resetsAt: g.resetsAt, models: [...new Set(g.models)].sort() }))
+      .sort((a, b) => a.label.localeCompare(b.label)) };
+  } catch (e) {
+    v = { ...(c?.v?.groups ? c.v : {}), error: e.message, stale: Boolean(c?.v?.groups) };
+  }
+  usageCache.agy = { t: Date.now(), v };
+  return v;
+}
+
+// Claude Code transcripts, parsed once per file version (size + mtime).
+const transcriptCache = new Map();
+function claudeTranscriptDays() {
+  const root = path.join(HOME_DIR, '.claude', 'projects');
+  const files = [];
+  const walk = (d) => { let es = []; try { es = fs.readdirSync(d, { withFileTypes: true }); } catch {} for (const e of es) { const f = path.join(d, e.name); if (e.isDirectory()) walk(f); else if (e.name.endsWith('.jsonl')) files.push(f); } };
+  walk(root);
+  const days = {};
+  for (const f of files) {
+    let st; try { st = fs.statSync(f); } catch { continue; }
+    const sig = st.size + ':' + st.mtimeMs;
+    let c = transcriptCache.get(f);
+    if (!c || c.sig !== sig) {
+      const per = {}, seen = new Set();
+      let text = ''; try { text = fs.readFileSync(f, 'utf8'); } catch {}
+      for (const line of text.split('\n')) {
+        if (!line.includes('"usage"') || !line.includes('"assistant"')) continue;
+        let j; try { j = JSON.parse(line); } catch { continue; }
+        const msg = j.message, u = msg?.usage;
+        if (j.type !== 'assistant' || !u || !j.timestamp || (msg.id && seen.has(msg.id))) continue;
+        if (msg.id) seen.add(msg.id);
+        if (msg.model === '<synthetic>') continue;
+        const d = (per[dayKey(j.timestamp)] ||= { in: 0, out: 0, cacheRead: 0, msgs: 0 });
+        d.in += (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0); d.out += u.output_tokens || 0; d.cacheRead += u.cache_read_input_tokens || 0; d.msgs += 1;
+      }
+      c = { sig, per }; transcriptCache.set(f, c);
+    }
+    for (const [k, d] of Object.entries(c.per)) { const t = (days[k] ||= { in: 0, out: 0, cacheRead: 0, msgs: 0 }); t.in += d.in; t.out += d.out; t.cacheRead += d.cacheRead; t.msgs += d.msgs; }
+  }
+  return days;
+}
+
+async function usageReport(nDays = 56) {
+  const [claude, antigravity] = await Promise.all([claudeLimits(), agyLimits()]);
+  const tdays = claudeTranscriptDays();
+  const log = {};
+  try {
+    for (const line of fs.readFileSync(USAGE_FILE, 'utf8').split('\n')) {
+      if (!line) continue; let j; try { j = JSON.parse(line); } catch { continue; }
+      const d = ((log[dayKey(j.at)] ||= {})[j.provider] ||= { runs: 0, cost: 0, ms: 0, in: 0, out: 0, cacheRead: 0 });
+      d.runs += 1; d.cost += j.cost || 0; d.ms += j.ms || 0; d.in += j.in || 0; d.out += j.out || 0; d.cacheRead += j.cacheRead || 0;
+    }
+  } catch {}
+  const days = [];
+  for (let i = nDays - 1; i >= 0; i--) {
+    const date = dayKey(Date.now() - i * 86400000);
+    const tc = tdays[date], lc = log[date]?.claude, la = log[date]?.antigravity;
+    days.push({ date,
+      claude: { tokens: tc ? tc.in + tc.out : (lc ? lc.in + lc.out : 0), out: tc?.out || lc?.out || 0, cacheRead: tc?.cacheRead || lc?.cacheRead || 0, msgs: tc?.msgs || 0, runs: lc?.runs || 0, cost: lc?.cost || 0 },
+      antigravity: { tokens: la ? la.in + la.out : 0, out: la?.out || 0, cacheRead: la?.cacheRead || 0, runs: la?.runs || 0 } });
+  }
+  return { claude, antigravity, days, tz: TZ, historySince: { antigravity: fs.existsSync(USAGE_FILE) ? (fs.readFileSync(USAGE_FILE, 'utf8').slice(0, 40).match(/"at":"([^"]+)/) || [])[1] || null : null } };
+}
+
 // ---------- admin API for the Agent Control panel ----------
 // Reached over the private coolify network at http://claude-bridge-claude-zap:3000/admin/...
 // Every call needs "Authorization: Bearer <BRIDGE_ADMIN_TOKEN>". Without that variable the API is off.
@@ -1342,6 +1478,7 @@ async function handleAdmin(req, res, u, raw) {
   if (raw.length) { try { body = JSON.parse(raw.toString('utf8')); } catch { return send(400, { error: 'JSON inválido' }); } }
   const [a, b, c2] = parts;
   try {
+    if (a === 'usage' && m === 'GET') return send(200, await usageReport(Math.min(120, Math.max(7, Number(u.searchParams.get('days')) || 56))));
     if (a === 'overview' && m === 'GET') {
       return send(200, { version: VERSION, tz: TZ, permissionMode: PERMISSION_MODE, workdir: WORKDIR, uptime: Math.round(process.uptime()),
         aiMemory: { status: aiMemory.status, restarts: aiMemory.restarts }, allowed: ALLOWED.length, settings,
