@@ -20,7 +20,7 @@ if (a[0] === 'mcp') {
   if (a[1] === 'remove') { if (!j.mcpServers[a[4]]) { console.error('No MCP server found'); process.exit(1); } delete j.mcpServers[a[4]]; fs.writeFileSync(cfgFile, JSON.stringify(j)); process.exit(0); }
   if (a[1] === 'list') { console.log(Object.keys(j.mcpServers).map((k) => k + ': ok - ✓ Connected').join('\\n')); process.exit(0); }
 }
-const p = get('-p');
+const p = (a.includes('--input-format') ? await new Promise((res) => { let b = ''; process.stdin.on('data', (d) => { b += d; const i = b.indexOf('\\n'); if (i >= 0) { process.stdin.destroy(); try { res(JSON.parse(b.slice(0, i)).message.content.map((x) => x.text || '').join('')); } catch { res(''); } } }); process.stdin.on('end', () => res('')); }) : get('-p')) || '';
 const ev = (o) => console.log(JSON.stringify(o));
 ev({ type: 'system', subtype: 'init', model: get('--model') || 'default', mcp_servers: [{ name: 'pw', status: 'connected' }] });
 ev({ type: 'assistant', message: { content: [{ type: 'text', text: 'vou olhar' }, { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] } });

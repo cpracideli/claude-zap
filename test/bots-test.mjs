@@ -13,7 +13,7 @@ import fs from 'node:fs';
 const a = process.argv.slice(2);
 const get = (f) => a.includes(f) ? a[a.indexOf(f) + 1] : null;
 if (a[0] === '--version') { console.log('9.9.9'); process.exit(0); }
-const p = get('-p') || '';
+const p = (a.includes('--input-format') ? await new Promise((res) => { let b = ''; process.stdin.on('data', (d) => { b += d; const i = b.indexOf('\\n'); if (i >= 0) { process.stdin.destroy(); try { res(JSON.parse(b.slice(0, i)).message.content.map((x) => x.text || '').join('')); } catch { res(''); } } }); process.stdin.on('end', () => res('')); }) : get('-p')) || '';
 const sys = get('--append-system-prompt') || '';
 const mcp = get('--mcp-config');
 const info = { model: get('--model'), effort: get('--effort'), resume: get('--resume'), hasBots: sys.includes('BOTS:'),

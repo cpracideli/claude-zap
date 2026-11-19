@@ -7,7 +7,8 @@ const dir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/
 const tmp = path.join(dir, 'tmp2'); fs.rmSync(tmp, { recursive: true, force: true }); fs.mkdirSync(path.join(tmp, '.bridge'), { recursive: true });
 const C = '5511999990000@c.us';
 fs.writeFileSync(path.join(tmp, '.bridge', 'chats.json'), JSON.stringify({ [C]: {} }));
-fs.writeFileSync(path.join(tmp, 'claude.mjs'), `const a=process.argv.slice(2);console.log(JSON.stringify({result:'RAN:'+a[a.indexOf('-p')+1].split('\\n')[0],session_id:'s'}))`);
+const SHIM = "a.includes('--input-format') ? await new Promise((res) => { let b = ''; process.stdin.on('data', (d) => { b += d; const i = b.indexOf('\\n'); if (i >= 0) { process.stdin.destroy(); try { res(JSON.parse(b.slice(0, i)).message.content.map((x) => x.text || '').join('')); } catch { res(''); } } }); process.stdin.on('end', () => res('')); }) : get('-p')";
+fs.writeFileSync(path.join(tmp, 'claude.mjs'), `const a=process.argv.slice(2);const get=(f)=>a.includes(f)?a[a.indexOf(f)+1]:null;const p=(${SHIM})||'';console.log(JSON.stringify({type:'result',result:'RAN:'+p.split('\\n')[0],session_id:'s'}))`);
 const sent = [];
 const waha = http.createServer((req, res) => { let b = ''; req.on('data', (d) => (b += d)); req.on('end', () => { if (req.url === '/api/sendText') sent.push(JSON.parse(b).text); res.end('{}'); }); }).listen(4021);
 const bridge = spawn(process.execPath, [path.join(dir, '..', 'bridge', 'bridge.mjs')], { env: { ...process.env, PORT: '4022', WAHA_URL: 'http://localhost:4021',

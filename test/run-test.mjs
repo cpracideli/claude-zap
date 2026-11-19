@@ -13,7 +13,7 @@ const fakeClaude = path.join(tmp, 'claude.mjs');
 fs.writeFileSync(fakeClaude, `
 const a = process.argv.slice(2);
 const get = (f) => a.includes(f) ? a[a.indexOf(f) + 1] : null;
-const p = get('-p');
+const p = (a.includes('--input-format') ? await new Promise((res) => { let b = ''; process.stdin.on('data', (d) => { b += d; const i = b.indexOf('\\n'); if (i >= 0) { process.stdin.destroy(); try { res(JSON.parse(b.slice(0, i)).message.content.map((x) => x.text || '').join('')); } catch { res(''); } } }); process.stdin.on('end', () => res('')); }) : get('-p')) || '';
 const out = () => { console.log(JSON.stringify({ type: 'system', subtype: 'init' })); console.log(JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name: 'Bash', input: {} }] } })); console.log(JSON.stringify({ type: 'result', result: (p === 'md' ? '# Titulo\\n**negrito** e [link](https://x.y)\\n- item\\n\`\`\`\\n**cru**\\n\`\`\`' : 'ECHO:' + p.split('\\n')[0]) + ' |model=' + get('--model') + ' |effort=' + get('--effort') + ' |resume=' + get('--resume') + ' |sys=' + Boolean(get('--append-system-prompt')) + ' |chat=' + process.env.WA_CHAT_ID, session_id: get('--resume') || 'sess-1', is_error: false, num_turns: 2, duration_ms: 1500 })); };
 if (p === 'slow') setTimeout(out, 5000); else out();
 `);
