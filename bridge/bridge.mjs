@@ -65,7 +65,7 @@ const defEffort = () => settings.claudeEffort || ENV_EFFORT;
 const BOTS_FILE = path.join(DATA_DIR, 'bots.json');
 const BOTS_DIR = path.join(DATA_DIR, 'bots');
 const DEFAULT_BOT = 'default';
-const BOT_FIELDS = ['name', 'emoji', 'color', 'description', 'instructions', 'provider', 'model', 'effort', 'agyModel', 'agyEffort', 'memory'];
+const BOT_FIELDS = ['name', 'emoji', 'avatar', 'color', 'description', 'instructions', 'provider', 'model', 'effort', 'agyModel', 'agyEffort', 'memory'];
 let bots = {};
 try { bots = JSON.parse(fs.readFileSync(BOTS_FILE, 'utf8')); } catch {}
 if (!bots[DEFAULT_BOT]) {
@@ -96,7 +96,7 @@ function botPatch(b, body, via) {
     if (k === 'instructions' && v !== (b.instructions || '')) {
       b.history = [...(b.history || []), { at: new Date().toISOString(), instructions: b.instructions || '', via: via || 'panel' }].slice(-20);
     }
-    if (v) b[k] = k === 'name' ? v.slice(0, 40) : k === 'description' ? v.slice(0, 300) : k === 'instructions' ? v.slice(0, 20000) : v.slice(0, 120);
+    if (v) b[k] = k === 'name' ? v.slice(0, 40) : k === 'description' ? v.slice(0, 300) : k === 'instructions' ? v.slice(0, 20000) : k === 'avatar' ? v.slice(0, 120000) : v.slice(0, 120);
     else if (k !== 'name') delete b[k];
   }
   if ('mcp' in body) {
@@ -2533,7 +2533,7 @@ const server = http.createServer((req, res) => {
         else if (id && req.method === 'PATCH' && bots[id]) {
           const body = JSON.parse(raw.toString('utf8') || '{}');
           const allowed = {};
-          for (const k of ['instructions', 'description', 'emoji']) if (k in body) allowed[k] = body[k];
+          for (const k of ['instructions', 'description', 'emoji', 'avatar']) if (k in body) allowed[k] = body[k];
           botPatch(bots[id], allowed, 'agent'); saveBots();
           audit({ action: 'bot-update', id, via: 'agent' });
           out = bots[id];
