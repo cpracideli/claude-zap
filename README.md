@@ -145,6 +145,10 @@ The bot answers in Brazilian Portuguese by default (see `systemPrompt()` in `bri
 
 **Scheduling** works in plain language: "every day at 8am send me the top AI news" or "remind me tomorrow at 3pm to call John". Claude creates the schedule through the bridge; results arrive prefixed with ⏰.
 
+**Bots (personas):** create bots in the Agent Control panel (Bots tab), each with its own name, icon, instructions, provider/model/effort, its own memory file (`~/.bridge/bots/<id>/MEMORY.md`) and, optionally, a limited set of Claude Code MCP servers (`--strict-mcp-config`). Switch the bot of a WhatsApp chat with `/bot <name>` (or `/bot` for a menu); switching starts a new session. Chats that never picked a bot use the `default` bot, which adds nothing to the prompt, so older setups behave exactly as before. A bot can rewrite its own instructions when you ask (local `PATCH /bots/<id>`); every previous version is kept and can be restored in the panel.
+
+**Routines:** schedules can also run as another bot (`"bot"`), be fired by a **webhook** (`"webhook": true` gives `POST <panel>/hooks/<id>/<token>`; the body is passed to the agent as data), **watch** a shell command (`"watch": {"command": "...", "every": 30}` runs it every N minutes and fires only when the output changes) and be **quiet** (`"quiet": true`: nothing is sent when the answer is `NADA_A_RELATAR`). The last 30 runs of each routine (trigger, status, duration, output) are in the panel.
+
 **Messaging others:** ask Claude ("tell +55 11 98888-7777 I'm 10 minutes late") or use `/send`. Messages go out from the bot's number. Replies from that person do not reach Claude.
 
 **Installing tools:** ask Claude to install anything ("install the Playwright MCP"). It has passwordless `sudo`. New MCP servers are available from the next message.
@@ -260,6 +264,7 @@ No dependencies: plain Node.js 22.
 node test/run-test.mjs     # fake WAHA + fake Claude: commands, queue, media, schedules
 node test/cron-test.mjs    # waits for a minute boundary and checks cron matching
 node test/send-test.mjs    # sending to other numbers, /send, files
+node test/bots-test.mjs    # bots (personas), routine webhooks, watch, quiet runs, run history
 node build-compose.mjs     # regenerate docker-compose.yml from bridge/bridge.mjs
 ```
 
