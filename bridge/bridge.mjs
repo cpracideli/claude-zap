@@ -1,6 +1,7 @@
 // WhatsApp (WAHA) <-> Claude Code bridge. No dependencies, Node 20+.
 // NOTE: this file is embedded in a docker-compose file, so it must not contain the dollar sign.
 import http from 'node:http';
+import net from 'node:net';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -65,7 +66,7 @@ const defEffort = () => settings.claudeEffort || ENV_EFFORT;
 const BOTS_FILE = path.join(DATA_DIR, 'bots.json');
 const BOTS_DIR = path.join(DATA_DIR, 'bots');
 const DEFAULT_BOT = 'default';
-const BOT_FIELDS = ['name', 'emoji', 'avatar', 'color', 'description', 'instructions', 'provider', 'model', 'effort', 'agyModel', 'agyEffort', 'memory'];
+const BOT_FIELDS = ['name', 'emoji', 'avatar', 'color', 'description', 'instructions', 'provider', 'model', 'effort', 'agyModel', 'agyEffort', 'memory', 'approvalMode', 'allowRules', 'blockRules'];
 let bots = {};
 try { bots = JSON.parse(fs.readFileSync(BOTS_FILE, 'utf8')); } catch {}
 if (!bots[DEFAULT_BOT]) {
@@ -96,7 +97,7 @@ function botPatch(b, body, via) {
     if (k === 'instructions' && v !== (b.instructions || '')) {
       b.history = [...(b.history || []), { at: new Date().toISOString(), instructions: b.instructions || '', via: via || 'panel' }].slice(-20);
     }
-    if (v) b[k] = k === 'name' ? v.slice(0, 40) : k === 'description' ? v.slice(0, 300) : k === 'instructions' ? v.slice(0, 20000) : k === 'avatar' ? v.slice(0, 120000) : v.slice(0, 120);
+    if (v) b[k] = k === 'name' ? v.slice(0, 40) : k === 'description' ? v.slice(0, 300) : (k === 'instructions' || k === 'allowRules' || k === 'blockRules') ? v.slice(0, 20000) : k === 'avatar' ? v.slice(0, 120000) : v.slice(0, 120);
     else if (k !== 'name') delete b[k];
   }
   if ('mcp' in body) {
@@ -105,6 +106,7 @@ function botPatch(b, body, via) {
   if (b.provider && !PROVIDERS[b.provider]) { delete b.provider; throw new Error('provedor inválido'); }
   if (b.effort && !EFFORTS.includes(b.effort)) { delete b.effort; throw new Error('esforço inválido'); }
   if (b.memory && !['own', 'shared'].includes(b.memory)) b.memory = 'own';
+  if (b.approvalMode && !['ask', 'auto', 'never'].includes(b.approvalMode)) b.approvalMode = 'auto';
   b.updated = new Date().toISOString();
   return b;
 }
@@ -290,7 +292,12 @@ function systemPrompt(chatId, bot) {
     'CARTÕES DE PERGUNTA / APROVAÇÃO: quando precisar que o usuário escolha uma opção ou aprove uma ação importante antes de continuar, envie um cartão interativo e aguarde a resposta (o usuário clica num botão no painel ou responde pelo número no WhatsApp):',
     '  curl -s -X POST http://127.0.0.1:' + PORT + '/prompts -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","title":"Confirmar ação","question":"O que deseja fazer?","options":["Aprovar","Cancelar"],"wait":110}\'',
     '  A resposta traz status "answered" e "answer" (a opção escolhida); se vier "pending", repita: curl -s "http://127.0.0.1:' + PORT + '/prompts/ID?wait=110" até o usuário responder.',
-    'Comandos da ponte que o usuário pode usar: /help, /new, /status, /usage, /log, /model, /effort, /stop, /send, /schedules, /pause, /resume, /cancel, /bot.',
+    'SKILLS (habilidades reutilizáveis): listar: curl -s http://127.0.0.1:' + PORT + '/skills   ler: curl -s http://127.0.0.1:' + PORT + '/skills/SLUG   salvar nova skill (quando o usuário pedir "salve isso como skill" ou após ensinar uma tarefa): curl -s -X POST http://127.0.0.1:' + PORT + '/skills -H "Content-Type: application/json" -d \'{"name":"Nome","description":"quando usar","instructions":"passo a passo completo"}\'' +
+      (Object.keys(skills).length ? '\n  Skills disponíveis: ' + Object.values(skills).slice(0, 20).map((sk) => '/' + sk.slug + (sk.description ? ' (' + sk.description.slice(0, 80) + ')' : '')).join('; ') : ''),
+    'COFRE DE CREDENCIAIS (nunca peça senhas ou tokens em texto aberto no chat): listar nomes: curl -s http://127.0.0.1:' + PORT + '/secrets   pedir credencial com campo protegido: curl -s -X POST http://127.0.0.1:' + PORT + '/secrets/request -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","name":"minha_api_key","label":"Chave da API","reason":"motivo","wait":110}\'   executar comando usando segredo salvo (sem vazar na saída): curl -s -X POST http://127.0.0.1:' + PORT + '/secrets/exec -H "Content-Type: application/json" -d \'{"name":"minha_api_key","envVar":"API_KEY","command":"..."}\'',
+    'QUADRO DE TAREFAS (Board): listar: curl -s http://127.0.0.1:' + PORT + '/tickets   criar: curl -s -X POST http://127.0.0.1:' + PORT + '/tickets -H "Content-Type: application/json" -d \'{"title":"...","description":"...","priority":"medium","bot":"' + (bot || botOf(chats[chatId])).id + '"}\'   atualizar/comentar: PATCH /tickets/ID e POST /tickets/ID/comment.',
+    'COMPUTADOR AO VIVO (navegador visível com perfil persistente + tela que o usuário pode assistir e assumir controle para login/2FA/CAPTCHA): status: curl -s http://127.0.0.1:' + PORT + '/computer/status   abrir URL na tela ao vivo (CDP em http://127.0.0.1:9222): curl -s -X POST http://127.0.0.1:' + PORT + '/computer/open -H "Content-Type: application/json" -d \'{"url":"https://..."}\'   pedir ao usuário para assumir a tela (login, 2FA, CAPTCHA): curl -s -X POST http://127.0.0.1:' + PORT + '/computer/need-human -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","reason":"Faça login no site","url":"https://...","wait":110}\'',
+    'Comandos da ponte que o usuário pode usar: /help, /new, /status, /usage, /log, /model, /effort, /stop, /send, /schedules, /pause, /resume, /cancel, /bot (e /<slug-da-skill> para rodar uma skill).',
     botPrompt(bot || botOf(chats[chatId]), chatId),
   ].filter(Boolean).join('\n');
 }
@@ -300,9 +307,13 @@ function systemPrompt(chatId, bot) {
 function botPrompt(b, chatId) {
   const others = Object.values(bots).filter((x) => x.id !== b.id);
   const isDefault = b.id === DEFAULT_BOT;
-  if (isDefault && !b.instructions && !others.length && b.memory !== 'own' && !Array.isArray(b.mcp)) return '';
+  if (isDefault && !b.instructions && !others.length && b.memory !== 'own' && !Array.isArray(b.mcp) && !b.approvalMode && !b.allowRules && !b.blockRules) return '';
   const lines = ['', 'BOTS: o usuário tem vários bots (personas). Nesta conversa você é o bot "' + b.name + '" (id ' + b.id + ').' + (b.description ? ' Descrição: ' + b.description : '')];
   if (b.instructions) lines.push('INSTRUÇÕES DESTE BOT (definidas pelo usuário; valem sobre o estilo padrão, mas não sobre as regras de segurança acima):\n' + b.instructions);
+  if (b.approvalMode === 'ask') lines.push('POLÍTICA DE APROVAÇÃO (MODO PERGUNTAR): antes de qualquer ação externa, destrutiva, que altere dados persistentes, envie mensagens/e-mails ou gere custos, envie SEMPRE um cartão de aprovação via POST /prompts e aguarde aprovação.');
+  if (b.approvalMode === 'auto') lines.push('POLÍTICA DE APROVAÇÃO (MODO AUTO): execute ações claramente alinhadas ao pedido; peça aprovação via POST /prompts antes de ações sensíveis, irreversíveis ou fora do pedido explícito.');
+  if (b.allowRules) lines.push('REGRAS PERMITIDAS SEM PERGUNTAR:\n' + b.allowRules);
+  if (b.blockRules) lines.push('REGRAS BLOQUEADAS (NUNCA FAÇA SEM AUTORIZAÇÃO EXPLÍCITA):\n' + b.blockRules);
   if (b.memory === 'own') {
     const mem = readBotMemory(b.id).trim();
     lines.push('MEMÓRIA PRÓPRIA DESTE BOT: arquivo ' + botMemFile(b.id) + ' (crie se não existir). Guarde ali o que só interessa a este bot: um fato por linha, reescreva ou apague o que ficou velho em vez de duplicar, no máximo uns 4 KB. A memória geral do usuário continua valendo e é compartilhada por todos os bots.' +
@@ -1034,6 +1045,8 @@ async function handleMessage(msg) {
     const typing = () => waha('POST', '/api/startTyping', { session: WAHA_SESSION, chatId }).catch(() => {});
     typing();
     const keepTyping = setInterval(typing, 20000);
+    const expanded = expandSkillPrompt(body);
+    const actualBody = expanded.text;
     // "@Nome" (or @todos) makes those bots answer this message, one after the other; otherwise the chat's bot.
     const targets = mentionsIn(body, c);
     remember(chatId, 'user', body);
@@ -1041,7 +1054,7 @@ async function handleMessage(msg) {
       const started = Date.now();
       const status = liveStatus(chatId);
       liveStatuses.set(chatId, status);
-      const prompt = targets.length ? groupPrompt(chatId, id, body) : body;
+      const prompt = targets.length ? groupPrompt(chatId, id, actualBody) : actualBody;
       const r = await runTurn(chatId, id, prompt, (label) => status.activity(label));
       liveStatuses.delete(chatId);
       await status.finish();
@@ -1497,6 +1510,7 @@ const prompts = new Map(); // id -> prompt object
 const promptLog = new Map(); // chatId -> prompts created during the current run
 const promptView = (p) => ({
   id: p.id, chatId: p.chatId, bot: p.bot, botName: bots[p.bot] ? botLabel(bots[p.bot]) : p.bot,
+  kind: p.kind || 'prompt', secretName: p.secretName || '', secretKind: p.secretKind || '',
   title: p.title, question: p.question, options: p.options, status: p.status,
   answer: p.answer || '', note: p.note || '', created: p.created, answeredAt: p.answeredAt || '',
 });
@@ -1510,37 +1524,53 @@ function emitPrompt(p) {
 function startPrompt(body) {
   const chatId = String(body.chatId || body.from || '');
   const question = String(body.question || body.text || '').trim();
-  const title = String(body.title || 'Pergunta / Aprovação').trim().slice(0, 120);
+  const kind = body.kind === 'secret' ? 'secret' : 'prompt';
+  const title = String(body.title || (kind === 'secret' ? 'Credencial protegida' : 'Pergunta / Aprovação')).trim().slice(0, 120);
   if (!chatId || !chats[chatId]) throw new Error('chatId desconhecido');
   if (!question) throw new Error('question obrigatório');
-  const rawOpts = Array.isArray(body.options) && body.options.length ? body.options : ['Aprovar', 'Cancelar'];
+  const rawOpts = Array.isArray(body.options) && body.options.length ? body.options : (kind === 'secret' ? ['Cancelar'] : ['Aprovar', 'Cancelar']);
   const options = rawOpts.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 8);
   if (!options.length) throw new Error('options vazio');
   const callerBot = (running.get(chatId) && running.get(chatId).bot) || botOf(chats[chatId]).id;
   const p = {
-    id: crypto.randomBytes(4).toString('hex'), chatId, bot: callerBot, title, question, options,
+    id: crypto.randomBytes(4).toString('hex'), chatId, bot: callerBot, kind,
+    secretName: kind === 'secret' ? secretSlug(body.secretName || body.name || 'segredo') : '',
+    secretKind: kind === 'secret' ? String(body.secretKind || 'api_key').slice(0, 32) : '',
+    title, question, options,
     status: 'pending', answer: '', note: '', created: new Date().toISOString(), started: Date.now(),
   };
   p.promise = new Promise((resolve) => { p.resolve = resolve; });
   prompts.set(p.id, p);
   if (prompts.size > 300) prompts.delete(prompts.keys().next().value);
-  audit({ action: 'prompt-ask', chatId, id: p.id, title, question: question.slice(0, 80) });
+  audit({ action: kind === 'secret' ? 'secret-request' : 'prompt-ask', chatId, id: p.id, title, question: question.slice(0, 80) });
   emitPrompt(p);
   if (!isWeb(chatId) && !isDeleg(chatId)) {
     const numbered = options.map((o, i) => (i + 1) + '. ' + o).join('\n');
-    reply(chatId, '❓ *' + title + '*\n' + question + '\n\n' + numbered + '\n\n_Responda com o número da opção ou escreva sua resposta._', true).catch(() => {});
+    const warn = kind === 'secret' ? '\n\n_Por segurança, prefira salvar esta credencial pelo painel web (aba Chat ou Cofre)._' : '';
+    reply(chatId, (kind === 'secret' ? '🔒 *' : '❓ *') + title + '*\n' + question + '\n\n' + numbered + warn + '\n\n_Responda com o número da opção ou escreva sua resposta._', true).catch(() => {});
   }
   return p;
 }
-function answerPrompt(id, answer, note = '', via = 'panel') {
+function answerPrompt(id, answer, note = '', via = 'panel', secretValue = '') {
   const p = prompts.get(id);
   if (!p) throw new Error('cartão não encontrado');
   if (p.status !== 'pending') return promptView(p);
+  if (p.kind === 'secret' && secretValue) {
+    setSecret({ name: p.secretName, label: p.title, value: String(secretValue), scope: p.bot || 'global', kind: p.secretKind || 'api_key', note: p.question.slice(0, 120) }, via);
+    p.status = 'answered';
+    p.answer = 'Salvo no cofre (' + p.secretName + ')';
+    p.note = '';
+    p.answeredAt = new Date().toISOString();
+    audit({ action: 'secret-saved', chatId: p.chatId, id: p.id, name: p.secretName, via });
+    emitPrompt(p);
+    if (p.resolve) p.resolve(p);
+    return promptView(p);
+  }
   p.status = 'answered';
   p.answer = String(answer || '').trim();
   p.note = String(note || '').trim();
   p.answeredAt = new Date().toISOString();
-  audit({ action: 'prompt-answer', chatId: p.chatId, id: p.id, answer: p.answer.slice(0, 80), via });
+  audit({ action: 'prompt-answer', chatId: p.chatId, id: p.id, answer: p.kind === 'secret' ? '[protegido]' : p.answer.slice(0, 80), via });
   emitPrompt(p);
   if (p.resolve) p.resolve(p);
   return promptView(p);
@@ -1553,6 +1583,839 @@ async function waitPrompt(p, secs) {
   const ms = Math.min(Math.max(Number(secs) || 0, 0), 115) * 1000;
   if (p.status === 'pending' && ms) await Promise.race([p.promise, new Promise((r) => setTimeout(r, ms))]);
   return promptView(p);
+}
+
+// ---------- reusable skills library (/slug in chat, bot-saved skills, GitHub import) ----------
+const SKILLS_FILE = path.join(DATA_DIR, 'skills.json');
+const SKILLS_DIR = path.join(DATA_DIR, 'skills');
+fs.mkdirSync(SKILLS_DIR, { recursive: true });
+let skills = {};
+try { skills = JSON.parse(fs.readFileSync(SKILLS_FILE, 'utf8')); } catch {}
+const saveSkills = () => fs.writeFileSync(SKILLS_FILE, JSON.stringify(skills, null, 2));
+const skillMdFile = (slug) => path.join(SKILLS_DIR, String(slug).replace(/[^a-z0-9-]/g, '') + '.md');
+function skillSlug(raw) {
+  const base = fold(raw).replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+(?![\s\S])/g, '').slice(0, 40) || 'skill';
+  return base;
+}
+function writeSkillMd(sk) {
+  const doc = ['---', 'name: ' + sk.name, 'slug: ' + sk.slug, 'description: ' + (sk.description || ''), '---', '', sk.instructions || ''].join('\n');
+  fs.writeFileSync(skillMdFile(sk.slug), doc);
+}
+function skillView(sk) {
+  return { ...sk, botName: sk.bot && bots[sk.bot] ? botLabel(bots[sk.bot]) : '' };
+}
+function createSkill(b, via = 'panel') {
+  const name = String(b.name || '').trim().slice(0, 80);
+  const instructions = String(b.instructions || '').trim().slice(0, 40000);
+  if (!name) throw new Error('nome obrigatório');
+  if (!instructions) throw new Error('instruções obrigatórias');
+  let slug = skillSlug(b.slug || name);
+  if (skills[slug] && !b.upsert) {
+    let n = 2; while (skills[slug + '-' + n]) n++; slug = slug + '-' + n;
+  }
+  const now = new Date().toISOString();
+  const prev = skills[slug];
+  const sk = {
+    id: slug, slug, name,
+    description: String(b.description || '').trim().slice(0, 300),
+    instructions,
+    bot: b.bot && bots[b.bot] ? b.bot : '',
+    source: String(b.source || via || 'manual').slice(0, 32),
+    sourceUrl: String(b.sourceUrl || '').trim().slice(0, 300),
+    created: prev ? prev.created : now,
+    updated: now,
+  };
+  skills[slug] = sk; saveSkills(); writeSkillMd(sk);
+  audit({ action: 'skill-save', slug, name, via });
+  return skillView(sk);
+}
+function patchSkill(slug, b, via = 'panel') {
+  const sk = skills[slug];
+  if (!sk) throw new Error('skill não encontrada');
+  if ('name' in b && String(b.name || '').trim()) sk.name = String(b.name).trim().slice(0, 80);
+  if ('description' in b) sk.description = String(b.description || '').trim().slice(0, 300);
+  if ('instructions' in b && String(b.instructions || '').trim()) sk.instructions = String(b.instructions).trim().slice(0, 40000);
+  if ('bot' in b) sk.bot = b.bot && bots[b.bot] ? b.bot : '';
+  sk.updated = new Date().toISOString();
+  saveSkills(); writeSkillMd(sk);
+  audit({ action: 'skill-update', slug, via });
+  return skillView(sk);
+}
+function deleteSkill(slug, via = 'panel') {
+  if (!skills[slug]) throw new Error('skill não encontrada');
+  delete skills[slug]; saveSkills();
+  try { fs.unlinkSync(skillMdFile(slug)); } catch {}
+  audit({ action: 'skill-delete', slug, via });
+  return { deleted: slug };
+}
+// Expand "/slug ..." into full skill instructions when the command is not a built-in bridge command.
+const BUILTIN_CMDS = new Set(['/help', '/new', '/provider', '/model', '/effort', '/bot', '/stop', '/status', '/usage', '/log', '/send', '/schedules', '/pause', '/resume', '/cancel']);
+function expandSkillPrompt(text) {
+  const s = String(text || '').trim();
+  const m = /^\/([a-z0-9][a-z0-9_-]{0,40})(?:\s+([\s\S]*))?$/i.exec(s);
+  if (!m) return { text, skill: null };
+  const cmd = '/' + m[1].toLowerCase();
+  if (BUILTIN_CMDS.has(cmd)) return { text, skill: null };
+  const slug = fold(m[1]);
+  const sk = skills[slug] || Object.values(skills).find((x) => fold(x.slug) === slug || fold(x.name) === slug);
+  if (!sk) return { text, skill: null };
+  const rest = (m[2] || '').trim();
+  const expanded = '[SKILL ATIVADA: ' + sk.name + ' (/' + sk.slug + ')]\nSiga rigorosamente estas instruções da skill:\n\n' + sk.instructions + '\n\n---\nPedido do usuário: ' + (rest || 'Execute esta skill agora.');
+  return { text: expanded, skill: sk };
+}
+function parseSkillMarkdown(md, fallbackName) {
+  const text = String(md || '');
+  let name = fallbackName || 'Skill importada';
+  let description = '';
+  let body = text.trim();
+  const fm = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)/.exec(text);
+  if (fm) {
+    body = fm[2].trim();
+    for (const line of fm[1].split(/\r?\n/)) {
+      const kv = /^([a-zA-Z_-]+):\s*(.*)/.exec(line);
+      if (!kv) continue;
+      const k = kv[1].toLowerCase(), v = kv[2].trim().replace(/^["']|["'](?![\s\S])/g, '');
+      if (k === 'name' && v) name = v;
+      if (k === 'description' && v) description = v;
+    }
+  }
+  return { name, description, instructions: body || text.trim() };
+}
+async function importSkillsFromGithub(rawUrl) {
+  const u = String(rawUrl || '').trim();
+  const m = /github\.com\/([^/\s]+)\/([^/\s#?]+)(?:\/(?:tree|blob)\/([^/\s]+)\/([^\s#?]+))?/i.exec(u);
+  if (!m) throw new Error('Informe uma URL válida do GitHub (ex.: https://github.com/dono/repo ou link de pasta/SKILL.md)');
+  const owner = m[1], repo = m[2].replace(/\.git(?![\s\S])/i, ''), ref = m[3] || '', sub = (m[4] || '').replace(/\/+(?![\s\S])/, '');
+  const ghFetch = async (apiPath) => {
+    const r = await fetch('https://api.github.com' + apiPath, { headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'agent-control' }, signal: AbortSignal.timeout(20000) });
+    if (!r.ok) throw new Error('GitHub HTTP ' + r.status);
+    return r.json();
+  };
+  const imported = [];
+  const addFromRaw = async (downloadUrl, fallbackName, srcUrl) => {
+    const r = await fetch(downloadUrl, { signal: AbortSignal.timeout(20000) });
+    if (!r.ok) return;
+    const md = await r.text();
+    const parsed = parseSkillMarkdown(md, fallbackName);
+    if (parsed.instructions) imported.push(createSkill({ ...parsed, source: 'github', sourceUrl: srcUrl || u, upsert: true }, 'github'));
+  };
+  const q = ref ? '?ref=' + encodeURIComponent(ref) : '';
+  const root = await ghFetch('/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(repo) + '/contents/' + sub.split('/').filter(Boolean).map(encodeURIComponent).join('/') + q);
+  if (!Array.isArray(root)) {
+    if (root.download_url) await addFromRaw(root.download_url, path.basename(root.name, '.md'), root.html_url);
+  } else {
+    const direct = root.find((x) => x.type === 'file' && /^(SKILL|README)\.md$/i.test(x.name));
+    if (direct && direct.name.toUpperCase() === 'SKILL.MD') {
+      await addFromRaw(direct.download_url, sub.split('/').pop() || repo, direct.html_url);
+    } else {
+      const scanDirs = [root];
+      const skillsDir = root.find((x) => x.type === 'dir' && /^(skills|\.agents)$/i.test(x.name));
+      if (skillsDir) {
+        try {
+          const inner = await ghFetch('/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(repo) + '/contents/' + skillsDir.path.split('/').map(encodeURIComponent).join('/') + q);
+          if (Array.isArray(inner)) scanDirs.push(inner);
+        } catch {}
+      }
+      for (const dirList of scanDirs) {
+        for (const item of dirList.slice(0, 30)) {
+          if (item.type === 'file' && /\.md$/i.test(item.name) && !/^README\.md$/i.test(item.name)) {
+            await addFromRaw(item.download_url, path.basename(item.name, '.md'), item.html_url);
+          } else if (item.type === 'dir' && !item.name.startsWith('.')) {
+            try {
+              const subItems = await ghFetch('/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(repo) + '/contents/' + item.path.split('/').map(encodeURIComponent).join('/') + q);
+              const sf = Array.isArray(subItems) && subItems.find((x) => x.type === 'file' && /^SKILL\.md$/i.test(x.name));
+              if (sf) await addFromRaw(sf.download_url, item.name, sf.html_url);
+            } catch {}
+          }
+          if (imported.length >= 20) break;
+        }
+        if (imported.length >= 20) break;
+      }
+    }
+  }
+  if (!imported.length) throw new Error('Nenhum arquivo SKILL.md encontrado nesse repositório/pasta');
+  return { count: imported.length, skills: imported };
+}
+
+// ---------- protected credentials vault (~/.bridge/secrets.json, mode 0600) ----------
+const SECRETS_FILE = path.join(DATA_DIR, 'secrets.json');
+let secrets = {};
+try { secrets = JSON.parse(fs.readFileSync(SECRETS_FILE, 'utf8')); } catch {}
+const saveSecrets = () => fs.writeFileSync(SECRETS_FILE, JSON.stringify(secrets, null, 2), { mode: 0o600 });
+function secretSlug(raw) {
+  return String(raw || '').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+(?![\s\S])/g, '').slice(0, 64) || 'secret';
+}
+function maskSecret(val) {
+  const s = String(val || '');
+  if (!s) return '';
+  if (s.length <= 4) return '••••';
+  return '••••' + s.slice(-4);
+}
+function secretMeta(s) {
+  return { name: s.name, label: s.label || s.name, scope: s.scope || 'global', kind: s.kind || 'api_key', note: s.note || '', hint: maskSecret(s.value), created: s.created, updated: s.updated };
+}
+function listSecretsMeta() {
+  return Object.values(secrets).map(secretMeta).sort((a, b) => a.name.localeCompare(b.name));
+}
+function setSecret(b, via = 'panel') {
+  const name = secretSlug(b.name);
+  const value = String(b.value || '');
+  if (!name) throw new Error('nome obrigatório');
+  if (!value) throw new Error('valor obrigatório');
+  if (value.length > 16384) throw new Error('valor grande demais (máx. 16 KB)');
+  const now = new Date().toISOString();
+  const prev = secrets[name];
+  secrets[name] = {
+    name, label: String(b.label || (prev && prev.label) || name).trim().slice(0, 80),
+    value, scope: b.scope && bots[b.scope] ? b.scope : 'global',
+    kind: ['api_key', 'login', 'command', 'token', 'other'].includes(b.kind) ? b.kind : 'api_key',
+    note: String(b.note || (prev && prev.note) || '').trim().slice(0, 200),
+    created: prev ? prev.created : now, updated: now,
+  };
+  saveSecrets();
+  audit({ action: 'secret-set', name, scope: secrets[name].scope, via });
+  return secretMeta(secrets[name]);
+}
+function deleteSecret(name, via = 'panel') {
+  const k = secretSlug(name);
+  if (!secrets[k]) throw new Error('segredo não encontrado');
+  delete secrets[k]; saveSecrets();
+  audit({ action: 'secret-delete', name: k, via });
+  return { deleted: k };
+}
+function redactSecretsText(text) {
+  let out = String(text || '');
+  for (const s of Object.values(secrets)) {
+    if (s.value && s.value.length >= 4) out = out.split(s.value).join('[SEGREDO:' + s.name + ']');
+  }
+  return out;
+}
+function execWithSecret(b) {
+  const name = secretSlug(b.name);
+  const s = secrets[name];
+  if (!s) throw new Error('segredo não encontrado: ' + name);
+  const envVar = String(b.envVar || 'SECRET_VALUE').trim();
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}(?![\s\S])/.test(envVar)) throw new Error('envVar inválida');
+  const command = String(b.command || '').trim();
+  if (!command) throw new Error('command obrigatório');
+  return new Promise((resolve) => {
+    let out = '', err = '';
+    const child = spawn('bash', ['-lc', command], { cwd: WORKDIR, env: { ...env, [envVar]: s.value }, stdio: ['ignore', 'pipe', 'pipe'] });
+    const timer = setTimeout(() => child.kill('SIGTERM'), Math.min(Math.max(Number(b.timeoutMs) || 30000, 1000), 120000));
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, out: '', err: e.message }); });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      audit({ action: 'secret-exec', name, envVar, code });
+      resolve({ code, out: redactSecretsText(out).slice(0, 16000), err: redactSecretsText(err).slice(0, 4000) });
+    });
+  });
+}
+
+// ---------- bot templates, recipe export & Grok Bot importer ----------
+const BOT_TEMPLATES = [
+  {
+    id: 'briefing-matinal', name: 'Briefing Matinal', emoji: '☀️', color: '#ff9f0a',
+    description: 'Prepara um resumo enxuto toda manhã com clima, pendências, e-mails urgentes e notícias relevantes.',
+    example: '☀️ *Bom dia!* São Paulo 23°C (parcialmente nublado)\n• 2 e-mails urgentes (Fatura AWS, Contrato)\n• 3 tarefas abertas no Board\n• Destaques de IA hoje...',
+    instructions: 'Você é o bot de Briefing Matinal. Entregue sempre um resumo direto, escaneável em menos de 1 minuto, dividido em: Clima, E-mails urgentes, Pendências/Board e 3 notícias importantes. Nunca enrole.',
+    approvalMode: 'auto',
+    skill: { name: 'Briefing Matinal', description: 'Gera o resumo matinal estruturado', instructions: '1. Verifique o clima da cidade do usuário.\n2. Liste os e-mails não lidos importantes (usando ~/bin/gmail.py se disponível).\n3. Consulte tickets abertos em GET /tickets.\n4. Traga 3 manchetes relevantes de tecnologia/IA.\n5. Formate em seções curtas com emojis.' },
+    routine: { cron: '0 8 * * 1-5', description: 'Briefing matinal (seg-sex 8h)', prompt: 'Execute o briefing matinal completo com clima, e-mails importantes, tarefas abertas e 3 destaques do dia.', paused: true },
+  },
+  {
+    id: 'triagem-gmail', name: 'Triagem de Gmail', emoji: '📬', color: '#0a84ff',
+    description: 'Analisa a caixa de entrada, destaca urgências, detecta assinaturas esquecidas e rascunha respostas.',
+    example: '📬 *Triagem (14 não lidos)*\n🔴 Urgente: Confirmação de voo\n🟡 Responder hoje: Lucas sobre projeto\n🟢 11 newsletters (resumo em 3 linhas)',
+    instructions: 'Você faz triagem de e-mails usando ~/bin/gmail.py. Classifique em Urgente, Responder hoje e Informativos. NUNCA apague e-mails nem envie respostas sem aprovação via cartão (/prompts).',
+    approvalMode: 'ask',
+    blockRules: 'Nunca excluir e-mails de serviços, casa, carro, bens duráveis ou notas fiscais. Nunca enviar e-mail sem aprovação explícita.',
+    skill: { name: 'Triagem Gmail', description: 'Classifica e-mails não lidos por prioridade', instructions: '1. Leia os últimos 20 e-mails não lidos via ~/bin/gmail.py.\n2. Separe em: Urgentes, Ação necessária, Notas/Faturas e Newsletters.\n3. Sugira rascunhos curtos para os que pedem resposta.' },
+    routine: { cron: '30 8 * * 1-5', description: 'Triagem diária de e-mails', prompt: 'Faça a triagem dos e-mails não lidos das últimas 24h e envie um resumo priorizado.', paused: true },
+  },
+  {
+    id: 'pesquisador-web', name: 'Pesquisador & Relatórios', emoji: '🔎', color: '#bf5af2',
+    description: 'Faz pesquisas profundas na web, compara opções com fontes e publica dashboards HTML interativos.',
+    example: 'Relatório publicado em Páginas: Comparativo de 5 opções com tabela de custo-benefício, prós/contras e recomendação final.',
+    instructions: 'Você é um pesquisador meticuloso. Sempre cruze múltiplas fontes, cite links reais e, quando houver comparações ou números, crie uma Página HTML limpa via POST /pages além do resumo no chat.',
+    approvalMode: 'auto',
+    skill: { name: 'Pesquisa Profunda', description: 'Investiga um tema com múltiplas fontes e gera página HTML', instructions: '1. Pesquise pelo menos 4 fontes confiáveis.\n2. Compare critérios objetivos (preço, prós, contras, riscos).\n3. Publique um relatório visual em POST /pages.\n4. Entregue um resumo executivo com a recomendação.' },
+  },
+  {
+    id: 'dev-revisor', name: 'Engenheiro & Revisor', emoji: '🧑‍💻', color: '#30d158',
+    description: 'Revisa código, PRs e issues no GitHub, roda testes e propõe correções limpas.',
+    example: '✅ PR #42 analisado: 1 bug de race condition na linha 88, 2 sugestões de performance. Testes locais: 18/18 passando.',
+    instructions: 'Você é um engenheiro sênior focado em qualidade, segurança e simplicidade. Use gh e git para inspecionar PRs/commits, rode testes antes de concluir e peça aprovação antes de fazer merge ou deploy.',
+    approvalMode: 'auto',
+    blockRules: 'Nunca fazer force-push em main nem deploy em produção sem cartão de aprovação.',
+    skill: { name: 'Revisar PR', description: 'Revisa diff, segurança e testes de um Pull Request', instructions: '1. Leia o diff completo do PR.\n2. Verifique bugs lógicos, vazamento de segredos e regressões.\n3. Rode a suíte de testes se o repo estiver local.\n4. Liste achados por severidade (Crítico, Médio, Sugestão).' },
+  },
+  {
+    id: 'monitor-ofertas', name: 'Radar Silencioso', emoji: '📡', color: '#64d2ff',
+    description: 'Monitora sites, preços, status ou vagas periodicamente e só avisa quando algo realmente muda.',
+    example: '📡 *Mudança detectada!* Preço caiu de R$ 1.890 para R$ 1.499 (-21%). Link direto...',
+    instructions: 'Você monitora páginas e APIs. Quando nada relevante mudou, responda exatamente NADA_A_RELATAR para não incomodar o usuário. Quando houver novidade real, seja imediato, objetivo e inclua o link.',
+    approvalMode: 'auto',
+    routine: { cron: '0 */4 * * *', description: 'Checagem silenciosa a cada 4h', prompt: 'Verifique a lista de itens/sites monitorados na sua memória. Se não houver mudança relevante, responda exatamente NADA_A_RELATAR.', quiet: true, paused: true },
+  },
+  {
+    id: 'financeiro-notas', name: 'Financeiro & Notas', emoji: '💰', color: '#ffd60a',
+    description: 'Registra gastos por texto, foto de recibo ou áudio, organiza notas fiscais e gera painéis mensais.',
+    example: '💰 Registrado: Mercado R$ 248,90 (Alimentação) · Total do mês: R$ 3.420 (+4% vs mês anterior).',
+    instructions: 'Você organiza finanças pessoais e notas fiscais. Ao receber foto, PDF, áudio ou texto de gasto, extraia data (yyyy-mm-dd), estabelecimento, valor e categoria, registre na sua memória/arquivo e mantenha um dashboard mensal em Páginas.',
+    approvalMode: 'ask',
+  },
+  {
+    id: 'conteudo-x', name: 'Operador de Conteúdo', emoji: '✍️', color: '#ff375f',
+    description: 'Transforma ideias em posts naturais (sem cara de IA) para X/LinkedIn e só publica após aprovação.',
+    example: '✍️ 3 opções de post prontas no seu tom de voz. Clique em Aprovar no cartão para publicar.',
+    instructions: 'Você escreve como um humano direto e autêntico, sem clichês de IA, sem excesso de emojis ou frases genéricas. Sempre apresente rascunhos e peça aprovação via cartão (/prompts) antes de publicar qualquer coisa.',
+    approvalMode: 'ask',
+    blockRules: 'Nunca publicar post, tweet ou comentário público sem aprovação explícita no cartão.',
+  },
+  {
+    id: 'secretaria-pessoal', name: 'Chefe de Gabinete', emoji: '🎯', color: '#8e8e93',
+    description: 'Coordena seus outros bots por delegação, organiza o Quadro de Tarefas (Board) e cobra pendências.',
+    example: '🎯 Deleguei a pesquisa ao Pesquisador e criei 2 tarefas no Board. Volto assim que consolidar tudo.',
+    instructions: 'Você é o Chefe de Gabinete (bot coordenador). Quebre pedidos grandes em subtarefas, delegue partes especializadas para os outros bots via /bots/<id>/ask, mantenha o Board (/tickets) organizado e consolide uma resposta clara para o usuário.',
+    approvalMode: 'auto',
+  },
+];
+function createBotFromTemplate(templateId, chatId) {
+  const tpl = BOT_TEMPLATES.find((x) => x.id === templateId);
+  if (!tpl) throw new Error('template não encontrado');
+  const b = createBot({
+    name: tpl.name, emoji: tpl.emoji, color: tpl.color, description: tpl.description,
+    instructions: tpl.instructions, approvalMode: tpl.approvalMode || 'auto',
+    allowRules: tpl.allowRules || '', blockRules: tpl.blockRules || '', memory: 'own',
+  });
+  let createdSkill = null;
+  if (tpl.skill) {
+    createdSkill = createSkill({ ...tpl.skill, bot: b.id, source: 'template', upsert: false }, 'template');
+  }
+  let createdRoutine = null;
+  const targetChat = (chatId && chats[chatId]) ? chatId : Object.keys(chats).find((id) => isWeb(id)) || Object.keys(chats)[0];
+  if (tpl.routine && targetChat) {
+    createdRoutine = addSchedule({ ...tpl.routine, chatId: targetChat, bot: b.id });
+    if (tpl.routine.paused) { createdRoutine.paused = true; saveSched(); }
+  }
+  audit({ action: 'bot-template', template: tpl.id, bot: b.id });
+  return { bot: b, skill: createdSkill, routine: createdRoutine };
+}
+function exportBotRecipe(id) {
+  const b = bots[id];
+  if (!b) throw new Error('bot não encontrado');
+  const botSkills = Object.values(skills).filter((s) => s.bot === id).map((s) => ({ name: s.name, slug: s.slug, description: s.description, instructions: s.instructions }));
+  const botRoutines = schedules.filter((r) => r.bot === id).map((r) => ({ description: r.description, prompt: r.prompt, cron: r.cron || '', webhook: Boolean(r.webhook), watch: r.watch || null, quiet: Boolean(r.quiet) }));
+  return {
+    format: 'agent-control-bot-export',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    bot: {
+      name: b.name, emoji: b.emoji || '🤖', color: b.color || '#0a84ff',
+      description: b.description || '', instructions: b.instructions || '',
+      approvalMode: b.approvalMode || 'auto', allowRules: b.allowRules || '', blockRules: b.blockRules || '',
+      memory: b.memory || 'own',
+    },
+    skills: botSkills,
+    routines: botRoutines,
+  };
+}
+function importBotRecipe(rawPayload, chatId) {
+  let data = rawPayload;
+  if (typeof data === 'string') {
+    const cleaned = data.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```(?![\s\S])/, '');
+    const start = cleaned.indexOf('{'), end = cleaned.lastIndexOf('}');
+    if (start < 0 || end <= start) throw new Error('JSON não encontrado no texto colado');
+    data = JSON.parse(cleaned.slice(start, end + 1));
+  }
+  if (!data || typeof data !== 'object') throw new Error('receita inválida');
+  // Support both agent-control-bot-export and Grok Bot export (grok-bot-export / bots array / flat bot object)
+  const src = data.bot || (Array.isArray(data.bots) ? data.bots[0] : data);
+  const name = String(src.name || data.name || 'Bot Importado').trim();
+  const instrParts = [];
+  if (src.instructions) instrParts.push(String(src.instructions));
+  else if (src.systemPrompt) instrParts.push(String(src.systemPrompt));
+  else if (src.prompt) instrParts.push(String(src.prompt));
+  if (Array.isArray(src.rules) && src.rules.length) instrParts.push('\nRegras:\n' + src.rules.map((x) => '- ' + x).join('\n'));
+  const b = createBot({
+    name,
+    emoji: src.emoji || '✨',
+    color: src.color || '#0a84ff',
+    description: String(src.description || src.role || data.description || '').slice(0, 300),
+    instructions: instrParts.join('\n').trim(),
+    approvalMode: src.approvalMode || 'auto',
+    allowRules: src.allowRules || '',
+    blockRules: src.blockRules || '',
+    memory: src.memory === 'shared' ? 'shared' : 'own',
+  });
+  const memText = Array.isArray(src.memory) ? src.memory.map((x) => '- ' + (typeof x === 'string' ? x : JSON.stringify(x))).join('\n')
+    : (typeof src.memoryNotes === 'string' ? src.memoryNotes : (typeof data.memory === 'string' ? data.memory : ''));
+  if (memText.trim()) writeBotMemory(b.id, memText.trim());
+  const importedSkills = [];
+  const rawSkills = data.skills || src.skills || [];
+  for (const sk of Array.isArray(rawSkills) ? rawSkills.slice(0, 20) : []) {
+    const sn = String(sk.name || sk.title || '').trim();
+    const si = String(sk.instructions || sk.steps || sk.prompt || sk.content || '').trim();
+    if (sn && si) importedSkills.push(createSkill({ name: sn, description: String(sk.description || sk.whenToUse || ''), instructions: si, bot: b.id, source: 'import' }, 'import'));
+  }
+  const importedRoutines = [];
+  const rawRoutines = data.routines || src.routines || [];
+  const targetChat = (chatId && chats[chatId]) ? chatId : Object.keys(chats).find((id) => isWeb(id)) || Object.keys(chats)[0];
+  for (const rt of Array.isArray(rawRoutines) ? rawRoutines.slice(0, 20) : []) {
+    if (!targetChat) break;
+    const promptText = String(rt.prompt || rt.instruction || rt.instructions || '').trim();
+    if (!promptText) continue;
+    const cron = rt.cron && validCron(rt.cron) ? rt.cron : '';
+    const webhook = Boolean(rt.webhook || (rt.trigger && /webhook|linear|sentry|pagerduty|github/i.test(String(rt.trigger))));
+    const watch = rt.watch && rt.watch.command ? rt.watch : null;
+    try {
+      const created = addSchedule({
+        chatId: targetChat, bot: b.id,
+        description: String(rt.description || rt.name || 'Rotina importada').slice(0, 120),
+        prompt: promptText,
+        ...(cron ? { cron } : {}),
+        ...(webhook || (!cron && !watch) ? { webhook: true } : {}),
+        ...(watch ? { watch } : {}),
+        quiet: Boolean(rt.quiet),
+      });
+      created.paused = true; saveSched();
+      importedRoutines.push(created);
+    } catch {}
+  }
+  audit({ action: 'bot-import', id: b.id, skills: importedSkills.length, routines: importedRoutines.length });
+  return { bot: b, skills: importedSkills, routines: importedRoutines };
+}
+
+// ---------- ticket board (shared Kanban tasks for user and bots) ----------
+const TICKETS_FILE = path.join(DATA_DIR, 'tickets.json');
+const TICKET_STATUSES = ['todo', 'in_progress', 'review', 'blocked', 'done'];
+const TICKET_PRIORITIES = ['low', 'medium', 'high', 'urgent'];
+let tickets = [];
+try { tickets = JSON.parse(fs.readFileSync(TICKETS_FILE, 'utf8')); } catch {}
+const saveTickets = () => fs.writeFileSync(TICKETS_FILE, JSON.stringify(tickets, null, 2));
+const ticketView = (t) => ({
+  ...t,
+  botName: t.bot && bots[t.bot] ? botLabel(bots[t.bot]) : '',
+  running: Boolean(t.chatId && running.has(t.chatId)),
+});
+function createTicket(b, via = 'panel') {
+  const title = String(b.title || '').trim().slice(0, 160);
+  if (!title) throw new Error('title obrigatório');
+  const now = new Date().toISOString();
+  const t = {
+    id: crypto.randomBytes(3).toString('hex'),
+    title,
+    description: String(b.description || '').trim().slice(0, 8000),
+    status: TICKET_STATUSES.includes(b.status) ? b.status : 'todo',
+    priority: TICKET_PRIORITIES.includes(b.priority) ? b.priority : 'medium',
+    bot: b.bot && bots[b.bot] ? b.bot : '',
+    comments: [],
+    chatId: '',
+    created: now, updated: now,
+  };
+  tickets.push(t); saveTickets();
+  audit({ action: 'ticket-create', id: t.id, title: t.title, bot: t.bot, via });
+  return ticketView(t);
+}
+function patchTicket(id, b, via = 'panel') {
+  const t = tickets.find((x) => x.id === id);
+  if (!t) throw new Error('tarefa não encontrada');
+  if ('title' in b && String(b.title || '').trim()) t.title = String(b.title).trim().slice(0, 160);
+  if ('description' in b) t.description = String(b.description || '').trim().slice(0, 8000);
+  if ('status' in b && TICKET_STATUSES.includes(b.status)) t.status = b.status;
+  if ('priority' in b && TICKET_PRIORITIES.includes(b.priority)) t.priority = b.priority;
+  if ('bot' in b) t.bot = b.bot && bots[b.bot] ? b.bot : '';
+  t.updated = new Date().toISOString();
+  saveTickets();
+  audit({ action: 'ticket-update', id: t.id, status: t.status, via });
+  return ticketView(t);
+}
+function addTicketComment(id, author, text, via = 'panel') {
+  const t = tickets.find((x) => x.id === id);
+  if (!t) throw new Error('tarefa não encontrada');
+  const body = String(text || '').trim().slice(0, 12000);
+  if (!body) throw new Error('comentário vazio');
+  const c = { id: crypto.randomBytes(3).toString('hex'), author: String(author || 'Usuário').slice(0, 60), text: body, at: new Date().toISOString(), via };
+  t.comments = [...(t.comments || []), c].slice(-100);
+  t.updated = c.at;
+  saveTickets();
+  return ticketView(t);
+}
+function deleteTicket(id, via = 'panel') {
+  const idx = tickets.findIndex((x) => x.id === id);
+  if (idx < 0) throw new Error('tarefa não encontrada');
+  const [t] = tickets.splice(idx, 1); saveTickets();
+  audit({ action: 'ticket-delete', id: t.id, via });
+  return { deleted: id };
+}
+function runTicket(id) {
+  const t = tickets.find((x) => x.id === id);
+  if (!t) throw new Error('tarefa não encontrada');
+  const botId = t.bot && bots[t.bot] ? t.bot : DEFAULT_BOT;
+  const botObj = bots[botId];
+  const cid = t.chatId || ('deleg:ticket-' + t.id);
+  t.chatId = cid;
+  t.status = 'in_progress';
+  t.updated = new Date().toISOString();
+  saveTickets();
+  const c = chat(cid);
+  c.title = 'Ticket #' + t.id + ': ' + t.title;
+  c.bot = botId;
+  c.created = c.created || new Date().toISOString();
+  save();
+  const history = (t.comments || []).slice(-10).map((cm) => '[' + cm.author + ']: ' + cm.text).join('\n');
+  const prompt = 'Você foi atribuído à tarefa #' + t.id + ' no Quadro de Tarefas (Board).\n' +
+    'Título: ' + t.title + '\nPrioridade: ' + t.priority + '\n' +
+    (t.description ? 'Descrição:\n' + t.description + '\n' : '') +
+    (history ? 'Comentários anteriores:\n' + history + '\n' : '') +
+    '\nExecute a tarefa com autonomia. Ao terminar, apresente um resumo objetivo do que foi feito e do resultado. Se precisar de intervenção humana, explique claramente o que falta.';
+  enqueue(cid, async () => {
+    const started = Date.now();
+    const r = await runAgent(cid, prompt, { bot: botId, noSteer: true });
+    const ms = r.usage ? r.usage.ms : Date.now() - started;
+    recordRun(cid, { prompt: ('Ticket #' + t.id + ': ' + t.title).slice(0, 80), ms, cost: r.usage ? r.usage.cost : 0, error: r.error });
+    const cur = tickets.find((x) => x.id === id);
+    if (!cur) return;
+    const replyText = r.error ? 'Erro ao executar: ' + r.error : (r.text || '(sem resposta)');
+    addTicketComment(id, botLabel(botObj), replyText, 'bot');
+    if (cur.status === 'in_progress') {
+      cur.status = r.error ? 'blocked' : 'review';
+      cur.updated = new Date().toISOString();
+      saveTickets();
+    }
+  });
+  audit({ action: 'ticket-run', id: t.id, bot: botId });
+  return ticketView(t);
+}
+
+// ---------- live agent computer (Xvfb + fluxbox + x11vnc + websockify/noVNC + persistent Chromium) ----------
+const COMPUTER_DISPLAY = env.COMPUTER_DISPLAY || ':99';
+const COMPUTER_VNC_PORT = Number(env.COMPUTER_VNC_PORT || 5999);
+const COMPUTER_WS_PORT = Number(env.COMPUTER_WS_PORT || 6080);
+const COMPUTER_CDP_PORT = Number(env.COMPUTER_CDP_PORT || 9222);
+const COMPUTER_PROFILE = path.join(DATA_DIR, 'computer-profile');
+const COMPUTER_IDLE_MS = Number(env.COMPUTER_IDLE_MINUTES || 30) * 60000;
+const NOVNC_DIR = '/usr/share/novnc';
+const computer = {
+  status: 'stopped', // stopped | starting | running
+  control: 'bot',    // bot | human
+  startedAt: '',
+  lastActivity: 0,
+  currentUrl: '',
+  procs: {},
+  needsHuman: { active: false, reason: '', url: '', chatId: '', at: '', action: '', promise: null, resolve: null },
+};
+function findChromiumBin() {
+  const roots = [path.join(HOME_DIR, '.cache', 'ms-playwright'), '/ms-playwright'];
+  for (const root of roots) {
+    try {
+      const dirs = fs.readdirSync(root).filter((d) => d.startsWith('chromium-')).sort().reverse();
+      for (const d of dirs) {
+        for (const sub of ['chrome-linux-arm64/chrome', 'chrome-linux/chrome', 'chrome-linux64/chrome']) {
+          const p = path.join(root, d, sub);
+          if (fs.existsSync(p)) return p;
+        }
+      }
+    } catch {}
+  }
+  for (const bin of ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome']) {
+    if (fs.existsSync(bin)) return bin;
+  }
+  return '';
+}
+function binExists(name) {
+  for (const dir of String(env.PATH || '/usr/bin:/bin').split(':')) {
+    if (dir && fs.existsSync(path.join(dir, name))) return true;
+  }
+  return false;
+}
+function computerStatus() {
+  const nh = computer.needsHuman;
+  return {
+    status: computer.status,
+    control: computer.control,
+    display: COMPUTER_DISPLAY,
+    cdpUrl: computer.status === 'running' ? 'http://127.0.0.1:' + COMPUTER_CDP_PORT : '',
+    startedAt: computer.startedAt,
+    lastActivity: computer.lastActivity ? new Date(computer.lastActivity).toISOString() : '',
+    currentUrl: computer.currentUrl,
+    needsHuman: { active: Boolean(nh.active), reason: nh.reason || '', url: nh.url || '', chatId: nh.chatId || '', at: nh.at || '' },
+    available: {
+      xvfb: binExists('Xvfb'), x11vnc: binExists('x11vnc'), websockify: binExists('websockify'),
+      fluxbox: binExists('fluxbox'), scrot: binExists('scrot'), novnc: fs.existsSync(path.join(NOVNC_DIR, 'core', 'rfb.js')),
+      chromium: Boolean(findChromiumBin()),
+    },
+  };
+}
+function spawnBg(key, bin, args, extraEnv) {
+  const child = spawn(bin, args, { cwd: WORKDIR, env: { ...env, ...(extraEnv || {}) }, stdio: ['ignore', 'ignore', 'ignore'] });
+  child.on('error', (e) => log('computer[' + key + '] error:', e.message));
+  child.on('exit', () => { if (computer.procs[key] === child) delete computer.procs[key]; });
+  computer.procs[key] = child;
+  return child;
+}
+function waitTcp(port, ms = 8000) {
+  return new Promise((resolve) => {
+    const end = Date.now() + ms;
+    const probe = () => {
+      const sock = net.connect(port, '127.0.0.1');
+      sock.once('connect', () => { sock.destroy(); resolve(true); });
+      sock.once('error', () => {
+        sock.destroy();
+        if (Date.now() < end) setTimeout(probe, 200); else resolve(false);
+      });
+    };
+    probe();
+  });
+}
+async function startComputer(openUrl = '') {
+  computer.lastActivity = Date.now();
+  if (computer.status === 'running') {
+    if (openUrl) await openComputerUrl(openUrl).catch(() => {});
+    return computerStatus();
+  }
+  if (computer.status === 'starting') {
+    await waitTcp(COMPUTER_WS_PORT, 8000);
+    if (openUrl) await openComputerUrl(openUrl).catch(() => {});
+    return computerStatus();
+  }
+  const avail = computerStatus().available;
+  if (!avail.xvfb || !avail.x11vnc || !avail.websockify) throw new Error('Pacotes do computador (Xvfb, x11vnc, websockify) não estão instalados');
+  computer.status = 'starting';
+  try { fs.rmSync('/tmp/.X' + COMPUTER_DISPLAY.replace(':', '') + '-lock', { force: true }); } catch {}
+  spawnBg('xvfb', 'Xvfb', [COMPUTER_DISPLAY, '-screen', '0', '1280x800x24', '-ac', '-nolisten', 'tcp']);
+  await new Promise((r) => setTimeout(r, 600));
+  if (avail.fluxbox) spawnBg('wm', 'fluxbox', [], { DISPLAY: COMPUTER_DISPLAY });
+  spawnBg('vnc', 'x11vnc', ['-display', COMPUTER_DISPLAY, '-rfbport', String(COMPUTER_VNC_PORT), '-localhost', '-nopw', '-forever', '-shared', '-noxdamage', '-quiet']);
+  await waitTcp(COMPUTER_VNC_PORT, 6000);
+  spawnBg('ws', 'websockify', ['127.0.0.1:' + COMPUTER_WS_PORT, '127.0.0.1:' + COMPUTER_VNC_PORT]);
+  const wsOk = await waitTcp(COMPUTER_WS_PORT, 6000);
+  if (!wsOk) { stopComputer(); throw new Error('Falha ao iniciar o servidor VNC/websockify'); }
+  const chrome = findChromiumBin();
+  if (chrome) {
+    fs.mkdirSync(COMPUTER_PROFILE, { recursive: true });
+    const startUrl = openUrl || 'about:blank';
+    computer.currentUrl = startUrl;
+    spawnBg('chrome', chrome, [
+      '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+      '--window-position=0,0', '--window-size=1280,800', '--remote-debugging-port=' + COMPUTER_CDP_PORT,
+      '--user-data-dir=' + COMPUTER_PROFILE, startUrl,
+    ], { DISPLAY: COMPUTER_DISPLAY });
+  }
+  computer.status = 'running';
+  computer.startedAt = new Date().toISOString();
+  computer.lastActivity = Date.now();
+  audit({ action: 'computer-start', url: openUrl || '' });
+  return computerStatus();
+}
+function stopComputer() {
+  for (const key of ['chrome', 'ws', 'vnc', 'wm', 'xvfb']) {
+    const p = computer.procs[key];
+    if (p) { try { p.kill('SIGTERM'); } catch {} delete computer.procs[key]; }
+  }
+  computer.status = 'stopped';
+  computer.control = 'bot';
+  computer.startedAt = '';
+  if (computer.needsHuman.active) resolveComputerHuman('skip');
+  audit({ action: 'computer-stop' });
+  return computerStatus();
+}
+async function openComputerUrl(url) {
+  const target = String(url || '').trim();
+  if (!/^https?:\/\//i.test(target)) throw new Error('URL deve começar com http:// ou https://');
+  if (computer.status !== 'running') return startComputer(target);
+  computer.lastActivity = Date.now();
+  computer.currentUrl = target;
+  // Open tab via Chromium CDP if available, otherwise launch a new Chromium window with the same profile.
+  try {
+    const r = await fetch('http://127.0.0.1:' + COMPUTER_CDP_PORT + '/json/new?' + encodeURIComponent(target), { method: 'PUT', signal: AbortSignal.timeout(4000) });
+    if (r.ok) return computerStatus();
+  } catch {}
+  const chrome = findChromiumBin();
+  if (chrome) {
+    spawnBg('chrome-tab', chrome, ['--no-sandbox', '--disable-dev-shm-usage', '--user-data-dir=' + COMPUTER_PROFILE, target], { DISPLAY: COMPUTER_DISPLAY });
+  }
+  return computerStatus();
+}
+function setComputerControl(mode) {
+  computer.control = mode === 'human' ? 'human' : 'bot';
+  computer.lastActivity = Date.now();
+  audit({ action: 'computer-control', mode: computer.control });
+  return computerStatus();
+}
+async function requestComputerHuman(b) {
+  const reason = String(b.reason || 'O bot precisa da sua ajuda na tela (login, 2FA ou confirmação).').trim().slice(0, 300);
+  const url = String(b.url || '').trim();
+  const chatId = String(b.chatId || '');
+  await startComputer(url);
+  computer.control = 'human';
+  const nh = {
+    active: true, reason, url, chatId, at: new Date().toISOString(), action: '',
+    promise: null, resolve: null,
+  };
+  nh.promise = new Promise((resolve) => { nh.resolve = resolve; });
+  computer.needsHuman = nh;
+  if (chatId && isWeb(chatId)) webEmit(chatId, { type: 'computer', computer: computerStatus() });
+  audit({ action: 'computer-need-human', chatId, reason: reason.slice(0, 80) });
+  const secs = Math.min(Math.max(Number(b.wait === undefined ? 110 : b.wait) || 0, 0), 115);
+  if (nh.active && secs) await Promise.race([nh.promise, new Promise((r) => setTimeout(r, secs * 1000))]);
+  return { ...computerStatus(), resolved: !computer.needsHuman.active, action: nh.action || 'pending' };
+}
+function resolveComputerHuman(action = 'done') {
+  const nh = computer.needsHuman;
+  nh.active = false;
+  nh.action = action === 'skip' ? 'skip' : 'done';
+  computer.control = 'bot';
+  computer.lastActivity = Date.now();
+  if (nh.chatId && isWeb(nh.chatId)) webEmit(nh.chatId, { type: 'computer', computer: computerStatus() });
+  if (nh.resolve) nh.resolve(nh.action);
+  audit({ action: 'computer-resolve', result: nh.action });
+  return computerStatus();
+}
+async function computerScreenshot() {
+  if (computer.status !== 'running') throw new Error('computador está parado');
+  computer.lastActivity = Date.now();
+  const tmp = path.join('/tmp', 'computer-shot-' + Date.now() + '.png');
+  const r = await new Promise((resolve) => {
+    const child = spawn('scrot', ['-o', tmp], { env: { ...env, DISPLAY: COMPUTER_DISPLAY }, stdio: 'ignore' });
+    child.on('error', () => resolve(1));
+    child.on('close', (code) => resolve(code));
+  });
+  if (r !== 0 || !fs.existsSync(tmp)) throw new Error('não foi possível capturar a tela');
+  const buf = fs.readFileSync(tmp);
+  try { fs.unlinkSync(tmp); } catch {}
+  return buf;
+}
+function computerViewerHtml(wsPath, viewOnly) {
+  return [
+    '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<title>Computador do Agente</title>',
+    '<style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0b0d12;color:#e5e7eb;font-family:system-ui,sans-serif}#screen{width:100%;height:100%;display:flex;align-items:center;justify-content:center}#msg{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font-size:14px;color:#94a3b8;pointer-events:none}</style>',
+    '</head><body><div id="screen"></div><div id="msg">Conectando à tela do computador...</div>',
+    '<script type="module">',
+    'import RFB from "./novnc/core/rfb.js";',
+    'const msg = document.getElementById("msg");',
+    'const proto = location.protocol === "https:" ? "wss://" : "ws://";',
+    'const wsUrl = proto + location.host + ' + JSON.stringify(wsPath) + ';',
+    'let rfb = null;',
+    'function connect() {',
+    '  msg.textContent = "Conectando à tela do computador..."; msg.style.display = "flex";',
+    '  rfb = new RFB(document.getElementById("screen"), wsUrl);',
+    '  rfb.scaleViewport = true; rfb.resizeSession = false; rfb.clipViewport = false;',
+    '  rfb.viewOnly = ' + (viewOnly ? 'true' : 'false') + ';',
+    '  rfb.addEventListener("connect", () => { msg.style.display = "none"; parent.postMessage({ type: "computer-connected" }, "*"); });',
+    '  rfb.addEventListener("disconnect", () => { msg.textContent = "Desconectado. Reconectando..."; msg.style.display = "flex"; setTimeout(connect, 2000); });',
+    '}',
+    'window.addEventListener("message", (e) => {',
+    '  if (!rfb || !e.data) return;',
+    '  if (e.data.type === "viewOnly") rfb.viewOnly = Boolean(e.data.value);',
+    '  if (e.data.type === "clipboard" && e.data.text) rfb.clipboardPasteFrom(String(e.data.text));',
+    '});',
+    'connect();',
+    '</script></body></html>',
+  ].join('\n');
+}
+function serveNoVncFile(res, relPath) {
+  const safe = path.normalize('/' + String(relPath || '')).replace(/^\/+/, '');
+  const full = path.join(NOVNC_DIR, safe);
+  if (!full.startsWith(NOVNC_DIR) || !fs.existsSync(full) || fs.statSync(full).isDirectory()) {
+    res.writeHead(404); return res.end('not found');
+  }
+  const ext = path.extname(full).toLowerCase();
+  const types = { '.js': 'application/javascript; charset=utf-8', '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.ttf': 'font/ttf', '.woff': 'font/woff' };
+  res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream', 'Cache-Control': 'public, max-age=3600' });
+  fs.createReadStream(full).pipe(res);
+}
+setInterval(() => {
+  if (computer.status === 'running' && computer.control !== 'human' && !computer.needsHuman.active && Date.now() - computer.lastActivity > COMPUTER_IDLE_MS) {
+    log('computer: idle timeout, stopping');
+    stopComputer();
+  }
+}, 60000).unref();
+
+// ---------- artifacts index & unified activity feed ----------
+const ARTIFACTS_DIR = path.join(WORKDIR, 'artifacts');
+function listArtifacts() {
+  const fileMeta = new Map(); // filename -> { chatId, chatTitle, bot }
+  for (const id of Object.keys(chats)) {
+    if (!isWeb(id)) continue;
+    const h = webHistory(id);
+    const title = chatView(id).title;
+    const bot = botOf(chats[id]).id;
+    for (const m of h) {
+      for (const f of m.files || []) {
+        if (f.file) fileMeta.set(f.file, { chatId: id, chatTitle: title, bot: m.bot || bot, origName: f.name, type: f.type, voice: Boolean(f.voice) });
+      }
+      if (m.tts) fileMeta.set(m.tts, { chatId: id, chatTitle: title, bot: m.bot || bot, origName: m.tts, type: 'audio/mp4', voice: true });
+    }
+  }
+  const items = [];
+  const scan = (dir, source) => {
+    let list = [];
+    try { list = fs.readdirSync(dir); } catch { return; }
+    for (const name of list) {
+      if (name.startsWith('.')) continue;
+      const full = path.join(dir, name);
+      let st; try { st = fs.statSync(full); } catch { continue; }
+      if (!st.isFile()) continue;
+      const ext = path.extname(name).toLowerCase();
+      const meta = fileMeta.get(name) || {};
+      items.push({
+        name, source, origName: meta.origName || name, size: st.size, ext,
+        type: meta.type || (ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : ext === '.webp' ? 'image/webp' : ext === '.pdf' ? 'application/pdf' : ext === '.m4a' || ext === '.mp4' ? 'audio/mp4' : ext === '.ogg' ? 'audio/ogg' : 'application/octet-stream'),
+        voice: Boolean(meta.voice),
+        chatId: meta.chatId || '', chatTitle: meta.chatTitle || '', bot: meta.bot || '',
+        created: st.mtime.toISOString(),
+      });
+    }
+  };
+  scan(INBOX, 'inbox');
+  if (fs.existsSync(ARTIFACTS_DIR)) scan(ARTIFACTS_DIR, 'artifacts');
+  return items.sort((a, b) => b.created.localeCompare(a.created)).slice(0, 300);
+}
+function artifactPath(name) {
+  const base = path.basename(String(name || ''));
+  if (!base || base.startsWith('.')) return '';
+  for (const dir of [INBOX, ARTIFACTS_DIR]) {
+    const p = path.join(dir, base);
+    if (fs.existsSync(p) && fs.statSync(p).isFile()) return p;
+  }
+  return '';
+}
+function activityFeed() {
+  const items = [];
+  for (const [id, r] of running.entries()) {
+    const cv = chatView(id);
+    items.push({ kind: 'running', id: 'run-' + id, chatId: id, title: cv.title, bot: r.bot || cv.bot, text: r.prompt, at: new Date(r.started).toISOString(), status: 'running' });
+  }
+  for (const p of prompts.values()) {
+    if (p.status === 'pending') {
+      items.push({ kind: p.kind === 'secret' ? 'secret' : 'prompt', id: 'prp-' + p.id, chatId: p.chatId, title: p.title, bot: p.bot, text: p.question, at: p.created, status: 'pending' });
+    }
+  }
+  if (computer.needsHuman.active) {
+    items.push({ kind: 'computer', id: 'comp-nh', chatId: computer.needsHuman.chatId, title: 'Computador precisa de você', bot: '', text: computer.needsHuman.reason, at: computer.needsHuman.at, status: 'pending' });
+  }
+  for (const t of tickets) {
+    if (t.status === 'in_progress' || t.status === 'review' || t.status === 'blocked') {
+      items.push({ kind: 'ticket', id: 'tkt-' + t.id, ticketId: t.id, title: 'Tarefa #' + t.id + ' · ' + t.title, bot: t.bot, text: t.status, at: t.updated, status: t.status });
+    }
+  }
+  for (const [sid, list] of Object.entries(routineRuns)) {
+    const s = schedules.find((x) => x.id === sid);
+    for (const rr of (list || []).slice(-3)) {
+      items.push({ kind: 'routine', id: 'rr-' + rr.id, chatId: s ? s.chatId : '', title: (s ? s.description : 'Rotina #' + sid), bot: s ? (s.bot || '') : '', text: (rr.text || '').slice(0, 140), at: rr.at, status: rr.status, ms: rr.ms || 0 });
+    }
+  }
+  for (const id of Object.keys(chats)) {
+    if (!isWeb(id)) continue;
+    const c = chats[id];
+    const last = (c.runs || []).at(-1);
+    if (last) items.push({ kind: 'chat', id: 'ch-' + id + '-' + last.at, chatId: id, title: c.title || 'Conversa', bot: botOf(c).id, text: last.prompt || '', at: last.at, status: last.error ? 'error' : 'ok', ms: last.ms || 0 });
+  }
+  return items.sort((a, b) => String(b.at || '').localeCompare(String(a.at || ''))).slice(0, 80);
 }
 
 // ---------- send to any number (local only, used by Claude itself) ----------
@@ -1748,7 +2611,10 @@ function webSend(chatId, text, files = [], transcript = '') {
     webUpdate(chatId, um.id, { transcript: tr.text, transcriptEngine: tr.engine });
     if (c.title === 'Mensagem de voz') { c.title = tr.text.replace(/\s+/g, ' ').slice(0, 60); save(); }
   });
-  const buildPrompt = (tr) => promptWithFiles(text, files, tr ? tr.text : transcript, tr ? tr.engine : '');
+  const buildPrompt = (tr) => {
+    const rawText = expandSkillPrompt(text).text;
+    return promptWithFiles(rawText, files, tr ? tr.text : transcript, tr ? tr.engine : '');
+  };
   // While a run is going on, Claude Code reads the new message mid-run (voice notes after the transcription).
   const inject = (prompt) => {
     if (!tryInject(chatId, prompt)) return false;
@@ -2049,6 +2915,7 @@ function chatView(id) {
     provider: providerOf(c), providerSet: Boolean(c.provider), bot: botOf(c).id, effModel: runConfig(c).model || '', effEffort: runConfig(c).effort || '',
     model: c.model || '', effort: c.effort || '', agyModel: c.agyModel || '', agyEffort: c.agyEffort || '',
     session: c.session || '', agySession: c.agySession || '', created: c.created || '', readAt: c.readAt || '', unread,
+    pinned: Boolean(c.pinned), archived: Boolean(c.archived),
     totals: c.totals || { runs: 0, cost: 0, ms: 0, errors: 0 }, runs: c.runs || [], lastUsage: c.lastUsage || null,
     running: r ? { started: r.started, prompt: r.prompt } : null,
     queued: Math.max(0, (pending.get(id) || 0) - (r ? 1 : 0)),
@@ -2238,6 +3105,10 @@ async function handleAdmin(req, res, u, raw) {
         aiMemory: { status: aiMemory.status, restarts: aiMemory.restarts }, allowed: ALLOWED.length, settings,
         running: [...running.entries()].map(([id, r]) => ({ chatId: id, started: r.started, prompt: r.prompt })),
         chats: Object.keys(chats).length, schedules: schedules.length, bots: Object.keys(bots).length, pages: Object.keys(pages).length,
+        skills: Object.keys(skills).length, tickets: tickets.length,
+        openTickets: tickets.filter((t) => t.status !== 'done').length,
+        secrets: Object.keys(secrets).length,
+        computer: { status: computer.status, control: computer.control, needsHuman: Boolean(computer.needsHuman.active) },
         unread: Object.keys(chats).filter((id) => isWeb(id) && chatView(id).unread).length,
         pendingPrompts: [...prompts.values()].filter((p) => p.status === 'pending').length });
     }
@@ -2288,6 +3159,8 @@ async function handleAdmin(req, res, u, raw) {
         if (nb.id !== botOf(c).id) { delete c.session; delete c.agySession; audit({ action: 'chat-bot', chatId: b, bot: nb.id, via: 'panel' }); }
         if (nb.id === DEFAULT_BOT) delete c.bot; else c.bot = nb.id;
       }
+      if ('pinned' in body) { if (body.pinned) c.pinned = true; else delete c.pinned; }
+      if ('archived' in body) { if (body.archived) c.archived = true; else delete c.archived; }
       if (body.read) c.readAt = new Date().toISOString();
       if (body.reset) { delete c.session; delete c.agySession; }
       save();
@@ -2330,7 +3203,7 @@ async function handleAdmin(req, res, u, raw) {
       return send(200, list);
     }
     if (a === 'prompts' && b && (c2 === 'answer' || !c2) && m === 'POST') {
-      return send(200, answerPrompt(b, body.answer, body.note, 'panel'));
+      return send(200, answerPrompt(b, body.answer, body.note, 'panel', body.secretValue || ''));
     }
     if (a === 'web' && b && c2 === 'tts' && m === 'POST') {
       const id = 'web:' + b;
@@ -2405,15 +3278,20 @@ async function handleAdmin(req, res, u, raw) {
       }
     }
     if (a === 'bots') {
+      if (b === 'templates' && m === 'GET') return send(200, BOT_TEMPLATES);
+      if (b === 'from-template' && m === 'POST') return send(200, createBotFromTemplate(body.templateId, body.chatId));
+      if (b === 'import' && m === 'POST') return send(200, importBotRecipe(body.recipe !== undefined ? body.recipe : body, body.chatId));
       if (!b && m === 'GET') {
         return send(200, Object.values(bots).map((x) => ({ ...x, isDefault: x.id === DEFAULT_BOT,
           chats: Object.values(chats).filter((c) => botOf(c).id === x.id).length,
           routines: schedules.filter((r) => (r.bot || botOf(chats[r.chatId]).id) === x.id).length,
+          skills: Object.values(skills).filter((s) => s.bot === x.id).length,
           memorySize: readBotMemory(x.id).length })));
       }
       if (!b && m === 'POST') return send(200, createBot(body));
       const bt = bots[b];
       if (!bt) return send(404, { error: 'bot não encontrado' });
+      if (c2 === 'export' && m === 'GET') return send(200, exportBotRecipe(bt.id));
       if (!c2 && m === 'PATCH') { botPatch(bt, body, 'panel'); saveBots(); audit({ action: 'bot-update', id: bt.id, via: 'panel' }); return send(200, bt); }
       if (!c2 && m === 'DELETE') {
         if (bt.id === DEFAULT_BOT) throw new Error('o bot padrão não pode ser apagado');
@@ -2446,6 +3324,69 @@ async function handleAdmin(req, res, u, raw) {
     }
     if (a === 'mcp' && !b && m === 'POST') return send(200, await addMcp(body));
     if (a === 'mcp' && b && c2 && m === 'DELETE') return send(200, await removeMcp(b, c2, u.searchParams.get('scope')));
+    if (a === 'skills') {
+      if (!b && m === 'GET') return send(200, Object.values(skills).map(skillView).sort((x, y) => String(y.updated).localeCompare(String(x.updated))));
+      if (!b && m === 'POST') return send(200, createSkill(body, 'panel'));
+      if (b === 'import-github' && m === 'POST') return send(200, await importSkillsFromGithub(body.url));
+      if (b && m === 'GET') return skills[b] ? send(200, skillView(skills[b])) : send(404, { error: 'skill não encontrada' });
+      if (b && m === 'PATCH') return send(200, patchSkill(b, body, 'panel'));
+      if (b && m === 'DELETE') return send(200, deleteSkill(b, 'panel'));
+    }
+    if (a === 'secrets') {
+      if (!b && m === 'GET') return send(200, listSecretsMeta());
+      if (!b && m === 'POST') return send(200, setSecret(body, 'panel'));
+      if (b && m === 'DELETE') return send(200, deleteSecret(b, 'panel'));
+    }
+    if (a === 'tickets') {
+      if (!b && m === 'GET') return send(200, tickets.map(ticketView).sort((x, y) => String(y.updated).localeCompare(String(x.updated))));
+      if (!b && m === 'POST') return send(200, createTicket(body, 'panel'));
+      if (b && !c2 && m === 'PATCH') return send(200, patchTicket(b, body, 'panel'));
+      if (b && !c2 && m === 'DELETE') return send(200, deleteTicket(b, 'panel'));
+      if (b && c2 === 'comment' && m === 'POST') return send(200, addTicketComment(b, body.author || 'Usuário', body.text, 'panel'));
+      if (b && c2 === 'run' && m === 'POST') return send(200, runTicket(b));
+    }
+    if (a === 'computer') {
+      if (b === 'status' && m === 'GET') return send(200, computerStatus());
+      if (b === 'start' && m === 'POST') return send(200, await startComputer(body.url || ''));
+      if (b === 'stop' && m === 'POST') return send(200, stopComputer());
+      if (b === 'control' && m === 'POST') return send(200, setComputerControl(body.mode));
+      if (b === 'resolve' && m === 'POST') return send(200, resolveComputerHuman(body.action));
+      if (b === 'open' && m === 'POST') return send(200, await openComputerUrl(body.url));
+      if (b === 'screenshot' && m === 'GET') {
+        const png = await computerScreenshot();
+        res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': png.length, 'Cache-Control': 'no-cache' });
+        return res.end(png);
+      }
+      if (b === 'viewer' && m === 'GET') {
+        const wsPath = u.searchParams.get('ws') || '/api/bridge/computer/ws';
+        const viewOnly = u.searchParams.get('viewOnly') !== '0';
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+        return res.end(computerViewerHtml(wsPath, viewOnly));
+      }
+      if (b === 'novnc' && m === 'GET') {
+        return serveNoVncFile(res, parts.slice(2).join('/'));
+      }
+    }
+    if (a === 'artifacts') {
+      if (!b && m === 'GET') return send(200, listArtifacts());
+      if (b === 'file' && c2 && m === 'GET') {
+        const fp = artifactPath(c2);
+        if (!fp) return send(404, { error: 'arquivo não encontrado' });
+        const ext = path.extname(fp).toLowerCase();
+        const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp',
+          '.pdf': 'application/pdf', '.webm': 'audio/webm', '.ogg': 'audio/ogg', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.mp4': 'video/mp4', '.wav': 'audio/wav', '.txt': 'text/plain; charset=utf-8', '.md': 'text/markdown; charset=utf-8', '.json': 'application/json', '.csv': 'text/csv', '.html': 'text/html; charset=utf-8' };
+        res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream', 'Content-Length': fs.statSync(fp).size, 'Cache-Control': 'private, max-age=3600' });
+        return fs.createReadStream(fp).pipe(res);
+      }
+      if (b && !c2 && m === 'DELETE') {
+        const fp = artifactPath(b);
+        if (!fp) return send(404, { error: 'arquivo não encontrado' });
+        fs.unlinkSync(fp);
+        audit({ action: 'artifact-delete', file: path.basename(fp), via: 'panel' });
+        return send(200, { deleted: path.basename(fp) });
+      }
+    }
+    if (a === 'activity' && m === 'GET') return send(200, activityFeed());
     if (a === 'audit' && m === 'GET') return send(200, readAudit(Math.min(Number(u.searchParams.get('n')) || 100, 1000)));
     if (a === 'send' && m === 'POST') {
       const out = await sendMessage({ to: body.to, text: body.text, raw: true });
@@ -2473,6 +3414,76 @@ const server = http.createServer((req, res) => {
     if (u.pathname.startsWith('/admin/')) return handleAdmin(req, res, u, raw).catch((e) => { log('admin error', e.message); try { res.writeHead(500); res.end(); } catch {} });
     if (u.pathname.startsWith('/hooks/')) return handleHook(req, res, u, raw).catch((e) => { log('hook error', e.message); try { res.writeHead(500); res.end(); } catch {} });
     if (u.pathname.startsWith('/p/')) return handlePublicPage(req, res, u).catch((e) => { log('page error', e.message); try { res.writeHead(500); res.end(); } catch {} });
+    if (u.pathname === '/skills' || u.pathname.startsWith('/skills/')) {
+      if (!isLocal(req)) { res.writeHead(403); return res.end(); }
+      try {
+        const slug = decodeURIComponent(u.pathname.split('/')[2] || '');
+        const b = raw.length ? JSON.parse(raw.toString('utf8') || '{}') : {};
+        let out;
+        if (!slug && req.method === 'GET') out = Object.values(skills).map(skillView);
+        else if (!slug && req.method === 'POST') out = createSkill(b, 'agent');
+        else if (slug && req.method === 'GET' && skills[slug]) out = skillView(skills[slug]);
+        else if (slug && req.method === 'PATCH' && skills[slug]) out = patchSkill(slug, b, 'agent');
+        else if (slug && req.method === 'DELETE' && skills[slug]) out = deleteSkill(slug, 'agent');
+        else throw new Error('skill não encontrada ou método não suportado');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(out, null, 2));
+      } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: e.message })); }
+    }
+    if (u.pathname === '/secrets' || u.pathname.startsWith('/secrets/')) {
+      if (!isLocal(req)) { res.writeHead(403); return res.end(); }
+      try {
+        const sub = decodeURIComponent(u.pathname.split('/')[2] || '');
+        const b = raw.length ? JSON.parse(raw.toString('utf8') || '{}') : {};
+        let out;
+        if (!sub && req.method === 'GET') out = listSecretsMeta();
+        else if (sub === 'request' && req.method === 'POST') {
+          const p = startPrompt({
+            chatId: b.chatId || b.from, kind: 'secret',
+            secretName: b.name || 'segredo', secretKind: b.kind || 'api_key',
+            title: b.label || ('Credencial: ' + (b.name || 'segredo')),
+            question: b.reason || ('Informe o valor protegido para "' + (b.name || 'segredo') + '". Ele será salvo no cofre sem aparecer no histórico.'),
+            options: ['Cancelar'],
+          });
+          out = await waitPrompt(p, b.wait === undefined ? 110 : b.wait);
+        } else if (sub === 'exec' && req.method === 'POST') out = await execWithSecret(b);
+        else throw new Error('rota de cofre inválida');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(out, null, 2));
+      } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: e.message })); }
+    }
+    if (u.pathname === '/tickets' || u.pathname.startsWith('/tickets/')) {
+      if (!isLocal(req)) { res.writeHead(403); return res.end(); }
+      try {
+        const id = decodeURIComponent(u.pathname.split('/')[2] || '');
+        const sub = decodeURIComponent(u.pathname.split('/')[3] || '');
+        const b = raw.length ? JSON.parse(raw.toString('utf8') || '{}') : {};
+        let out;
+        if (!id && req.method === 'GET') out = tickets.map(ticketView);
+        else if (!id && req.method === 'POST') out = createTicket(b, 'agent');
+        else if (id && !sub && req.method === 'PATCH') out = patchTicket(id, b, 'agent');
+        else if (id && sub === 'comment' && req.method === 'POST') out = addTicketComment(id, b.author || 'Bot', b.text, 'agent');
+        else throw new Error('tarefa não encontrada ou método não suportado');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(out, null, 2));
+      } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: e.message })); }
+    }
+    if (u.pathname.startsWith('/computer/')) {
+      if (!isLocal(req)) { res.writeHead(403); return res.end(); }
+      try {
+        const sub = decodeURIComponent(u.pathname.split('/')[2] || '');
+        const b = raw.length ? JSON.parse(raw.toString('utf8') || '{}') : {};
+        let out;
+        if (sub === 'status' && req.method === 'GET') out = computerStatus();
+        else if (sub === 'open' && req.method === 'POST') out = await openComputerUrl(b.url);
+        else if (sub === 'start' && req.method === 'POST') out = await startComputer(b.url || '');
+        else if (sub === 'stop' && req.method === 'POST') out = stopComputer();
+        else if (sub === 'need-human' && req.method === 'POST') out = await requestComputerHuman(b);
+        else throw new Error('rota de computador inválida');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(out, null, 2));
+      } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: e.message })); }
+    }
     if (u.pathname === '/prompts' || u.pathname.startsWith('/prompts/')) {
       if (!isLocal(req)) { res.writeHead(403); return res.end(); }
       try {
@@ -2621,6 +3632,31 @@ async function notifyStartup() {
     }
   }
 }
+
+// WebSocket proxy for live computer noVNC: /admin/computer/ws -> 127.0.0.1:COMPUTER_WS_PORT
+server.on('upgrade', (req, socket, head) => {
+  const u = new URL(req.url || '/', 'http://local');
+  if (u.pathname !== '/admin/computer/ws' || !adminAuthorized(req)) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    return socket.destroy();
+  }
+  computer.lastActivity = Date.now();
+  const upstream = net.connect(COMPUTER_WS_PORT, '127.0.0.1', () => {
+    const hdrs = ['GET / HTTP/1.1', 'Host: 127.0.0.1:' + COMPUTER_WS_PORT];
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      const k = req.rawHeaders[i], v = req.rawHeaders[i + 1];
+      if (/^(host|authorization)$/i.test(k)) continue;
+      hdrs.push(k + ': ' + v);
+    }
+    upstream.write(hdrs.join('\r\n') + '\r\n\r\n');
+    if (head && head.length) upstream.write(head);
+    upstream.pipe(socket);
+    socket.pipe(upstream);
+  });
+  const close = () => { try { socket.destroy(); } catch {} try { upstream.destroy(); } catch {} };
+  upstream.on('error', close);
+  socket.on('error', close);
+});
 
 server.listen(PORT, () => {
   log('bridge listening on', PORT, '| version', VERSION, '| session', WAHA_SESSION, '| allowed numbers', ALLOWED.length, '| mode', PERMISSION_MODE);
