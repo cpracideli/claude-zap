@@ -283,6 +283,13 @@ function systemPrompt(chatId, bot) {
     '  O prompt do agendamento roda depois numa sessão NOVA, sem o contexto desta conversa: escreva-o completo (o que buscar, como formatar, o que enviar). A resposta final daquela execução é enviada automaticamente ao usuário. Confirme ao usuário o id, o horário e o que será enviado.',
     '  Rotinas (opcional, mesmos campos no POST): "webhook":true gera uma URL que dispara a rotina quando alguém faz POST nela (o corpo chega como dados do gatilho); "watch":{"command":"comando bash","every":30} roda o comando a cada N minutos (5 a 1440) e só dispara quando a saída muda; "quiet":true não envia nada quando a resposta for só NADA_A_RELATAR; "bot":"id" executa como outro bot. Pode haver rotina só com webhook ou só com watch (sem cron/at). O histórico de execuções fica no painel, aba Agendamentos.' +
       (settings.panelUrl ? ' URL pública do webhook: ' + settings.panelUrl + '/hooks/ID/TOKEN (id e hookToken vêm na resposta do POST).' : ' A URL pública do webhook aparece no painel, na aba Agendamentos.'),
+    'PÁGINAS (dashboards e documentos HTML): quando o usuário pedir uma página, dashboard, relatório visual ou app web interativo, publique como Página da ponte (uma rotina também pode atualizar a mesma página pelo id):',
+    '  Criar: curl -s -X POST http://127.0.0.1:' + PORT + '/pages -H "Content-Type: application/json" -d \'{"title":"Título","description":"resumo curto","html":"<!doctype html><html>...</html>","bot":"' + (bot || botOf(chats[chatId])).id + '","chatId":"' + chatId + '","public":false}\'',
+    '  Atualizar: curl -s -X PATCH http://127.0.0.1:' + PORT + '/pages/ID -H "Content-Type: application/json" -d \'{"html":"..."}\'   Listar: curl -s http://127.0.0.1:' + PORT + '/pages   Ler: curl -s http://127.0.0.1:' + PORT + '/pages/ID',
+    '  Para HTML grande, grave o JSON num arquivo e use --data @arquivo. As páginas aparecem na aba Páginas do painel' + (settings.panelUrl ? ' (' + settings.panelUrl + '/#/pages) e, quando "public":true, têm link público ' + settings.panelUrl + '/p/ID/TOKEN (shareToken vem na resposta).' : '.'),
+    'CARTÕES DE PERGUNTA / APROVAÇÃO: quando precisar que o usuário escolha uma opção ou aprove uma ação importante antes de continuar, envie um cartão interativo e aguarde a resposta (o usuário clica num botão no painel ou responde pelo número no WhatsApp):',
+    '  curl -s -X POST http://127.0.0.1:' + PORT + '/prompts -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","title":"Confirmar ação","question":"O que deseja fazer?","options":["Aprovar","Cancelar"],"wait":110}\'',
+    '  A resposta traz status "answered" e "answer" (a opção escolhida); se vier "pending", repita: curl -s "http://127.0.0.1:' + PORT + '/prompts/ID?wait=110" até o usuário responder.',
     'Comandos da ponte que o usuário pode usar: /help, /new, /status, /usage, /log, /model, /effort, /stop, /send, /schedules, /pause, /resume, /cancel, /bot.',
     botPrompt(bot || botOf(chats[chatId]), chatId),
   ].filter(Boolean).join('\n');
@@ -1001,6 +1008,15 @@ async function handleMessage(msg) {
   if (!body) return;
 
   if (running.has(chatId)) {
+    const pp = pendingPromptFor(chatId);
+    if (pp) {
+      const n = body.length <= 2 && /^\d+(?![\s\S])/.test(body) ? Number(body) : 0;
+      const ans = n >= 1 && n <= pp.options.length ? pp.options[n - 1] : body;
+      answerPrompt(pp.id, ans, '', 'whatsapp');
+      remember(chatId, 'user', ans);
+      reply(chatId, '✅ Resposta registrada: *' + ans + '*', true).catch(() => {});
+      return;
+    }
     // Claude Code reads it right away, in the middle of the run (like the interactive terminal).
     if (tryInject(chatId, body)) {
       remember(chatId, 'user', body);
@@ -1387,6 +1403,158 @@ async function handleHook(req, res, u, raw) {
   return send(202, { queued: true, run: rec.id });
 }
 
+// ---------- pages (HTML dashboards and documents created by bots or routines) ----------
+const PAGES_FILE = path.join(DATA_DIR, 'pages.json');
+const PAGES_DIR = path.join(DATA_DIR, 'pages');
+fs.mkdirSync(PAGES_DIR, { recursive: true });
+let pages = {};
+try { pages = JSON.parse(fs.readFileSync(PAGES_FILE, 'utf8')); } catch {}
+const savePages = () => fs.writeFileSync(PAGES_FILE, JSON.stringify(pages, null, 2));
+const pageHtmlFile = (id) => path.join(PAGES_DIR, String(id).replace(/[^\w-]/g, '') + '.html');
+const readPageHtml = (id) => { try { return fs.readFileSync(pageHtmlFile(id), 'utf8'); } catch { return ''; } };
+const writePageHtml = (id, html) => fs.writeFileSync(pageHtmlFile(id), String(html || '').slice(0, 2 * 1024 * 1024));
+function pageSlug(raw, fallback) {
+  const s = fold(raw || fallback || 'pagina').replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
+  return s || 'pagina-' + crypto.randomBytes(2).toString('hex');
+}
+function pageView(p, withHtml = false) {
+  const b = p.bot && bots[p.bot] ? bots[p.bot] : null;
+  const html = readPageHtml(p.id);
+  return { ...p, botName: b ? botLabel(b) : (p.bot || ''), size: Buffer.byteLength(html), ...(withHtml ? { html } : {}) };
+}
+function createPage(b, via = 'agent') {
+  const title = String(b.title || '').trim().slice(0, 120);
+  if (!title) throw new Error('title obrigatório');
+  if (b.html === undefined || !String(b.html).trim()) throw new Error('html obrigatório');
+  let id = b.id ? pageSlug(b.id) : pageSlug(title);
+  if (pages[id] && !b.upsert) {
+    let n = 2; while (pages[id + '-' + n]) n++; id = id + '-' + n;
+  }
+  const existing = pages[id];
+  if (existing && b.upsert) return patchPage(existing, b, via);
+  const now = new Date().toISOString();
+  const isPub = Boolean(b.public);
+  const p = {
+    id, title, description: String(b.description || '').trim().slice(0, 300),
+    bot: b.bot && bots[b.bot] ? b.bot : DEFAULT_BOT,
+    chatId: b.chatId ? String(b.chatId) : '',
+    public: isPub,
+    ...(isPub ? { shareToken: crypto.randomBytes(16).toString('hex') } : {}),
+    created: now, updated: now, revisions: 1, history: [],
+  };
+  writePageHtml(id, b.html);
+  pages[id] = p; savePages();
+  audit({ action: 'page-create', id, title, bot: p.bot, public: isPub, via });
+  return pageView(p, true);
+}
+function patchPage(p, b, via = 'agent') {
+  if ('title' in b && String(b.title || '').trim()) p.title = String(b.title).trim().slice(0, 120);
+  if ('description' in b) p.description = String(b.description || '').trim().slice(0, 300);
+  if ('bot' in b && b.bot && bots[b.bot]) p.bot = b.bot;
+  if ('public' in b) {
+    if (b.public) { p.public = true; if (!p.shareToken) p.shareToken = crypto.randomBytes(16).toString('hex'); }
+    else { p.public = false; delete p.shareToken; }
+  }
+  if (b.newToken && p.public) p.shareToken = crypto.randomBytes(16).toString('hex');
+  if ('html' in b && b.html !== undefined) {
+    const oldHtml = readPageHtml(p.id);
+    const nextHtml = String(b.html);
+    if (oldHtml && oldHtml !== nextHtml) {
+      p.history = [...(p.history || []), { at: p.updated || new Date().toISOString(), via, title: p.title, html: oldHtml.slice(0, 200000) }].slice(-10);
+      p.revisions = (p.revisions || 1) + 1;
+    }
+    writePageHtml(p.id, nextHtml);
+  }
+  p.updated = new Date().toISOString();
+  savePages();
+  audit({ action: 'page-update', id: p.id, title: p.title, public: Boolean(p.public), via });
+  return pageView(p, true);
+}
+function deletePage(id, via = 'panel') {
+  const p = pages[id];
+  if (!p) throw new Error('página não encontrada');
+  delete pages[id]; savePages();
+  try { fs.unlinkSync(pageHtmlFile(id)); } catch {}
+  audit({ action: 'page-delete', id, title: p.title, via });
+  return { deleted: id };
+}
+async function handlePublicPage(req, res, u) {
+  const [, , id, token] = u.pathname.split('/').map(decodeURIComponent);
+  const p = pages[id];
+  const want = p && p.public && p.shareToken ? p.shareToken : '';
+  const got = String(token || '');
+  if (!want || got.length !== want.length || !crypto.timingSafeEqual(Buffer.from(got), Buffer.from(want))) {
+    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+    return res.end('Página não encontrada ou privada.');
+  }
+  const html = readPageHtml(p.id);
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+  return res.end(html);
+}
+
+// ---------- interactive prompt / approval cards (Phase 6) ----------
+const prompts = new Map(); // id -> prompt object
+const promptLog = new Map(); // chatId -> prompts created during the current run
+const promptView = (p) => ({
+  id: p.id, chatId: p.chatId, bot: p.bot, botName: bots[p.bot] ? botLabel(bots[p.bot]) : p.bot,
+  title: p.title, question: p.question, options: p.options, status: p.status,
+  answer: p.answer || '', note: p.note || '', created: p.created, answeredAt: p.answeredAt || '',
+});
+function emitPrompt(p) {
+  if (isWeb(p.chatId)) webEmit(p.chatId, { type: 'prompt', prompt: promptView(p) });
+  const list = promptLog.get(p.chatId) || [];
+  const idx = list.findIndex((x) => x.id === p.id);
+  if (idx >= 0) list[idx] = promptView(p); else list.push(promptView(p));
+  promptLog.set(p.chatId, list);
+}
+function startPrompt(body) {
+  const chatId = String(body.chatId || body.from || '');
+  const question = String(body.question || body.text || '').trim();
+  const title = String(body.title || 'Pergunta / Aprovação').trim().slice(0, 120);
+  if (!chatId || !chats[chatId]) throw new Error('chatId desconhecido');
+  if (!question) throw new Error('question obrigatório');
+  const rawOpts = Array.isArray(body.options) && body.options.length ? body.options : ['Aprovar', 'Cancelar'];
+  const options = rawOpts.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 8);
+  if (!options.length) throw new Error('options vazio');
+  const callerBot = (running.get(chatId) && running.get(chatId).bot) || botOf(chats[chatId]).id;
+  const p = {
+    id: crypto.randomBytes(4).toString('hex'), chatId, bot: callerBot, title, question, options,
+    status: 'pending', answer: '', note: '', created: new Date().toISOString(), started: Date.now(),
+  };
+  p.promise = new Promise((resolve) => { p.resolve = resolve; });
+  prompts.set(p.id, p);
+  if (prompts.size > 300) prompts.delete(prompts.keys().next().value);
+  audit({ action: 'prompt-ask', chatId, id: p.id, title, question: question.slice(0, 80) });
+  emitPrompt(p);
+  if (!isWeb(chatId) && !isDeleg(chatId)) {
+    const numbered = options.map((o, i) => (i + 1) + '. ' + o).join('\n');
+    reply(chatId, '❓ *' + title + '*\n' + question + '\n\n' + numbered + '\n\n_Responda com o número da opção ou escreva sua resposta._', true).catch(() => {});
+  }
+  return p;
+}
+function answerPrompt(id, answer, note = '', via = 'panel') {
+  const p = prompts.get(id);
+  if (!p) throw new Error('cartão não encontrado');
+  if (p.status !== 'pending') return promptView(p);
+  p.status = 'answered';
+  p.answer = String(answer || '').trim();
+  p.note = String(note || '').trim();
+  p.answeredAt = new Date().toISOString();
+  audit({ action: 'prompt-answer', chatId: p.chatId, id: p.id, answer: p.answer.slice(0, 80), via });
+  emitPrompt(p);
+  if (p.resolve) p.resolve(p);
+  return promptView(p);
+}
+function pendingPromptFor(chatId) {
+  for (const p of prompts.values()) if (p.chatId === chatId && p.status === 'pending') return p;
+  return null;
+}
+async function waitPrompt(p, secs) {
+  const ms = Math.min(Math.max(Number(secs) || 0, 0), 115) * 1000;
+  if (p.status === 'pending' && ms) await Promise.race([p.promise, new Promise((r) => setTimeout(r, ms))]);
+  return promptView(p);
+}
+
 // ---------- send to any number (local only, used by Claude itself) ----------
 // "to" may be a phone number in any format (+55 11 9...), or a full WhatsApp id (...@c.us / ...@g.us / ...@lid).
 async function resolveTo(to) {
@@ -1601,14 +1769,17 @@ function webSend(chatId, text, files = [], transcript = '') {
       const onEvent = (ev) => { for (const e of webEventsFrom(ev, tools)) webEmit(chatId, e); };
       const started = Date.now();
       delegLog.delete(chatId);
+      promptLog.delete(chatId);
       const r = await runTurn(chatId, id, targets.length ? groupPrompt(chatId, id, prompt) : prompt, null, onEvent,
         () => webEmit(chatId, { type: 'text', text: '(a sessão anterior não abriu; começando uma nova)' }));
       const ms = r.usage ? r.usage.ms : Date.now() - started;
       recordRun(chatId, { prompt: label.slice(0, 80), ms, cost: r.usage ? r.usage.cost : 0, error: r.stopped ? 'interrompido pelo usuário' : r.error });
       const delegations = delegLog.get(chatId) || [];
       delegLog.delete(chatId);
+      const cards = promptLog.get(chatId) || [];
+      promptLog.delete(chatId);
       webAppend(chatId, {
-        role: 'assistant', provider, bot: who.id, tools, ...(delegations.length ? { delegations } : {}),
+        role: 'assistant', provider, bot: who.id, tools, ...(delegations.length ? { delegations } : {}), ...(cards.length ? { prompts: cards } : {}),
         text: r.stopped ? '(interrompido)' : r.error ? 'Erro: ' + r.error : r.text,
         error: Boolean(r.error), stopped: Boolean(r.stopped),
         usage: { ms, cost: r.usage ? r.usage.cost : 0, turns: r.usage ? r.usage.turns : 0 },
@@ -1871,14 +2042,17 @@ async function providersInfo() {
 function chatView(id) {
   const c = chats[id] || {};
   const r = running.get(id);
+  const lastRunAt = (c.runs && c.runs.at(-1) && c.runs.at(-1).at) || '';
+  const unread = Boolean(isWeb(id) && lastRunAt && (!c.readAt || lastRunAt > c.readAt));
   return {
     id, kind: isWeb(id) ? 'web' : isDeleg(id) ? 'delegation' : 'whatsapp', members: Array.isArray(c.members) ? c.members : [], title: c.title || (isWeb(id) ? 'Conversa web' : id.split('@')[0]),
     provider: providerOf(c), providerSet: Boolean(c.provider), bot: botOf(c).id, effModel: runConfig(c).model || '', effEffort: runConfig(c).effort || '',
     model: c.model || '', effort: c.effort || '', agyModel: c.agyModel || '', agyEffort: c.agyEffort || '',
-    session: c.session || '', agySession: c.agySession || '', created: c.created || '',
+    session: c.session || '', agySession: c.agySession || '', created: c.created || '', readAt: c.readAt || '', unread,
     totals: c.totals || { runs: 0, cost: 0, ms: 0, errors: 0 }, runs: c.runs || [], lastUsage: c.lastUsage || null,
     running: r ? { started: r.started, prompt: r.prompt } : null,
     queued: Math.max(0, (pending.get(id) || 0) - (r ? 1 : 0)),
+    pendingPrompt: pendingPromptFor(id) ? promptView(pendingPromptFor(id)) : null,
   };
 }
 
@@ -2063,7 +2237,27 @@ async function handleAdmin(req, res, u, raw) {
       return send(200, { version: VERSION, tz: TZ, permissionMode: PERMISSION_MODE, workdir: WORKDIR, uptime: Math.round(process.uptime()),
         aiMemory: { status: aiMemory.status, restarts: aiMemory.restarts }, allowed: ALLOWED.length, settings,
         running: [...running.entries()].map(([id, r]) => ({ chatId: id, started: r.started, prompt: r.prompt })),
-        chats: Object.keys(chats).length, schedules: schedules.length, bots: Object.keys(bots).length });
+        chats: Object.keys(chats).length, schedules: schedules.length, bots: Object.keys(bots).length, pages: Object.keys(pages).length,
+        unread: Object.keys(chats).filter((id) => isWeb(id) && chatView(id).unread).length,
+        pendingPrompts: [...prompts.values()].filter((p) => p.status === 'pending').length });
+    }
+    if (a === 'pages') {
+      if (!b && m === 'GET') return send(200, Object.values(pages).map((p) => pageView(p, false)).sort((x, y) => String(y.updated).localeCompare(String(x.updated))));
+      if (!b && m === 'POST') return send(200, createPage(body, 'panel'));
+      const pg = pages[b];
+      if (!pg) return send(404, { error: 'página não encontrada' });
+      if (!c2 && m === 'GET') return send(200, pageView(pg, true));
+      if (c2 === 'raw' && m === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+        return res.end(readPageHtml(pg.id));
+      }
+      if (!c2 && m === 'PATCH') return send(200, patchPage(pg, body, 'panel'));
+      if (!c2 && m === 'DELETE') return send(200, deletePage(pg.id, 'panel'));
+      if (c2 === 'restore' && m === 'POST') {
+        const h = (pg.history || []).find((x) => x.at === body.at);
+        if (!h) throw new Error('versão não encontrada');
+        return send(200, patchPage(pg, { html: h.html, title: h.title || pg.title }, 'restore'));
+      }
     }
     if (a === 'providers' && m === 'GET') return send(200, await providersInfo());
     if (a === 'settings' && m === 'PUT') {
@@ -2094,6 +2288,7 @@ async function handleAdmin(req, res, u, raw) {
         if (nb.id !== botOf(c).id) { delete c.session; delete c.agySession; audit({ action: 'chat-bot', chatId: b, bot: nb.id, via: 'panel' }); }
         if (nb.id === DEFAULT_BOT) delete c.bot; else c.bot = nb.id;
       }
+      if (body.read) c.readAt = new Date().toISOString();
       if (body.reset) { delete c.session; delete c.agySession; }
       save();
       return send(200, chatView(b));
@@ -2126,7 +2321,16 @@ async function handleAdmin(req, res, u, raw) {
     if (a === 'web' && b && c2 === 'messages' && m === 'GET') {
       const id = 'web:' + b;
       if (!chats[id]) return send(404, { error: 'conversa não encontrada' });
+      if (u.searchParams.get('read') !== '0') { chats[id].readAt = new Date().toISOString(); save(); }
       return send(200, { chat: chatView(id), messages: webHistory(id) });
+    }
+    if (a === 'prompts' && !b && m === 'GET') {
+      const cid = u.searchParams.get('chatId') || '';
+      const list = [...prompts.values()].filter((p) => !cid || p.chatId === cid).map(promptView);
+      return send(200, list);
+    }
+    if (a === 'prompts' && b && (c2 === 'answer' || !c2) && m === 'POST') {
+      return send(200, answerPrompt(b, body.answer, body.note, 'panel'));
     }
     if (a === 'web' && b && c2 === 'tts' && m === 'POST') {
       const id = 'web:' + b;
@@ -2157,7 +2361,8 @@ async function handleAdmin(req, res, u, raw) {
       const id = 'web:' + b;
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
       const write = (ev) => res.write('data: ' + JSON.stringify(ev) + '\n\n');
-      write({ type: 'hello', running: running.has(id) ? { started: running.get(id).started } : null });
+      const pid = pendingPromptFor(id);
+      write({ type: 'hello', running: running.has(id) ? { started: running.get(id).started } : null, ...(pid ? { prompt: promptView(pid) } : {}) });
       const set = webListeners.get(id) || new Set();
       set.add(write); webListeners.set(id, set);
       const ping = setInterval(() => res.write(': ping\n\n'), 20000);
@@ -2267,6 +2472,40 @@ const server = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://local');
     if (u.pathname.startsWith('/admin/')) return handleAdmin(req, res, u, raw).catch((e) => { log('admin error', e.message); try { res.writeHead(500); res.end(); } catch {} });
     if (u.pathname.startsWith('/hooks/')) return handleHook(req, res, u, raw).catch((e) => { log('hook error', e.message); try { res.writeHead(500); res.end(); } catch {} });
+    if (u.pathname.startsWith('/p/')) return handlePublicPage(req, res, u).catch((e) => { log('page error', e.message); try { res.writeHead(500); res.end(); } catch {} });
+    if (u.pathname === '/prompts' || u.pathname.startsWith('/prompts/')) {
+      if (!isLocal(req)) { res.writeHead(403); return res.end(); }
+      try {
+        const id = decodeURIComponent(u.pathname.split('/')[2] || '');
+        const b = raw.length ? JSON.parse(raw.toString('utf8') || '{}') : {};
+        let out;
+        if (!id && req.method === 'POST') out = await waitPrompt(startPrompt(b), b.wait === undefined ? 110 : b.wait);
+        else if (id && req.method === 'GET') {
+          const p = prompts.get(id);
+          if (!p) throw new Error('cartão não encontrado');
+          out = await waitPrompt(p, u.searchParams.get('wait') || 0);
+        } else if (id && req.method === 'POST') out = answerPrompt(id, b.answer, b.note, 'agent');
+        else throw new Error('cartão não encontrado ou método não suportado');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(out, null, 2));
+      } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: e.message })); }
+    }
+    if (u.pathname === '/pages' || u.pathname.startsWith('/pages/')) {
+      if (!isLocal(req)) { res.writeHead(403); return res.end(); }
+      try {
+        const id = decodeURIComponent(u.pathname.split('/')[2] || '');
+        const b = raw.length ? JSON.parse(raw.toString('utf8') || '{}') : {};
+        let out;
+        if (!id && req.method === 'GET') out = Object.values(pages).map((p) => pageView(p, false)).sort((x, y) => String(y.updated).localeCompare(String(x.updated)));
+        else if (!id && req.method === 'POST') out = createPage(b, 'agent');
+        else if (id && req.method === 'GET' && pages[id]) out = pageView(pages[id], true);
+        else if (id && req.method === 'PATCH' && pages[id]) out = patchPage(pages[id], b, 'agent');
+        else if (id && req.method === 'DELETE' && pages[id]) out = deletePage(id, 'agent');
+        else throw new Error('página não encontrada ou método não suportado');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(out, null, 2));
+      } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: e.message })); }
+    }
     if (u.pathname.startsWith('/asks/') || /^\/bots\/[^/]+\/ask\/?(?![\s\S])/.test(u.pathname)) {
       if (!isLocal(req)) { res.writeHead(403); return res.end(); }
       try {
