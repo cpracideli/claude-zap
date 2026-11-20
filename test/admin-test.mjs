@@ -163,6 +163,24 @@ try {
   const del = await api('DELETE', '/chats/' + encodeURIComponent('web:' + id));
   check('delete web chat', del.status === 200 && !(await api('GET', '/schedules')).body.length);
   check('cannot delete whatsapp chat', (await api('DELETE', '/chats/' + encodeURIComponent('5511@c.us'))).status === 400);
+
+  // Per-user UI preferences (customizable bottom dock).
+  const pEmpty = await api('GET', '/prefs/' + encodeURIComponent('caio@example.com'));
+  check('prefs default empty', pEmpty.status === 200 && !pEmpty.body.dock, pEmpty);
+  const pBadLen = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: ['chat', 'bots'] });
+  check('prefs rejects non-4 dock', pBadLen.status === 400, pBadLen);
+  const pBadMore = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: ['chat', 'bots', 'usage', 'more'] });
+  check('prefs rejects more in dock', pBadMore.status === 400, pBadMore);
+  const pBadDup = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: ['chat', 'chat', 'usage', 'overview'] });
+  check('prefs rejects duplicates', pBadDup.status === 400, pBadDup);
+  const pSave = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: ['chat', 'board', 'schedules', 'logs'] });
+  check('prefs saves 4 pages', pSave.status === 200 && JSON.stringify(pSave.body.dock) === JSON.stringify(['chat', 'board', 'schedules', 'logs']), pSave);
+  const pRead = await api('GET', '/prefs/' + encodeURIComponent('CAIO@EXAMPLE.COM'));
+  check('prefs read case-insensitive', pRead.status === 200 && JSON.stringify(pRead.body.dock) === JSON.stringify(['chat', 'board', 'schedules', 'logs']), pRead);
+  const pOther = await api('GET', '/prefs/' + encodeURIComponent('other@example.com'));
+  check('prefs isolated per user', pOther.status === 200 && !pOther.body.dock, pOther);
+  const pReset = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: null });
+  check('prefs restores default', pReset.status === 200 && !pReset.body.dock, pReset);
   sse.close();
 } catch (e) {
   failed++; console.log('ERROR', e);

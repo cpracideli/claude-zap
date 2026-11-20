@@ -3187,6 +3187,31 @@ async function handleAdmin(req, res, u, raw) {
       saveSettings();
       return send(200, settings);
     }
+    if (a === 'prefs' && b && !c2) {
+      const key = String(b).trim().toLowerCase().slice(0, 120);
+      if (!key) throw new Error('usuário inválido');
+      if (m === 'GET') return send(200, (settings.userPrefs && settings.userPrefs[key]) || {});
+      if (m === 'PUT') {
+        const cur = Object.assign({}, (settings.userPrefs && settings.userPrefs[key]) || {});
+        if ('dock' in body) {
+          if (body.dock === null || body.dock === undefined) {
+            delete cur.dock;
+          } else {
+            if (!Array.isArray(body.dock) || body.dock.length !== 4) throw new Error('dock precisa ter exatamente 4 páginas');
+            const clean = body.dock.map((x) => String(x || '').trim());
+            if (clean.some((x) => !/^[a-z0-9_-]{1,32}(?![\s\S])/.test(x) || x === 'more') || new Set(clean).size !== 4) {
+              throw new Error('páginas inválidas na barra inferior');
+            }
+            cur.dock = clean;
+          }
+        }
+        settings.userPrefs = settings.userPrefs || {};
+        if (Object.keys(cur).length) settings.userPrefs[key] = cur; else delete settings.userPrefs[key];
+        if (!Object.keys(settings.userPrefs).length) delete settings.userPrefs;
+        saveSettings();
+        return send(200, (settings.userPrefs && settings.userPrefs[key]) || {});
+      }
+    }
     if (a === 'chats' && !b && m === 'GET') {
       return send(200, Object.keys(chats).filter((id) => u.searchParams.get('all') || !isDeleg(id)).map(chatView).sort((x, y) => String((y.runs.at(-1) || {}).at || y.created).localeCompare(String((x.runs.at(-1) || {}).at || x.created))));
     }
