@@ -2682,23 +2682,69 @@ const dayKey = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'nu
 const HOME_DIR = env.HOME || '/tmp';
 const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
 
-const usageCache = { claude: null, agy: null, agyProject: null };
+const usageCache = { claude: null, agy: null, agyProject: null, claudeBlockedUntil: 0 };
+const CLAUDE_USAGE_TTL = 5 * 60000; // the oauth/usage endpoint rate-limits hard: poll at most every 5 min
+const CLAUDE_CRED_FILE = path.join(HOME_DIR, '.claude', '.credentials.json');
+const CLAUDE_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+// Refreshes ~/.claude/.credentials.json with its refreshToken. Runs use CLAUDE_CODE_OAUTH_TOKEN, so nothing
+// else refreshes this file and its access token expires after a few hours.
+async function refreshClaudeToken(cred) {
+  if (!cred?.refreshToken) throw new Error('token vencido e sem refreshToken: rode /login no Claude Code');
+  let r, lastErr;
+  for (const url of ['https://platform.claude.com/v1/oauth/token', 'https://console.anthropic.com/v1/oauth/token']) {
+    try {
+      r = await fetch(url, { method: 'POST', signal: AbortSignal.timeout(15000), headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: cred.refreshToken, client_id: CLAUDE_OAUTH_CLIENT_ID }) });
+      if (r.ok) break;
+      lastErr = new Error('renovação do token: HTTP ' + r.status);
+    } catch (e) { lastErr = e; }
+    r = null;
+  }
+  if (!r) throw lastErr;
+  const j = await r.json();
+  if (!j.access_token) throw new Error('renovação do token: resposta sem access_token');
+  const file = readJson(CLAUDE_CRED_FILE) || {};
+  const next = { ...(file.claudeAiOauth || cred), accessToken: j.access_token, refreshToken: j.refresh_token || cred.refreshToken,
+    expiresAt: Date.now() + (Number(j.expires_in) || 28800) * 1000 };
+  if (j.scope) next.scopes = String(j.scope).split(' ').filter(Boolean);
+  const tmp = CLAUDE_CRED_FILE + '.tmp-' + process.pid;
+  fs.writeFileSync(tmp, JSON.stringify({ ...file, claudeAiOauth: next }), { mode: 0o600 });
+  fs.renameSync(tmp, CLAUDE_CRED_FILE);
+  log('claude oauth token refreshed, expires', new Date(next.expiresAt).toISOString());
+  return next;
+}
 async function claudeLimits() {
   const c = usageCache.claude;
-  if (c && Date.now() - c.t < 60000) return c.v;
-  const cred = readJson(path.join(HOME_DIR, '.claude', '.credentials.json'))?.claudeAiOauth;
+  if (c && Date.now() - c.t < (c.v?.error ? 60000 : CLAUDE_USAGE_TTL)) return c.v;
+  const prevOk = c?.v?.limits ? c.v : null;
+  if (Date.now() < usageCache.claudeBlockedUntil) {
+    return { ...(prevOk || {}), error: 'HTTP 429 (limite de consultas; nova tentativa após ' + new Date(usageCache.claudeBlockedUntil).toISOString() + ')', stale: Boolean(prevOk), retryAt: new Date(usageCache.claudeBlockedUntil).toISOString() };
+  }
+  let cred = readJson(CLAUDE_CRED_FILE)?.claudeAiOauth;
   let v;
   try {
     if (!cred?.accessToken) throw new Error('Claude Code sem login OAuth');
-    const r = await fetch('https://api.anthropic.com/api/oauth/usage', { signal: AbortSignal.timeout(15000),
-      headers: { Authorization: 'Bearer ' + cred.accessToken, 'anthropic-beta': 'oauth-2025-04-20', 'Content-Type': 'application/json' } });
-    if (!r.ok) throw new Error('HTTP ' + r.status + (r.status === 401 ? ' (token vencido: renova na próxima execução do Claude)' : ''));
+    if (cred.expiresAt && cred.expiresAt - Date.now() < 120000) cred = await refreshClaudeToken(cred);
+    const get = (tok) => fetch('https://api.anthropic.com/api/oauth/usage', { signal: AbortSignal.timeout(15000),
+      headers: { Authorization: 'Bearer ' + tok, 'anthropic-beta': 'oauth-2025-04-20', 'Content-Type': 'application/json' } });
+    let r = await get(cred.accessToken);
+    if (r.status === 401) { cred = await refreshClaudeToken(cred); r = await get(cred.accessToken); }
+    if (r.status === 429) {
+      const ra = r.headers.get('retry-after');
+      let wait = Number(ra) * 1000;
+      if (!(wait > 0)) { const d = Date.parse(ra || ''); wait = d > Date.now() ? d - Date.now() : 0; }
+      usageCache.claudeBlockedUntil = Date.now() + Math.min(Math.max(wait || 15 * 60000, 60000), 6 * 3600000);
+      throw new Error('HTTP 429 (limite de consultas; nova tentativa após ' + new Date(usageCache.claudeBlockedUntil).toISOString() + ')');
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status + (r.status === 401 ? ' (token recusado mesmo após renovar: rode /login no Claude Code)' : ''));
     const j = await r.json();
     const lim = (k, x) => x && { kind: k, percent: x.utilization ?? null, resetsAt: x.resets_at || null };
-    v = { plan: cred.subscriptionType || null, limits: [lim('session', j.five_hour), lim('weekly', j.seven_day), lim('weekly_opus', j.seven_day_opus), lim('weekly_sonnet', j.seven_day_sonnet)].filter(Boolean),
+    v = { plan: cred.subscriptionType || null, fetchedAt: new Date().toISOString(),
+      limits: [lim('session', j.five_hour), lim('weekly', j.seven_day), lim('weekly_opus', j.seven_day_opus), lim('weekly_sonnet', j.seven_day_sonnet)].filter(Boolean),
       extra: j.extra_usage?.is_enabled ? { used: j.extra_usage.used_credits, limit: j.extra_usage.monthly_limit } : null };
   } catch (e) {
-    v = { ...(c?.v?.limits ? c.v : {}), error: e.message, stale: Boolean(c?.v?.limits) };
+    v = { ...(prevOk || {}), error: e.message, stale: Boolean(prevOk) };
+    if (usageCache.claudeBlockedUntil > Date.now()) v.retryAt = new Date(usageCache.claudeBlockedUntil).toISOString();
   }
   usageCache.claude = { t: Date.now(), v };
   return v;
@@ -2736,7 +2782,7 @@ async function agyLimits() {
       const fam = ['gemini', 'claude', 'gpt'].filter((f) => t.includes(f));
       return fam.map((f) => (f === 'gpt' ? 'GPT' : f[0].toUpperCase() + f.slice(1))).join(' + ') || 'Modelos';
     };
-    v = { tier: usageCache.agyProject.tier, groups: [...groups.values()].map((g) => ({ label: label(g), percent: Math.round((1 - g.remaining) * 1000) / 10, resetsAt: g.resetsAt, models: [...new Set(g.models)].sort() }))
+    v = { tier: usageCache.agyProject.tier, fetchedAt: new Date().toISOString(), groups: [...groups.values()].map((g) => ({ label: label(g), percent: Math.round((1 - g.remaining) * 1000) / 10, resetsAt: g.resetsAt, models: [...new Set(g.models)].sort() }))
       .sort((a, b) => a.label.localeCompare(b.label)) };
   } catch (e) {
     v = { ...(c?.v?.groups ? c.v : {}), error: e.message, stale: Boolean(c?.v?.groups) };
@@ -2796,7 +2842,7 @@ async function usageReport(nDays = 56) {
       claude: { tokens: tc ? tc.in + tc.out : (lc ? lc.in + lc.out : 0), out: tc?.out || lc?.out || 0, cacheRead: tc?.cacheRead || lc?.cacheRead || 0, msgs: tc?.msgs || 0, runs: lc?.runs || 0, cost: lc?.cost || 0 },
       antigravity: { tokens: la ? la.in + la.out : 0, out: la?.out || 0, cacheRead: la?.cacheRead || 0, runs: la?.runs || 0 } });
   }
-  return { claude, antigravity, days, tz: TZ, historySince: { antigravity: fs.existsSync(USAGE_FILE) ? (fs.readFileSync(USAGE_FILE, 'utf8').slice(0, 40).match(/"at":"([^"]+)/) || [])[1] || null : null } };
+  return { fetchedAt: new Date().toISOString(), claude, antigravity, days, tz: TZ, historySince: { antigravity: fs.existsSync(USAGE_FILE) ? (fs.readFileSync(USAGE_FILE, 'utf8').slice(0, 40).match(/"at":"([^"]+)/) || [])[1] || null : null } };
 }
 
 // ---------- memory explorer: ai-memory wiki pages + Claude Code's own memory files ----------
