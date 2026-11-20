@@ -164,19 +164,21 @@ try {
   check('delete web chat', del.status === 200 && !(await api('GET', '/schedules')).body.length);
   check('cannot delete whatsapp chat', (await api('DELETE', '/chats/' + encodeURIComponent('5511@c.us'))).status === 400);
 
-  // Per-user UI preferences (customizable bottom dock).
+  // Per-user UI preferences (customizable bottom dock: 1..5 items, 'more' optional).
   const pEmpty = await api('GET', '/prefs/' + encodeURIComponent('caio@example.com'));
   check('prefs default empty', pEmpty.status === 200 && !pEmpty.body.dock, pEmpty);
-  const pBadLen = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: ['chat', 'bots'] });
-  check('prefs rejects non-4 dock', pBadLen.status === 400, pBadLen);
-  const pBadMore = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: ['chat', 'bots', 'usage', 'more'] });
-  check('prefs rejects more in dock', pBadMore.status === 400, pBadMore);
-  const pBadDup = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: ['chat', 'chat', 'usage', 'overview'] });
+  const pBadEmpty = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: [] });
+  check('prefs rejects empty dock', pBadEmpty.status === 400, pBadEmpty);
+  const pBadTooMany = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: ['chat', 'bots', 'usage', 'overview', 'logs', 'more'] });
+  check('prefs rejects >5 dock', pBadTooMany.status === 400, pBadTooMany);
+  const pBadDup = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: ['chat', 'chat'] });
   check('prefs rejects duplicates', pBadDup.status === 400, pBadDup);
-  const pSave = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: ['chat', 'board', 'schedules', 'logs'] });
-  check('prefs saves 4 pages', pSave.status === 200 && JSON.stringify(pSave.body.dock) === JSON.stringify(['chat', 'board', 'schedules', 'logs']), pSave);
+  const pSmall = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: ['chat', 'bots'] });
+  check('prefs allows fewer icons without more', pSmall.status === 200 && JSON.stringify(pSmall.body.dock) === JSON.stringify(['chat', 'bots']), pSmall);
+  const pWithMore = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: ['chat', 'board', 'more'] });
+  check('prefs allows more as optional item', pWithMore.status === 200 && JSON.stringify(pWithMore.body.dock) === JSON.stringify(['chat', 'board', 'more']), pWithMore);
   const pRead = await api('GET', '/prefs/' + encodeURIComponent('CAIO@EXAMPLE.COM'));
-  check('prefs read case-insensitive', pRead.status === 200 && JSON.stringify(pRead.body.dock) === JSON.stringify(['chat', 'board', 'schedules', 'logs']), pRead);
+  check('prefs read case-insensitive', pRead.status === 200 && JSON.stringify(pRead.body.dock) === JSON.stringify(['chat', 'board', 'more']), pRead);
   const pOther = await api('GET', '/prefs/' + encodeURIComponent('other@example.com'));
   check('prefs isolated per user', pOther.status === 200 && !pOther.body.dock, pOther);
   const pReset = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: null });

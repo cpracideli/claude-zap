@@ -3197,9 +3197,9 @@ async function handleAdmin(req, res, u, raw) {
           if (body.dock === null || body.dock === undefined) {
             delete cur.dock;
           } else {
-            if (!Array.isArray(body.dock) || body.dock.length !== 4) throw new Error('dock precisa ter exatamente 4 páginas');
+            if (!Array.isArray(body.dock) || body.dock.length < 1 || body.dock.length > 5) throw new Error('dock precisa ter entre 1 e 5 páginas');
             const clean = body.dock.map((x) => String(x || '').trim());
-            if (clean.some((x) => !/^[a-z0-9_-]{1,32}(?![\s\S])/.test(x) || x === 'more') || new Set(clean).size !== 4) {
+            if (clean.some((x) => !/^[a-z0-9_-]{1,32}(?![\s\S])/.test(x)) || new Set(clean).size !== clean.length) {
               throw new Error('páginas inválidas na barra inferior');
             }
             cur.dock = clean;
