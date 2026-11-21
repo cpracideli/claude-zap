@@ -1,0 +1,25 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Syntax check
+        run: node --check bridge/bridge.mjs
+      - name: Run bridge test suites
+        run: |
+          for t in test/send-test.mjs test/run-test.mjs test/admin-test.mjs test/bots-test.mjs test/group-test.mjs test/pages-prompts-test.mjs test/grokbot-parity-test.mjs test/nod-dots-parity-test.mjs test/phase2-advanced-test.mjs test/tasks-batch-test.mjs test/next-level-features-test.mjs; do
+            if [ -f "$t" ]; then
+              echo "=== Running $t ==="
+              node "$t"
+            fi
+          done
