@@ -18,7 +18,10 @@ const WEBHOOK_HMAC_KEY = env.WEBHOOK_HMAC_KEY || '';
 const ALLOWED = String(env.ALLOWED_NUMBERS || '').split(/[,;\n]+/).map((n) => n.replace(/\D/g, '')).filter(Boolean);
 const CLAUDE_BIN = env.CLAUDE_BIN || 'claude';
 const AGY_BIN = env.AGY_BIN || path.join(env.HOME || '/tmp', '.local', 'bin', 'agy');
-const PROVIDERS = { claude: 'Claude Code', antigravity: 'Antigravity', openai_compat: 'API Direta (BYOM)' };
+const OPENCODE_BIN = env.OPENCODE_BIN || 'opencode';
+// Free OpenCode model used when the chat/bot/settings have none. Ids come live from `opencode models`.
+const OPENCODE_DEFAULT_MODEL = 'opencode/nemotron-3.5-lightning-free';
+const PROVIDERS = { claude: 'Claude Code', antigravity: 'Antigravity', opencode: 'OpenCode', openai_compat: 'API Direta (BYOM)' };
 // Claude keeps its memory notes here; Antigravity gets the same folder so it can read them too.
 const MEMORY_DIR = env.MEMORY_DIR || path.join(env.HOME || '/tmp', '.claude', 'projects', '-home-node-workspace', 'memory');
 const WORKDIR = env.CLAUDE_WORKDIR || path.join(env.HOME || '/tmp', 'workspace');
@@ -148,7 +151,7 @@ const defEffort = () => settings.claudeEffort || ENV_EFFORT;
 const BOTS_FILE = path.join(DATA_DIR, 'bots.json');
 const BOTS_DIR = path.join(DATA_DIR, 'bots');
 const DEFAULT_BOT = 'default';
-const BOT_FIELDS = ['name', 'emoji', 'avatar', 'color', 'description', 'instructions', 'provider', 'model', 'effort', 'agyModel', 'agyEffort', 'memory', 'approvalMode', 'allowRules', 'blockRules', 'policyEnforce', 'sandboxed'];
+const BOT_FIELDS = ['name', 'emoji', 'avatar', 'color', 'description', 'instructions', 'provider', 'model', 'effort', 'agyModel', 'agyEffort', 'ocModel', 'memory', 'approvalMode', 'allowRules', 'blockRules', 'policyEnforce', 'sandboxed'];
 const APPROVAL_MODES = ['ask', 'auto', 'when_asked', 'handoff', 'never'];
 let bots = loadState('bots', BOTS_FILE, {});
 if (!bots[DEFAULT_BOT]) {
@@ -227,6 +230,7 @@ function runConfig(c, botId) {
     model: pick('model', defModel()),
     effort: pick('effort', defEffort()),
     agy: { agyModel: pick('agyModel', ''), agyEffort: pick('agyEffort', '') },
+    oc: { ocModel: pick('ocModel', '') },
   };
 }
 const providerOf = (c) => runConfig(c).provider;
@@ -784,6 +788,70 @@ function runAntigravity(chatId, prompt, opts) {
   });
 }
 
+// ---------- OpenCode provider (`opencode run`, includes free models without a key) ----------
+// Each turn runs `opencode run --format json`. The JSON event stream gives the text (type "text"), the session id
+// (sessionID, reused with -s on the next turn) and the tokens/cost of each step (type "step_finish").
+// The bridge's instructions go in the first prompt of a new session, as with agy.
+let ocCatalog = { at: 0, models: [] };
+const OC_CATALOG_TTL = 10 * 60 * 1000;
+async function openCodeModels(force = false) {
+  if (!force && ocCatalog.models.length && Date.now() - ocCatalog.at < OC_CATALOG_TTL) return ocCatalog.models;
+  const r = await execCmd(OPENCODE_BIN, ['models'], 30000);
+  const models = r.code === 0 ? r.out.split('\n').map((l) => l.trim()).filter((l) => /^[\w.-]+\/\S+$/.test(l)) : [];
+  if (models.length) ocCatalog = { at: Date.now(), models };
+  return ocCatalog.models;
+}
+function runOpenCode(chatId, prompt, opts) {
+  return new Promise((resolve) => {
+    const args = ['run', '--format', 'json', '--dir', WORKDIR];
+    if (opts.model) args.push('-m', opts.model);
+    if (opts.resume) args.push('-s', opts.resume);
+    if (PERMISSION_MODE === 'bypassPermissions') args.push('--auto');
+    args.push('--', prompt);
+    const started = Date.now();
+    const child = spawn(OPENCODE_BIN, args, { cwd: WORKDIR, env: { ...env, WA_CHAT_ID: chatId }, stdio: ['ignore', 'pipe', 'pipe'] });
+    running.set(chatId, { child, started: Date.now(), prompt: prompt.slice(0, 80), bot: opts.botId || '' });
+    let out = '', err = '', timedOut = false;
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); }, TIMEOUT_MS);
+    const done = (r) => { clearTimeout(timer); running.delete(chatId); resolve(r); };
+    child.on('error', (e) => done({ error: e.message }));
+    child.on('close', (code, signal) => {
+      if (signal && !timedOut) return done({ stopped: true });
+      if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
+      const texts = [];
+      let sessionId = '', errMsg = '', steps = 0, cost = 0;
+      const u = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+      for (const line of out.split('\n')) {
+        if (!line.trim()) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.sessionID) sessionId = ev.sessionID;
+        const p = ev.part || {};
+        if (ev.type === 'text' && typeof p.text === 'string' && p.text.trim()) texts.push(p.text);
+        if (ev.type === 'step_finish') {
+          steps++;
+          cost += Number(p.cost) || 0;
+          const t = p.tokens || {};
+          u.input_tokens += Number(t.input) || 0;
+          u.output_tokens += (Number(t.output) || 0) + (Number(t.reasoning) || 0);
+          u.cache_read_tokens += Number(t.cache && t.cache.read) || 0;
+        }
+        if (ev.type === 'error') errMsg = (ev.error && (ev.error.data?.message || ev.error.message || ev.error.name)) || JSON.stringify(ev).slice(0, 300);
+      }
+      const text = texts.join('\n\n');
+      if (!text && (errMsg || code !== 0)) {
+        return done({ error: 'OpenCode: ' + (errMsg || (err || out).slice(-500) || 'saiu com código ' + code), sessionId: sessionId || undefined });
+      }
+      const ms = Date.now() - started;
+      const costUsd = Math.round(cost * 1000000) / 1000000;
+      logUsage('opencode', chatId, costUsd, ms, u, opts.model);
+      done({ text, sessionId, provider: 'opencode', usage: { cost: costUsd, ms, turns: steps, in: u.input_tokens, out: u.output_tokens, cacheRead: u.cache_read_tokens } });
+    });
+  });
+}
+
 // ---------- Antigravity model catalog, read live from `agy models` ----------
 // Google ships new Gemini models often, so the menu is never hard-coded. Model ids may carry the effort as a
 // suffix (gemini-x-flash-medium): those are grouped into one model with its effort variants.
@@ -1132,6 +1200,10 @@ async function runAgent(chatId, prompt, opts, onActivity, onEvent) {
       const agyCfg = opts.modelOverride ? { agyModel: opts.modelOverride, agyEffort: '' } : cfg.agy;
       const pick = resolveAgyRun(agyCfg);
       r = await runAntigravity(chatId, text, { model: pick.model, effort: pick.effort, resume: opts.resume, botId: cfg.bot.id });
+    } else if (provider === 'opencode') {
+      const text = !opts.resume ? antigravityPrompt(chatId, cfg.bot) + '\n\n---\n\n' + actualPrompt : actualPrompt;
+      const model = opts.modelOverride || cfg.oc.ocModel || settings.opencodeModel || OPENCODE_DEFAULT_MODEL;
+      r = await runOpenCode(chatId, text, { model, resume: opts.resume, botId: cfg.bot.id });
     } else if (provider === 'openai_compat') {
       const model = opts.modelOverride || cfg.model;
       r = await runOpenAiCompat(chatId, actualPrompt, { model, resume: opts.resume, bot: cfg.bot, readOnly: opts.readOnly }, onActivity);
@@ -1203,7 +1275,7 @@ const HELP = [
   '/status: sessão, modelo, tarefa em andamento e totais',
   '/log [n]: últimas n execuções (padrão 5) com horário, duração, custo e erros',
   '/usage: total de execuções, tempo e custo desta conversa',
-  '/provider [claude|antigravity]: escolhe quem responde nesta conversa (fica salvo)',
+  '/provider [claude|antigravity|opencode]: escolhe quem responde nesta conversa (fica salvo). OpenCode usa modelos gratuitos sem chave',
   '/model [opus|sonnet|haiku|fable|<id>|default]: troca o modelo desta conversa (fica salvo). No Antigravity, a lista vem ao vivo do agy models',
   '/effort [low|medium|high|xhigh|max|default]: nível de esforço (fica salvo). No Antigravity, mostra só os níveis do modelo escolhido',
   '/bot [nome]: troca o bot (persona) que responde nesta conversa e começa uma conversa nova',
@@ -1224,7 +1296,7 @@ const MODEL_CHOICES = [['Opus', '/model opus'], ['Sonnet', '/model sonnet'], ['H
 const EFFORT_CHOICES = [['low', '/effort low'], ['medium', '/effort medium'], ['high', '/effort high'], ['xhigh', '/effort xhigh'], ['max', '/effort max'], ['Padrão', '/effort default']];
 const HELP_MENU = [['Status', '/status'], ['Nova conversa', '/new'], ['Trocar modelo', '/model'], ['Trocar esforço', '/effort'],
   ['Uso e custo', '/usage'], ['Últimas execuções', '/log'], ['Agendamentos', '/schedules'], ['Interromper tarefa', '/stop'], ['Trocar provedor', '/provider'], ['Trocar bot', '/bot']];
-const PROVIDER_CHOICES = [['Claude Code', '/provider claude'], ['Antigravity', '/provider antigravity']];
+const PROVIDER_CHOICES = [['Claude Code', '/provider claude'], ['Antigravity', '/provider antigravity'], ['OpenCode (grátis)', '/provider opencode']];
 const MENU_TTL = 120000;
 const menus = new Map();  // chatId -> { at, options: [command] }   numbered menu waiting for a "1", "2"...
 const polls = new Map();  // poll message id (last segment) -> { chatId, options: { label: command } }
@@ -1360,18 +1432,31 @@ async function command(chatId, body) {
   switch (cmd) {
     case '/help': return sendMenu(chatId, 'O que você quer fazer?', HELP_MENU, HELP);
     case '/new':
-      delete c.session; delete c.agySession; save();
+      delete c.session; delete c.agySession; delete c.ocSession; save();
       return reply(chatId, 'Nova conversa iniciada com ' + botLabel(botOf(c)) + '. Modelo: ' + (runConfig(c).model || 'padrão') + '.', true);
     case '/provider': {
       const cur = PROVIDERS[providerOf(c)];
       if (!arg) return sendChoice(chatId, 'Provedor atual: ' + cur + '. Escolha:', PROVIDER_CHOICES);
-      const a = arg.toLowerCase(); const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : a;
-      if (!PROVIDERS[want]) return reply(chatId, 'Provedor inválido. Opções: claude, antigravity.', true);
+      const a = arg.toLowerCase(); const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : a;
+      if (!PROVIDERS[want] || want === 'openai_compat') return reply(chatId, 'Provedor inválido. Opções: claude, antigravity, opencode.', true);
       c.provider = want; save();
       return reply(chatId, 'Provedor desta conversa: ' + PROVIDERS[want] + '. Vale a partir da próxima mensagem. Use /new para começar do zero no novo provedor.', true);
     }
     case '/model':
       if (providerOf(c) === 'antigravity') return agyModelCommand(chatId, c, arg, isDefault);
+      if (providerOf(c) === 'opencode') {
+        const list = await openCodeModels();
+        if (!arg) {
+          if (!list.length) return reply(chatId, 'Não consegui listar os modelos do OpenCode (verifique se o comando `opencode models` funciona).', true);
+          const cur = runConfig(c).oc.ocModel || OPENCODE_DEFAULT_MODEL;
+          return sendChoice(chatId, 'Modelo OpenCode atual: ' + cur + '. Escolha o novo:', [...list.slice(0, 11).map((m) => [m.replace(/^opencode\//, ''), '/model ' + m]), ['Padrão', '/model default']]);
+        }
+        if (isDefault(arg)) delete c.ocModel;
+        else if (list.length && !list.includes(arg)) return reply(chatId, 'Modelo não encontrado. Use /model para ver a lista.', true);
+        else c.ocModel = arg;
+        save();
+        return reply(chatId, 'Modelo OpenCode desta conversa: ' + (runConfig(c).oc.ocModel || OPENCODE_DEFAULT_MODEL) + '. Vale a partir da próxima mensagem.', true);
+      }
       if (!arg) return sendChoice(chatId, 'Modelo atual: ' + (runConfig(c).model || 'padrão da conta') + '. Escolha o novo:', MODEL_CHOICES);
       if (isDefault(arg)) delete c.model; else c.model = arg;
       save();
@@ -1393,7 +1478,7 @@ async function command(chatId, body) {
       const b = findBot(arg);
       if (!b) return reply(chatId, 'Bot não encontrado. Disponíveis: ' + Object.values(bots).map((x) => x.name).join(', ') + '.', true);
       if (b.id === DEFAULT_BOT) delete c.bot; else c.bot = b.id;
-      delete c.session; delete c.agySession; save();
+      delete c.session; delete c.agySession; delete c.ocSession; save();
       audit({ action: 'chat-bot', chatId, bot: b.id });
       return reply(chatId, 'Agora quem responde é ' + botLabel(b) + '. Conversa nova iniciada.', true);
     }
@@ -1413,7 +1498,7 @@ async function command(chatId, body) {
         '*Status*',
         'Bot: ' + botLabel(botOf(c)),
         'Provedor: ' + PROVIDERS[providerOf(c)],
-        'Sessão: ' + (((providerOf(c) === 'antigravity' ? c.agySession : c.session) || '').slice(0, 8) || 'nenhuma (próxima mensagem inicia uma)'),
+        'Sessão: ' + (((providerOf(c) === 'antigravity' ? c.agySession : providerOf(c) === 'opencode' ? c.ocSession : c.session) || '').slice(0, 8) || 'nenhuma (próxima mensagem inicia uma)'),
         providerOf(c) === 'antigravity'
           ? 'Modelo: ' + agyModelLabel(c) + ' | Esforço: ' + (c.agyEffort || 'padrão') + ' | enviado ao agy: ' + (resolveAgyRun(c).model || 'padrão')
           : 'Modelo: ' + (runConfig(c).model || 'padrão da conta') + ' | Esforço: ' + (runConfig(c).effort || 'padrão'),
@@ -1624,8 +1709,8 @@ async function runTurn(chatId, botId, prompt, onActivity, onEvent, onRetry, extr
   const c = chat(chatId);
   const id = botId || botOf(c).id;
   const own = id === botOf(c).id;
-  const agy = runConfig(c, own ? undefined : id).provider === 'antigravity';
-  const key = agy ? 'agySession' : 'session';
+  const prov = runConfig(c, own ? undefined : id).provider;
+  const key = prov === 'antigravity' ? 'agySession' : prov === 'opencode' ? 'ocSession' : 'session';
   const store = own ? c : ((c.botSessions = c.botSessions || {})[id] = c.botSessions[id] || {});
   const opts = { resume: store[key], bot: own ? undefined : id, ...(extra || {}) };
   let r = await runAgent(chatId, prompt, opts, onActivity, onEvent);
@@ -5145,12 +5230,13 @@ function execCmd(bin, args, ms = 60000) {
   });
 }
 
-let versionCache = { at: 0, claude: '', agy: '' };
+let versionCache = { at: 0, claude: '', agy: '', oc: '' };
 async function providersInfo() {
   if (Date.now() - versionCache.at > 10 * 60 * 1000) {
     const cl = await execCmd(CLAUDE_BIN, ['--version'], 20000);
     const ag = fs.existsSync(AGY_BIN) ? await execCmd(AGY_BIN, ['--version'], 20000) : null;
-    versionCache = { at: Date.now(), claude: cl.code === 0 ? cl.out.trim() : '', agy: ag && ag.code === 0 ? ag.out.trim() : '' };
+    const oc = await execCmd(OPENCODE_BIN, ['--version'], 20000);
+    versionCache = { at: Date.now(), claude: cl.code === 0 ? cl.out.trim() : '', agy: ag && ag.code === 0 ? ag.out.trim() : '', oc: oc.code === 0 ? oc.out.trim() : '' };
   }
   const agyInstalled = fs.existsSync(AGY_BIN);
   const cat = agyInstalled ? await refreshAgyCatalog(false) : { models: [] };
@@ -5165,6 +5251,9 @@ async function providersInfo() {
         envModel: ENV_MODEL, envEffort: ENV_EFFORT, permissionMode: PERMISSION_MODE },
       { id: 'antigravity', name: PROVIDERS.antigravity, installed: agyInstalled, version: versionCache.agy,
         models: cat.models.map((g) => ({ id: g.base, label: g.label, efforts: g.efforts })) },
+      { id: 'opencode', name: PROVIDERS.opencode, installed: Boolean(versionCache.oc), version: versionCache.oc,
+        auth: 'Modelos gratuitos do OpenCode (sem chave)', authKind: 'none',
+        models: (await openCodeModels()).map((m) => ({ id: m, label: m })), defaultModel: settings.opencodeModel || OPENCODE_DEFAULT_MODEL },
       { id: 'openai_compat', name: PROVIDERS.openai_compat, installed: Boolean(compat.enabled), version: compat.baseUrl || 'não configurado',
         auth: compat.apiKey ? 'Cofre AES-GCM (' + compat.secretName + ')' : 'sem chave (ex.: Ollama local)',
         models: compat.models, defaultModel: compat.defaultModel },
@@ -5573,13 +5662,13 @@ async function handleAdmin(req, res, u, raw) {
       if ('bot' in body) {
         const nb = body.bot ? bots[body.bot] : bots[DEFAULT_BOT];
         if (!nb) throw new Error('bot desconhecido');
-        if (nb.id !== botOf(c).id) { delete c.session; delete c.agySession; audit({ action: 'chat-bot', chatId: b, bot: nb.id, via: 'panel' }); }
+        if (nb.id !== botOf(c).id) { delete c.session; delete c.agySession; delete c.ocSession; audit({ action: 'chat-bot', chatId: b, bot: nb.id, via: 'panel' }); }
         if (nb.id === DEFAULT_BOT) delete c.bot; else c.bot = nb.id;
       }
       if ('pinned' in body) { if (body.pinned) c.pinned = true; else delete c.pinned; }
       if ('archived' in body) { if (body.archived) c.archived = true; else delete c.archived; }
       if (body.read) c.readAt = new Date().toISOString();
-      if (body.reset) { delete c.session; delete c.agySession; }
+      if (body.reset) { delete c.session; delete c.agySession; delete c.ocSession; }
       save();
       return send(200, chatView(b));
     }
@@ -5747,7 +5836,7 @@ async function handleAdmin(req, res, u, raw) {
       if (!c2 && m === 'DELETE') {
         if (bt.id === DEFAULT_BOT) throw new Error('o bot padrão não pode ser apagado');
         delete bots[bt.id]; saveBots();
-        for (const c of Object.values(chats)) if (c.bot === bt.id) { delete c.bot; delete c.session; delete c.agySession; }
+        for (const c of Object.values(chats)) if (c.bot === bt.id) { delete c.bot; delete c.session; delete c.agySession; delete c.ocSession; }
         save();
         for (const r of schedules) if (r.bot === bt.id) delete r.bot;
         saveSched();
