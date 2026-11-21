@@ -19,9 +19,21 @@ const ALLOWED = String(env.ALLOWED_NUMBERS || '').split(/[,;\n]+/).map((n) => n.
 const CLAUDE_BIN = env.CLAUDE_BIN || 'claude';
 const AGY_BIN = env.AGY_BIN || path.join(env.HOME || '/tmp', '.local', 'bin', 'agy');
 const OPENCODE_BIN = env.OPENCODE_BIN || 'opencode';
+const COPILOT_BIN = env.COPILOT_BIN || 'copilot';
 // Free OpenCode model used when the chat/bot/settings have none. Ids come live from `opencode models`.
 const OPENCODE_DEFAULT_MODEL = 'opencode/nemotron-3.5-lightning-free';
-const PROVIDERS = { claude: 'Claude Code', antigravity: 'Antigravity', opencode: 'OpenCode', openai_compat: 'API Direta (BYOM)' };
+const COPILOT_DEFAULT_MODEL = 'auto';
+const COPILOT_MODELS = [
+  { id: 'auto', label: 'Auto (Copilot escolhe)' },
+  { id: 'gpt-5.3-codex', label: 'GPT-5.3 Codex' },
+  { id: 'gpt-5.2-codex', label: 'GPT-5.2 Codex' },
+  { id: 'claude-sonnet-4.6', label: 'Claude Sonnet 4.6' },
+  { id: 'claude-opus-4.6', label: 'Claude Opus 4.6' },
+  { id: 'claude-haiku-4.5', label: 'Claude Haiku 4.5' },
+  { id: 'gemini-3-pro-preview', label: 'Gemini 3 Pro' },
+  { id: 'mai-code-2-flash', label: 'MAI Code 2 Flash' },
+];
+const PROVIDERS = { claude: 'Claude Code', antigravity: 'Antigravity', opencode: 'OpenCode', copilot: 'GitHub Copilot', openai_compat: 'API Direta (BYOM)' };
 // Claude keeps its memory notes here; Antigravity gets the same folder so it can read them too.
 const MEMORY_DIR = env.MEMORY_DIR || path.join(env.HOME || '/tmp', '.claude', 'projects', '-home-node-workspace', 'memory');
 const WORKDIR = env.CLAUDE_WORKDIR || path.join(env.HOME || '/tmp', 'workspace');
@@ -170,7 +182,7 @@ const defEffort = () => settings.claudeEffort || ENV_EFFORT;
 const BOTS_FILE = path.join(DATA_DIR, 'bots.json');
 const BOTS_DIR = path.join(DATA_DIR, 'bots');
 const DEFAULT_BOT = 'default';
-const BOT_FIELDS = ['name', 'emoji', 'avatar', 'color', 'description', 'instructions', 'provider', 'model', 'effort', 'agyModel', 'agyEffort', 'ocModel', 'memory', 'approvalMode', 'allowRules', 'blockRules', 'policyEnforce', 'sandboxed'];
+const BOT_FIELDS = ['name', 'emoji', 'avatar', 'color', 'description', 'instructions', 'provider', 'model', 'effort', 'agyModel', 'agyEffort', 'ocModel', 'cpModel', 'memory', 'approvalMode', 'allowRules', 'blockRules', 'policyEnforce', 'sandboxed'];
 const APPROVAL_MODES = ['ask', 'auto', 'when_asked', 'handoff', 'never'];
 let bots = loadState('bots', BOTS_FILE, {});
 if (!bots[DEFAULT_BOT]) {
@@ -251,6 +263,7 @@ function runConfig(c, botId) {
     agy: { agyModel: pick('agyModel', ''), agyEffort: pick('agyEffort', '') },
     // The web panel's model picker writes chat.model; OpenCode ids always contain a provider prefix (opencode/...).
     oc: { ocModel: pick('ocModel', '') || (String(pick('model', '')).includes('/') ? String(pick('model', '')) : '') },
+    cp: { cpModel: pick('cpModel', '') || (pick('provider', settings.defaultProvider || 'claude') === 'copilot' ? String(pick('model', '')) : '') },
   };
 }
 const providerOf = (c) => runConfig(c).provider;
@@ -884,6 +897,105 @@ function runOpenCode(chatId, prompt, opts) {
   });
 }
 
+// ---------- GitHub Copilot CLI provider (`@github/copilot`, `copilot -p --output-format json`) ----------
+let cpTokenCache = { at: 0, token: '' };
+async function getCopilotToken() {
+  const direct = env.COPILOT_GITHUB_TOKEN || env.GH_TOKEN || env.GITHUB_TOKEN || (secrets.copilot_github_token && secrets.copilot_github_token.value) || '';
+  if (direct) return direct;
+  if (cpTokenCache.token && Date.now() - cpTokenCache.at < 10 * 60 * 1000) return cpTokenCache.token;
+  const r = await execCmd('gh', ['auth', 'token'], 8000);
+  const tok = r.code === 0 ? r.out.trim() : '';
+  if (tok) cpTokenCache = { at: Date.now(), token: tok };
+  return tok;
+}
+async function runCopilot(chatId, prompt, opts, onActivity, onEvent) {
+  const token = await getCopilotToken();
+  return new Promise((resolve) => {
+    const args = ['-p', prompt, '--output-format', 'json', '--silent', '--no-auto-update', '--no-ask-user', '--trust-folder'];
+    if (fs.existsSync(MEMORY_DIR)) args.push('--add-dir', MEMORY_DIR);
+    if (PERMISSION_MODE === 'bypassPermissions' && !opts.readOnly) args.push('--allow-all');
+    if (opts.model && opts.model !== 'auto') args.push('--model', opts.model);
+    if (opts.effort) args.push('--reasoning-effort', opts.effort);
+    if (opts.resume) args.push('--resume', opts.resume);
+    const isScript = COPILOT_BIN.endsWith('.mjs') || COPILOT_BIN.endsWith('.js');
+    const started = Date.now();
+    const extraEnv = { WA_CHAT_ID: chatId, WA_BOT_ID: opts.botId || DEFAULT_BOT, WA_READONLY: opts.readOnly ? '1' : '0' };
+    if (token) extraEnv.GH_TOKEN = token;
+    const childEnv = buildChildEnv(extraEnv, Boolean(opts.sandboxed));
+    const child = spawn(isScript ? process.execPath : COPILOT_BIN, isScript ? [COPILOT_BIN, ...args] : args,
+      { cwd: WORKDIR, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+    running.set(chatId, { child, started, prompt: prompt.slice(0, 80), bot: opts.botId || '' });
+    let out = '', err = '', buf = '', timedOut = false;
+    const texts = [];
+    let sessionId = '', modelUsed = opts.model || '', turns = 0, premiumRequests = 0, durationMs = 0, exitCode = 0;
+    const u = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+    const handleLine = (line) => {
+      if (!line) return;
+      let ev;
+      try { ev = JSON.parse(line); } catch { return; }
+      if (ev.type === 'session.start' && ev.data && ev.data.sessionId) sessionId = ev.data.sessionId;
+      if (ev.type === 'session.model_change' && ev.data && ev.data.newModel) modelUsed = ev.data.newModel;
+      if (ev.type === 'assistant.message' && ev.data) {
+        turns++;
+        if (ev.data.model) modelUsed = ev.data.model;
+        if (Array.isArray(ev.data.toolRequests) && onActivity) {
+          for (const tr of ev.data.toolRequests) onActivity(describeTool(tr.name || 'tool'));
+        }
+        if (typeof ev.data.content === 'string' && ev.data.content.trim()) {
+          texts.push(ev.data.content);
+          if (onEvent) {
+            try { onEvent({ type: 'assistant', message: { content: [{ type: 'text', text: ev.data.content }] } }); } catch {}
+          }
+        }
+      }
+      if (ev.type === 'session.usage_checkpoint' && ev.data && ev.data.accountingSnapshot) {
+        const snap = ev.data.accountingSnapshot;
+        if (snap.currentModel) modelUsed = snap.currentModel;
+        if (snap.totalPremiumRequestCost) premiumRequests = Number(snap.totalPremiumRequestCost) || premiumRequests;
+        if (snap.totalApiDurationMs) durationMs = Number(snap.totalApiDurationMs) || durationMs;
+        if (snap.tokenDetails) {
+          u.input_tokens = Number(snap.tokenDetails.input && snap.tokenDetails.input.tokenCount) || u.input_tokens;
+          u.output_tokens = Number(snap.tokenDetails.output && snap.tokenDetails.output.tokenCount) || u.output_tokens;
+          u.cache_read_tokens = Number(snap.tokenDetails.cache_read && snap.tokenDetails.cache_read.tokenCount) || u.cache_read_tokens;
+        }
+      }
+      if (ev.type === 'result') {
+        if (ev.sessionId) sessionId = ev.sessionId;
+        if (typeof ev.exitCode === 'number') exitCode = ev.exitCode;
+        if (ev.usage) {
+          if (ev.usage.sessionDurationMs) durationMs = Number(ev.usage.sessionDurationMs) || durationMs;
+          if (ev.usage.premiumRequests) premiumRequests = Number(ev.usage.premiumRequests) || premiumRequests;
+        }
+      }
+    };
+    child.stdout.on('data', (d) => {
+      out += d; buf += d;
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        handleLine(buf.slice(0, nl).trim());
+        buf = buf.slice(nl + 1);
+      }
+    });
+    child.stderr.on('data', (d) => { err += d; });
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); }, TIMEOUT_MS);
+    const done = (r) => { clearTimeout(timer); running.delete(chatId); resolve(r); };
+    child.on('error', (e) => done({ error: e.message }));
+    child.on('close', (code, signal) => {
+      if (buf.trim()) handleLine(buf.trim());
+      if (signal && !timedOut) return done({ stopped: true });
+      if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
+      const text = texts.join('\n\n').trim();
+      if (!text && (code !== 0 || exitCode !== 0)) {
+        return done({ error: 'copilot saiu com código ' + (code || exitCode) + ': ' + (err || out).slice(-500) });
+      }
+      const ms = durationMs || (Date.now() - started);
+      logUsage('copilot', chatId, 0, ms, u, modelUsed || opts.model || 'auto');
+      done({ text: text || '(sem resposta)', sessionId, provider: 'copilot',
+        usage: { cost: 0, ms, turns: turns || 1, premiumRequests, in: u.input_tokens, out: u.output_tokens, cacheRead: u.cache_read_tokens } });
+    });
+  });
+}
+
 // ---------- Antigravity model catalog, read live from `agy models` ----------
 // Google ships new Gemini models often, so the menu is never hard-coded. Model ids may carry the effort as a
 // suffix (gemini-x-flash-medium): those are grouped into one model with its effort variants.
@@ -1226,6 +1338,7 @@ function isProviderAvailable(p) {
   if (p === 'claude') return Boolean(CLAUDE_BIN && (CLAUDE_BIN === 'claude' || fs.existsSync(CLAUDE_BIN)));
   if (p === 'antigravity') return fs.existsSync(AGY_BIN);
   if (p === 'opencode') return Boolean(OPENCODE_BIN && (OPENCODE_BIN === 'opencode' || fs.existsSync(OPENCODE_BIN)));
+  if (p === 'copilot') return Boolean(COPILOT_BIN && (COPILOT_BIN === 'copilot' || fs.existsSync(COPILOT_BIN)));
   if (p === 'openai_compat') return compatConfig().enabled;
   return false;
 }
@@ -1249,6 +1362,11 @@ async function invokeProviderOnce(provider, chatId, actualPrompt, cfg, opts, onA
     const text = !opts.resume ? antigravityPrompt(chatId, effectiveBot, 'opencode') + '\n\n---\n\n' + actualPrompt : actualPrompt;
     const model = opts.modelOverride || cfg.oc.ocModel || settings.opencodeModel || OPENCODE_DEFAULT_MODEL;
     return runOpenCode(chatId, text, { model, resume: opts.resume, botId: effectiveBot.id, sandboxed: isSandboxed, readOnly: opts.readOnly });
+  }
+  if (provider === 'copilot') {
+    const text = !opts.resume ? antigravityPrompt(chatId, effectiveBot, 'copilot') + '\n\n---\n\n' + actualPrompt : actualPrompt;
+    const model = opts.modelOverride || (cfg.cp && cfg.cp.cpModel) || settings.copilotModel || COPILOT_DEFAULT_MODEL;
+    return runCopilot(chatId, text, { model, effort: cfg.effort, resume: opts.resume, botId: effectiveBot.id, sandboxed: isSandboxed, readOnly: opts.readOnly }, onActivity, onEvent);
   }
   if (provider === 'openai_compat') {
     const model = opts.modelOverride || cfg.model;
@@ -1282,7 +1400,7 @@ async function runAgent(chatId, prompt, opts, onActivity, onEvent) {
     if (r && r.error && !r.stopped && !opts.noFallback && routing.enabled) {
       const order = Array.isArray(routing.fallbackOrder) && routing.fallbackOrder.length
         ? routing.fallbackOrder
-        : ['antigravity', 'claude', 'opencode', 'openai_compat'];
+        : ['antigravity', 'claude', 'copilot', 'opencode', 'openai_compat'];
       for (const nextProv of order) {
         if (!PROVIDERS[nextProv] || nextProv === provider || !isProviderAvailable(nextProv)) continue;
         log('provider failover:', provider, '->', nextProv, 'reason:', String(r.error).slice(0, 120));
@@ -1318,7 +1436,7 @@ async function runCouncil(prompt, opts = {}) {
   if (!q) throw new Error('pergunta obrigatória para o Conselho');
   const wanted = Array.isArray(opts.providers) && opts.providers.length
     ? opts.providers.filter((p) => PROVIDERS[p] && isProviderAvailable(p))
-    : ['antigravity', 'claude', 'opencode', 'openai_compat'].filter(isProviderAvailable).slice(0, 3);
+    : ['antigravity', 'claude', 'copilot', 'opencode', 'openai_compat'].filter(isProviderAvailable).slice(0, 3);
   if (!wanted.length) throw new Error('nenhum provedor disponível para o Conselho');
   const councilId = crypto.randomBytes(4).toString('hex');
   const started = Date.now();
@@ -1413,7 +1531,7 @@ const HELP = [
   '/status: sessão, modelo, tarefa em andamento e totais',
   '/log [n]: últimas n execuções (padrão 5) com horário, duração, custo e erros',
   '/usage: total de execuções, tempo e custo desta conversa',
-  '/provider [claude|antigravity|opencode]: escolhe quem responde nesta conversa (fica salvo). OpenCode usa modelos gratuitos sem chave',
+  '/provider [claude|antigravity|copilot|opencode]: escolhe quem responde nesta conversa (fica salvo). Copilot usa GitHub Copilot CLI; OpenCode usa modelos gratuitos',
   '/model [opus|sonnet|haiku|fable|<id>|default]: troca o modelo desta conversa (fica salvo). No Antigravity, a lista vem ao vivo do agy models',
   '/effort [low|medium|high|xhigh|max|default]: nível de esforço (fica salvo). No Antigravity, mostra só os níveis do modelo escolhido',
   '/bot [nome]: troca o bot (persona) que responde nesta conversa e começa uma conversa nova',
@@ -1434,7 +1552,7 @@ const MODEL_CHOICES = [['Opus', '/model opus'], ['Sonnet', '/model sonnet'], ['H
 const EFFORT_CHOICES = [['low', '/effort low'], ['medium', '/effort medium'], ['high', '/effort high'], ['xhigh', '/effort xhigh'], ['max', '/effort max'], ['Padrão', '/effort default']];
 const HELP_MENU = [['Status', '/status'], ['Nova conversa', '/new'], ['Trocar modelo', '/model'], ['Trocar esforço', '/effort'],
   ['Uso e custo', '/usage'], ['Últimas execuções', '/log'], ['Agendamentos', '/schedules'], ['Interromper tarefa', '/stop'], ['Trocar provedor', '/provider'], ['Trocar bot', '/bot']];
-const PROVIDER_CHOICES = [['Claude Code', '/provider claude'], ['Antigravity', '/provider antigravity'], ['OpenCode (grátis)', '/provider opencode']];
+const PROVIDER_CHOICES = [['Claude Code', '/provider claude'], ['Antigravity', '/provider antigravity'], ['GitHub Copilot', '/provider copilot'], ['OpenCode (grátis)', '/provider opencode']];
 const MENU_TTL = 120000;
 const menus = new Map();  // chatId -> { at, options: [command] }   numbered menu waiting for a "1", "2"...
 const polls = new Map();  // poll message id (last segment) -> { chatId, options: { label: command } }
@@ -1570,18 +1688,27 @@ async function command(chatId, body) {
   switch (cmd) {
     case '/help': return sendMenu(chatId, 'O que você quer fazer?', HELP_MENU, HELP);
     case '/new':
-      delete c.session; delete c.agySession; delete c.ocSession; save();
+      delete c.session; delete c.agySession; delete c.ocSession; delete c.cpSession; save();
       return reply(chatId, 'Nova conversa iniciada com ' + botLabel(botOf(c)) + '. Modelo: ' + (runConfig(c).model || 'padrão') + '.', true);
     case '/provider': {
       const cur = PROVIDERS[providerOf(c)];
       if (!arg) return sendChoice(chatId, 'Provedor atual: ' + cur + '. Escolha:', PROVIDER_CHOICES);
-      const a = arg.toLowerCase(); const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : a;
-      if (!PROVIDERS[want] || want === 'openai_compat') return reply(chatId, 'Provedor inválido. Opções: claude, antigravity, opencode.', true);
+      const a = arg.toLowerCase(); const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : a;
+      if (!PROVIDERS[want] || want === 'openai_compat') return reply(chatId, 'Provedor inválido. Opções: claude, antigravity, copilot, opencode.', true);
       c.provider = want; save();
       return reply(chatId, 'Provedor desta conversa: ' + PROVIDERS[want] + '. Vale a partir da próxima mensagem. Use /new para começar do zero no novo provedor.', true);
     }
     case '/model':
       if (providerOf(c) === 'antigravity') return agyModelCommand(chatId, c, arg, isDefault);
+      if (providerOf(c) === 'copilot') {
+        if (!arg) {
+          const cur = (runConfig(c).cp && runConfig(c).cp.cpModel) || COPILOT_DEFAULT_MODEL;
+          return sendChoice(chatId, 'Modelo GitHub Copilot atual: ' + cur + '. Escolha o novo:', [...COPILOT_MODELS.map((m) => [m.label, '/model ' + m.id]), ['Padrão', '/model default']]);
+        }
+        if (isDefault(arg)) { delete c.cpModel; delete c.model; } else { c.cpModel = arg; c.model = arg; }
+        save();
+        return reply(chatId, 'Modelo GitHub Copilot desta conversa: ' + ((runConfig(c).cp && runConfig(c).cp.cpModel) || COPILOT_DEFAULT_MODEL) + '. Vale a partir da próxima mensagem.', true);
+      }
       if (providerOf(c) === 'opencode') {
         const list = await openCodeModels();
         if (!arg) {
@@ -1723,23 +1850,24 @@ async function handleWebCommand(chatId, body) {
   };
   switch (cmd) {
     case '/help':
-      return out('**Comandos disponíveis no Chat Web:**\n- `/new` — inicia nova sessão limpa\n- `/status` — mostra bot, provedor, modelo e fila\n- `/usage` — uso desta conversa e gasto do mês\n- `/log [n]` — últimas execuções\n- `/provider <claude|antigravity|opencode|openai_compat>` — troca provedor\n- `/model <id|default>` — troca modelo\n- `/effort <low|medium|high|xhigh|max|default>` — troca esforço\n- `/bot <nome>` — troca bot da conversa\n- `/stop` — interrompe execução atual\n- `/schedules` — lista agendamentos desta conversa\n- `/council <pergunta>` — consulta múltiplos modelos em paralelo e sintetiza\n- `/<slug-da-skill>` — executa uma skill');
+      return out('**Comandos disponíveis no Chat Web:**\n- `/new` — inicia nova sessão limpa\n- `/status` — mostra bot, provedor, modelo e fila\n- `/usage` — uso desta conversa e gasto do mês\n- `/log [n]` — últimas execuções\n- `/provider <claude|antigravity|copilot|opencode|openai_compat>` — troca provedor\n- `/model <id|default>` — troca modelo\n- `/effort <low|medium|high|xhigh|max|default>` — troca esforço\n- `/bot <nome>` — troca bot da conversa\n- `/stop` — interrompe execução atual\n- `/schedules` — lista agendamentos desta conversa\n- `/council <pergunta>` — consulta múltiplos modelos em paralelo e sintetiza\n- `/<slug-da-skill>` — executa uma skill');
     case '/new':
-      delete c.session; delete c.agySession; delete c.ocSession; save();
+      delete c.session; delete c.agySession; delete c.ocSession; delete c.cpSession; save();
       return out('Nova conversa iniciada com **' + botLabel(botOf(c)) + '**. Provedor: ' + PROVIDERS[providerOf(c)] + '.');
     case '/provider': {
-      if (!arg) return out('Provedor atual: **' + PROVIDERS[providerOf(c)] + '**. Use `/provider claude`, `/provider antigravity`, `/provider opencode` ou `/provider openai_compat`.');
+      if (!arg) return out('Provedor atual: **' + PROVIDERS[providerOf(c)] + '**. Use `/provider claude`, `/provider antigravity`, `/provider copilot`, `/provider opencode` ou `/provider openai_compat`.');
       const a = arg.toLowerCase();
-      const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'byom' || a === 'compat' || a === 'openai_compat') ? 'openai_compat' : a;
-      if (!PROVIDERS[want]) return out('Provedor inválido. Opções: `claude`, `antigravity`, `opencode`, `openai_compat`.');
+      const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : (a === 'byom' || a === 'compat' || a === 'openai_compat') ? 'openai_compat' : a;
+      if (!PROVIDERS[want]) return out('Provedor inválido. Opções: `claude`, `antigravity`, `copilot`, `opencode`, `openai_compat`.');
       c.provider = want; save();
       return out('Provedor desta conversa alterado para **' + PROVIDERS[want] + '** (vale a partir da próxima mensagem).');
     }
     case '/model': {
       const p = providerOf(c);
-      if (!arg) return out('Modelo atual (' + PROVIDERS[p] + '): `' + (p === 'antigravity' ? (c.agyModel || 'padrão') : p === 'opencode' ? (runConfig(c).oc.ocModel || OPENCODE_DEFAULT_MODEL) : (runConfig(c).model || 'padrão')) + '`.');
+      if (!arg) return out('Modelo atual (' + PROVIDERS[p] + '): `' + (p === 'antigravity' ? (c.agyModel || 'padrão') : p === 'opencode' ? (runConfig(c).oc.ocModel || OPENCODE_DEFAULT_MODEL) : p === 'copilot' ? ((runConfig(c).cp && runConfig(c).cp.cpModel) || COPILOT_DEFAULT_MODEL) : (runConfig(c).model || 'padrão')) + '`.');
       if (p === 'antigravity') { if (isDefault(arg)) delete c.agyModel; else c.agyModel = arg; }
       else if (p === 'opencode') { if (isDefault(arg)) { delete c.ocModel; delete c.model; } else { c.ocModel = arg; c.model = arg; } }
+      else if (p === 'copilot') { if (isDefault(arg)) { delete c.cpModel; delete c.model; } else { c.cpModel = arg; c.model = arg; } }
       else { if (isDefault(arg)) delete c.model; else c.model = arg; }
       save();
       return out('Modelo atualizado para `' + (isDefault(arg) ? 'padrão' : arg) + '`.');
@@ -1995,7 +2123,7 @@ async function runTurn(chatId, botId, prompt, onActivity, onEvent, onRetry, extr
   const id = botId || botOf(c).id;
   const own = id === botOf(c).id;
   const prov = runConfig(c, own ? undefined : id).provider;
-  const key = prov === 'antigravity' ? 'agySession' : prov === 'opencode' ? 'ocSession' : 'session';
+  const key = prov === 'antigravity' ? 'agySession' : prov === 'opencode' ? 'ocSession' : prov === 'copilot' ? 'cpSession' : 'session';
   const store = own ? c : ((c.botSessions = c.botSessions || {})[id] = c.botSessions[id] || {});
   const opts = { resume: store[key], bot: own ? undefined : id, ...(extra || {}) };
   let r = await runAgent(chatId, prompt, opts, onActivity, onEvent);
@@ -6407,17 +6535,25 @@ function execCmd(bin, args, ms = 60000) {
   });
 }
 
-let versionCache = { at: 0, claude: '', agy: '', oc: '' };
+let versionCache = { at: 0, claude: '', agy: '', oc: '', cp: '' };
 async function providersInfo() {
   if (Date.now() - versionCache.at > 10 * 60 * 1000) {
     const cl = await execCmd(CLAUDE_BIN, ['--version'], 20000);
     const ag = fs.existsSync(AGY_BIN) ? await execCmd(AGY_BIN, ['--version'], 20000) : null;
     const oc = await execCmd(OPENCODE_BIN, ['--version'], 20000);
-    versionCache = { at: Date.now(), claude: cl.code === 0 ? cl.out.trim() : '', agy: ag && ag.code === 0 ? ag.out.trim() : '', oc: oc.code === 0 ? oc.out.trim() : '' };
+    const cp = await execCmd(COPILOT_BIN, ['--version'], 20000);
+    versionCache = {
+      at: Date.now(),
+      claude: cl.code === 0 ? cl.out.trim() : '',
+      agy: ag && ag.code === 0 ? ag.out.trim() : '',
+      oc: oc.code === 0 ? oc.out.trim() : '',
+      cp: cp.code === 0 ? cp.out.split('\n')[0].trim() : '',
+    };
   }
   const agyInstalled = fs.existsSync(AGY_BIN);
   const cat = agyInstalled ? await refreshAgyCatalog(false) : { models: [] };
   const compat = compatConfig();
+  const cpTok = await getCopilotToken();
   return {
     defaultProvider: settings.defaultProvider || 'claude',
     providers: [
@@ -6428,6 +6564,10 @@ async function providersInfo() {
         envModel: ENV_MODEL, envEffort: ENV_EFFORT, permissionMode: PERMISSION_MODE },
       { id: 'antigravity', name: PROVIDERS.antigravity, installed: agyInstalled, version: versionCache.agy,
         models: cat.models.map((g) => ({ id: g.base, label: g.label, efforts: g.efforts })) },
+      { id: 'copilot', name: PROVIDERS.copilot, installed: Boolean(versionCache.cp), version: versionCache.cp,
+        auth: cpTok ? 'GitHub CLI / Token (autenticado)' : 'sem token (rode gh auth login ou copilot login)',
+        authKind: cpTok ? 'oauth' : 'none',
+        models: COPILOT_MODELS, efforts: EFFORTS, defaultModel: settings.copilotModel || COPILOT_DEFAULT_MODEL, permissionMode: PERMISSION_MODE },
       { id: 'opencode', name: PROVIDERS.opencode, installed: Boolean(versionCache.oc), version: versionCache.oc,
         auth: 'Modelos gratuitos do OpenCode (sem chave)', authKind: 'none',
         models: (await openCodeModels()).map((m) => ({ id: m, label: m })), defaultModel: settings.opencodeModel || OPENCODE_DEFAULT_MODEL },
@@ -6447,7 +6587,7 @@ function chatView(id) {
     id, kind: isWeb(id) ? 'web' : isDeleg(id) ? 'delegation' : 'whatsapp', members: Array.isArray(c.members) ? c.members : [], title: c.title || (isWeb(id) ? 'Conversa web' : id.split('@')[0]),
     provider: providerOf(c), providerSet: Boolean(c.provider), bot: botOf(c).id, effModel: runConfig(c).model || '', effEffort: runConfig(c).effort || '',
     model: c.model || '', effort: c.effort || '', agyModel: c.agyModel || '', agyEffort: c.agyEffort || '',
-    session: c.session || '', agySession: c.agySession || '', created: c.created || '', readAt: c.readAt || '', unread,
+    session: c.session || '', agySession: c.agySession || '', ocSession: c.ocSession || '', cpSession: c.cpSession || '', created: c.created || '', readAt: c.readAt || '', unread,
     pinned: Boolean(c.pinned), archived: Boolean(c.archived),
     totals: c.totals || { runs: 0, cost: 0, ms: 0, errors: 0 }, runs: c.runs || [], lastUsage: c.lastUsage || null,
     running: r ? { started: r.started, prompt: r.prompt } : null,
@@ -6686,7 +6826,7 @@ async function handleAdmin(req, res, u, raw) {
     if (a === 'providers' && m === 'GET') return send(200, await providersInfo());
     if (a === 'settings' && m === 'GET') return send(200, safeSettingsView());
     if (a === 'settings' && m === 'PUT') {
-      for (const k of ['defaultProvider', 'claudeModel', 'claudeEffort']) {
+      for (const k of ['defaultProvider', 'claudeModel', 'claudeEffort', 'copilotModel']) {
         if (!(k in body)) continue;
         if (!body[k]) delete settings[k]; else settings[k] = String(body[k]);
       }
@@ -6874,7 +7014,7 @@ async function handleAdmin(req, res, u, raw) {
       if ('pinned' in body) { if (body.pinned) c.pinned = true; else delete c.pinned; }
       if ('archived' in body) { if (body.archived) c.archived = true; else delete c.archived; }
       if (body.read) c.readAt = new Date().toISOString();
-      if (body.reset) { delete c.session; delete c.agySession; delete c.ocSession; }
+      if (body.reset) { delete c.session; delete c.agySession; delete c.ocSession; delete c.cpSession; }
       save();
       return send(200, chatView(b));
     }
