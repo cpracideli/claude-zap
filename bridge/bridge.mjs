@@ -212,18 +212,21 @@ function writeBotMemory(id, text) {
   fs.mkdirSync(botDir(id), { recursive: true });
   fs.writeFileSync(botMemFile(id), String(text || '').slice(0, 20000));
 }
-// Effective run settings for a chat. With an explicit bot (a routine that runs as another bot), the chat's own
-// overrides are ignored, so the routine really uses that bot's provider and model.
+// Effective run settings for a chat.
+// Direct chat (own=true): chat override -> bot -> default bot (Agent) -> global fallback.
+// Routine or @mention (own=false): target bot -> chat override -> default bot (Agent) -> global fallback.
 function runConfig(c, botId) {
   const own = !botId || botId === ((c && c.bot) || DEFAULT_BOT);
   const b = own ? botOf(c) : (bots[botId] || botOf(c));
-  const cc = own ? (c || {}) : {};
+  const cc = c || {};
+  const def = bots[DEFAULT_BOT] || {};
+  const pick = (k, fallback) => (own ? (cc[k] || b[k] || def[k] || fallback) : (b[k] || cc[k] || def[k] || fallback));
   return {
     bot: b,
-    provider: cc.provider || b.provider || settings.defaultProvider || 'claude',
-    model: cc.model || b.model || defModel(),
-    effort: cc.effort || b.effort || defEffort(),
-    agy: { agyModel: cc.agyModel || b.agyModel || '', agyEffort: cc.agyEffort || b.agyEffort || '' },
+    provider: pick('provider', settings.defaultProvider || 'claude'),
+    model: pick('model', defModel()),
+    effort: pick('effort', defEffort()),
+    agy: { agyModel: pick('agyModel', ''), agyEffort: pick('agyEffort', '') },
   };
 }
 const providerOf = (c) => runConfig(c).provider;
@@ -569,9 +572,10 @@ function systemPrompt(chatId, bot) {
     '  Criar: curl -s -X POST http://127.0.0.1:' + PORT + '/pages -H "Content-Type: application/json" -d \'{"title":"Título","description":"resumo curto","html":"<!doctype html><html>...</html>","bot":"' + (bot || botOf(chats[chatId])).id + '","chatId":"' + chatId + '","public":false}\'',
     '  Atualizar: curl -s -X PATCH http://127.0.0.1:' + PORT + '/pages/ID -H "Content-Type: application/json" -d \'{"html":"..."}\'   Listar: curl -s http://127.0.0.1:' + PORT + '/pages   Ler: curl -s http://127.0.0.1:' + PORT + '/pages/ID',
     '  Para HTML grande, grave o JSON num arquivo e use --data @arquivo. As páginas aparecem na aba Páginas do painel' + (settings.panelUrl ? ' (' + settings.panelUrl + '/#/pages) e, quando "public":true, têm link público ' + settings.panelUrl + '/p/ID/TOKEN (shareToken vem na resposta).' : '.'),
-    'CARTÕES DE PERGUNTA / APROVAÇÃO: quando precisar que o usuário escolha uma opção ou aprove uma ação importante antes de continuar, envie um cartão interativo e aguarde a resposta (no painel vira botões; no WhatsApp vira votação/enquete clicável + suporte a número e 👍/👎; no Telegram vira botões inline):',
-    '  curl -s -X POST http://127.0.0.1:' + PORT + '/prompts -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","title":"Confirmar ação","question":"O que deseja fazer?","options":["Aprovar","Cancelar"],"wait":110}\'',
-    '  A resposta traz status "answered" e "answer" (a opção escolhida); se vier "pending", repita: curl -s "http://127.0.0.1:' + PORT + '/prompts/ID?wait=110" até o usuário responder.',
+    'CARTÕES DE PERGUNTA / APROVAÇÃO: quando precisar tirar uma dúvida real, oferecer caminhos ou pedir aprovação antes de continuar, envie um cartão interativo e aguarde a resposta (no painel vira seletor interativo; no WhatsApp vira enquete clicável + suporte a número e 👍/👎; no Telegram vira botões inline):',
+    '  curl -s -X POST http://127.0.0.1:' + PORT + '/prompts -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","title":"Confirmar ação","question":"Qual abordagem prefere?","options":[{"label":"Opção A","description":"Resumo curto da opção A","recommended":true},{"label":"Opção B","description":"Resumo curto da opção B"}],"multiSelect":false,"wait":110}\'',
+    '  "options" aceita strings simples ou objetos {label, description?, recommended?: true}. Também aceita "multiSelect": true e "questions": [{"question":"...","options":[...],"multiSelect":false}] para várias perguntas no mesmo cartão. A resposta traz status "answered", "answer" (e "answers" quando múltiplas); se vier "pending", repita: curl -s "http://127.0.0.1:' + PORT + '/prompts/ID?wait=110" até o usuário responder.',
+    'SUGESTÕES RÁPIDAS (não-bloqueantes, no fim da resposta): quando quiser oferecer próximos passos clicáveis sem pausar o turno, inclua no final da resposta um bloco ```suggestions com JSON de até 4 opções (ex.: [{"label":"Fazer deploy","description":"Publica em produção"},{"label":"Rodar testes"}]). O painel remove o bloco cru e exibe chips clicáveis abaixo da mensagem.',
     'NUDGES PROATIVOS (com deduplicação e ação de 1 clique): curl -s -X POST http://127.0.0.1:' + PORT + '/nudges -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","topicKey":"chave-unica","title":"Resumo curto","summary":"O que mudou","draft":"rascunho opcional","actionLabel":"Executar","actionPrompt":"instrução se o usuário aprovar"}\'',
     'TAREFAS PARALELAS (não travam a conversa principal): curl -s -X POST http://127.0.0.1:' + PORT + '/tasks -H "Content-Type: application/json" -d \'{"parentChatId":"' + chatId + '","title":"Pesquisa em paralelo","prompt":"instrução completa","bot":"' + (bot || botOf(chats[chatId])).id + '"}\'',
     'SKILLS (habilidades reutilizáveis): listar: curl -s http://127.0.0.1:' + PORT + '/skills   ler: curl -s http://127.0.0.1:' + PORT + '/skills/SLUG   salvar nova skill (quando o usuário pedir "salve isso como skill" ou após resolver um fluxo complexo novo — use "source":"learned" e nunca inclua dados pessoais): curl -s -X POST http://127.0.0.1:' + PORT + '/skills -H "Content-Type: application/json" -d \'{"name":"Nome","description":"quando usar","instructions":"passo a passo completo"}\'' +
@@ -707,6 +711,40 @@ function tryInject(chatId, text) {
 }
 
 // ---------- Antigravity (agy) provider ----------
+// Estimated USD per 1M tokens for Antigravity models (can be overridden via settings.agyPricing).
+const AGY_PRICING = {
+  'gemini-3.8-flash': { in: 0.15, out: 0.60, cacheRead: 0.0375 },
+  'gemini-4-hydrogen': { in: 0.50, out: 2.00, cacheRead: 0.125 },
+  'gemini-4-argon': { in: 1.25, out: 5.00, cacheRead: 0.3125 },
+  'gemini-4-neon': { in: 2.50, out: 15.00, cacheRead: 0.625 },
+  'gemini-pro-orchestrator': { in: 1.25, out: 10.00, cacheRead: 0.3125 },
+  'claude-sonnet': { in: 3.00, out: 15.00, cacheRead: 0.30 },
+  'claude-opus': { in: 15.00, out: 75.00, cacheRead: 1.50 },
+  'gpt-oss-120b': { in: 0.50, out: 1.50, cacheRead: 0.125 },
+  default: { in: 1.25, out: 5.00, cacheRead: 0.3125 },
+};
+function estimateAgyCost(model, usage) {
+  const u = usage || {};
+  const inTok = Number(u.input_tokens ?? u.in ?? 0) + Number(u.cache_creation_input_tokens || 0);
+  const outTok = Number(u.output_tokens ?? u.out ?? 0) + Number(u.thinking_tokens || 0);
+  const cacheTok = Number(u.cache_read_tokens ?? u.cache_read_input_tokens ?? u.cacheRead ?? 0);
+  if (!(inTok > 0 || outTok > 0 || cacheTok > 0)) return 0;
+  const overrides = (settings.agyPricing && typeof settings.agyPricing === 'object') ? settings.agyPricing : {};
+  const table = Object.assign({}, AGY_PRICING, overrides);
+  const m = String(model || '').toLowerCase();
+  let rate = null;
+  if (m && table[m]) {
+    rate = table[m];
+  } else if (m) {
+    const keys = Object.keys(table).filter((k) => k !== 'default').sort((a, b) => b.length - a.length);
+    for (const k of keys) {
+      if (m.includes(k.toLowerCase())) { rate = table[k]; break; }
+    }
+  }
+  rate = rate || table.default || AGY_PRICING.default;
+  const raw = (inTok * (Number(rate.in) || 0) + outTok * (Number(rate.out) || 0) + cacheTok * (Number(rate.cacheRead) || 0)) / 1000000;
+  return raw > 0 ? Math.round(raw * 1000000) / 1000000 : 0;
+}
 // Runs `agy -p` in print mode. It keeps its own conversations (--conversation <id>), so each chat stores
 // the agy conversation id separately from the Claude session. The bridge's instructions are sent in the
 // first prompt of a new agy conversation, because agy has no --append-system-prompt.
@@ -734,9 +772,11 @@ function runAntigravity(chatId, prompt, opts) {
         const j = JSON.parse(out);
         if (j.status && j.status !== 'SUCCESS') return done({ error: 'Antigravity: ' + j.status, sessionId: j.conversation_id });
         const u = j.usage || {};
-        logUsage('antigravity', chatId, 0, Math.round((j.duration_seconds || 0) * 1000), u);
+        const modelUsed = j.model || opts.model || '';
+        const estCost = estimateAgyCost(modelUsed, u);
+        logUsage('antigravity', chatId, estCost, Math.round((j.duration_seconds || 0) * 1000), u, modelUsed);
         done({ text: j.response || '', sessionId: j.conversation_id, provider: 'antigravity',
-          usage: { cost: 0, ms: Math.round((j.duration_seconds || (Date.now() - started) / 1000) * 1000), turns: j.num_turns || 0 } });
+          usage: { cost: estCost, estimated: true, ms: Math.round((j.duration_seconds || (Date.now() - started) / 1000) * 1000), turns: j.num_turns || 0 } });
       } catch {
         done({ error: 'agy saiu com código ' + code + ': ' + (err || out).slice(-500) });
       }
@@ -1676,8 +1716,14 @@ function startAsk(targetId, body) {
   const dc = chat(dId);
   if (target.id === DEFAULT_BOT) delete dc.bot; else dc.bot = target.id;
   Object.assign(dc, { depth, from, title: botLabel(target) + ' ← ' + chatView(from).title });
+  const caller = bots[callerBot] || {};
   for (const k of ['provider', 'model', 'effort', 'agyModel', 'agyEffort']) {
-    if (fc[k]) dc[k] = fc[k]; else delete dc[k];
+    if (!target[k]) {
+      const inherited = fc[k] || caller[k];
+      if (inherited) dc[k] = inherited; else delete dc[k];
+    } else {
+      delete dc[k];
+    }
   }
   dc.created = dc.created || new Date().toISOString();
   save();
@@ -1980,6 +2026,8 @@ function tick() {
     }
     if (tChanged) saveTickets();
   }
+  // Auto-Executor (Board Runner): periodically picks next 'todo' ticket
+  try { boardRunnerTick(false); } catch (e) { log('boardRunnerTick error', e.message); }
 }
 setInterval(tick, Number(env.SCHEDULER_TICK_MS || 15000));
 
@@ -2093,16 +2141,79 @@ async function handlePublicPage(req, res, u) {
   return res.end(html);
 }
 
-// ---------- interactive prompt / approval cards (Phase 6 + WhatsApp Polls + Nudges + PIN) ----------
+// ---------- interactive prompt / approval cards (Phase 6 + WhatsApp Polls + Nudges + PIN + AskUserQuestion) ----------
 const prompts = new Map(); // id -> prompt object
 const promptLog = new Map(); // chatId -> prompts created during the current run
+function normalizePromptOptions(rawOpts, fallback) {
+  const arr = Array.isArray(rawOpts) && rawOpts.length ? rawOpts : (fallback || ['Aprovar', 'Cancelar']);
+  const items = [];
+  for (const x of arr) {
+    if (typeof x === 'string') {
+      const label = x.trim().slice(0, 120);
+      if (label) items.push({ label, description: '', recommended: false });
+    } else if (x && typeof x === 'object') {
+      const label = String(x.label || x.title || x.value || '').trim().slice(0, 120);
+      if (!label) continue;
+      items.push({
+        label,
+        description: String(x.description || x.desc || '').trim().slice(0, 240),
+        recommended: Boolean(x.recommended),
+      });
+    }
+    if (items.length >= 12) break;
+  }
+  return { labels: items.map((i) => i.label), items };
+}
+function extractSuggestions(rawText) {
+  const text = String(rawText || '');
+  if (!text) return { text: '', suggestions: [] };
+  const found = [];
+  const parsePayload = (body) => {
+    const trimmed = String(body || '').trim();
+    if (!trimmed) return;
+    let parsed = null;
+    try { parsed = JSON.parse(trimmed); } catch {}
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        if (typeof item === 'string') {
+          const label = item.trim().slice(0, 120);
+          if (label) found.push({ label, description: '', text: label });
+        } else if (item && typeof item === 'object') {
+          const label = String(item.label || item.title || item.text || '').trim().slice(0, 120);
+          if (!label) continue;
+          found.push({
+            label,
+            description: String(item.description || item.desc || '').trim().slice(0, 200),
+            text: String(item.text || item.prompt || label).trim().slice(0, 500),
+            recommended: Boolean(item.recommended),
+          });
+        }
+        if (found.length >= 6) break;
+      }
+      return;
+    }
+    for (const line of trimmed.split('\n')) {
+      const clean = line.replace(/^\s*(?:[-*•]|\d+[.)])\s*/, '').trim();
+      if (!clean) continue;
+      found.push({ label: clean.slice(0, 120), description: '', text: clean.slice(0, 500) });
+      if (found.length >= 6) break;
+    }
+  };
+  let clean = text.replace(/```suggestions\s*\n([\s\S]*?)```/gi, (_, body) => { parsePayload(body); return ''; });
+  clean = clean.replace(/<suggestions>([\s\S]*?)<\/suggestions>/gi, (_, body) => { parsePayload(body); return ''; });
+  return { text: clean.replace(/\n{3,}/g, '\n\n').trim(), suggestions: found.slice(0, 6) };
+}
 const promptView = (p) => ({
   id: p.id, chatId: p.chatId, bot: p.bot, botName: bots[p.bot] ? botLabel(bots[p.bot]) : p.bot,
   kind: p.kind || 'prompt', secretName: p.secretName || '', secretKind: p.secretKind || '',
-  title: p.title, question: p.question, options: p.options, status: p.status,
+  title: p.title, question: p.question, options: p.options,
+  optionItems: p.optionItems || p.options.map((label) => ({ label, description: '', recommended: false })),
+  multiSelect: Boolean(p.multiSelect),
+  ...(p.questions ? { questions: p.questions } : {}),
+  status: p.status,
   requirePin: Boolean(p.requirePin && settings.securityPinHash),
   nudgeId: p.nudgeId || '', topicKey: p.topicKey || '', hasDraft: Boolean(p.draft),
-  answer: p.answer || '', note: p.note || '', created: p.created, answeredAt: p.answeredAt || '',
+  answer: p.answer || '', ...(p.answers !== undefined ? { answers: p.answers } : {}), note: p.note || '', created: p.created, answeredAt: p.answeredAt || '',
 });
 function emitPrompt(p) {
   if (isWeb(p.chatId)) webEmit(p.chatId, { type: 'prompt', prompt: promptView(p) });
@@ -2112,23 +2223,25 @@ function emitPrompt(p) {
   promptLog.set(p.chatId, list);
 }
 async function sendPromptWhatsApp(p) {
-  const numbered = p.options.map((o, i) => (i + 1) + '. ' + o).join('\n');
+  const items = p.optionItems || p.options.map((label) => ({ label, description: '', recommended: false }));
+  const numbered = items.map((o, i) => (i + 1) + '. ' + o.label + (o.recommended ? ' *(Recomendado)*' : '') + (o.description ? ' — ' + o.description : '')).join('\n');
   if (p.kind === 'secret') {
     const warn = '\n\n_Por segurança, prefira salvar esta credencial pelo painel web (aba Chat ou Cofre)._';
     return reply(p.chatId, '🔒 *' + p.title + '*\n' + p.question + '\n\n' + numbered + warn + '\n\n_Responda com o número da opção ou escreva sua resposta._', true);
   }
-  const canPoll = p.options.length >= 2 && p.options.length <= 12;
+  const canPoll = !p.questions && p.options.length >= 2 && p.options.length <= 12;
   const pinHint = (p.requirePin && settings.securityPinHash) ? '\n🔐 _Esta ação exige PIN de segurança (confirme no painel web ou inclua PIN:xxxx)._' : '';
-  const reactHint = p.options.length === 2 ? ', reaja com 👍/👎' : '';
+  const reactHint = p.options.length === 2 && !p.multiSelect ? ', reaja com 👍/👎' : '';
+  const descLines = items.some((o) => o.description || o.recommended) ? '\n' + numbered : '';
   if (canPoll) {
     // Send readable context message first (keeps full markdown/question visible and preserves sendText listeners),
     // then send native WhatsApp Poll for 1-tap voting.
-    await reply(p.chatId, '❓ *' + p.title + '*\n' + p.question + pinHint + '\n\n_Vote na enquete abaixo' + reactHint + ' ou responda com o número._', true).catch(() => {});
+    await reply(p.chatId, '❓ *' + p.title + '*\n' + p.question + descLines + pinHint + '\n\n_Vote na enquete abaixo' + reactHint + ' ou responda com o número._', true).catch(() => {});
     try {
       const r = await waha('POST', '/api/sendPoll', {
         session: WAHA_SESSION,
         chatId: p.chatId,
-        poll: { name: String(p.title || 'Escolha uma opção').slice(0, 200), options: p.options.slice(0, 12), multipleAnswers: false },
+        poll: { name: String(p.title || 'Escolha uma opção').slice(0, 200), options: p.options.slice(0, 12), multipleAnswers: Boolean(p.multiSelect) },
       });
       const pid = msgIdOf(r);
       if (pid) {
@@ -2140,17 +2253,34 @@ async function sendPromptWhatsApp(p) {
       log('prompt poll failed, falling back to numbered list:', e.message);
     }
   }
-  return reply(p.chatId, '❓ *' + p.title + '*\n' + p.question + '\n\n' + numbered + pinHint + '\n\n_Responda com o número da opção ou escreva sua resposta._', true);
+  const qBlock = p.questions
+    ? p.questions.map((q, qi) => '*' + (qi + 1) + ') ' + q.question + '*\n' + q.optionItems.map((o, oi) => '  ' + (oi + 1) + '. ' + o.label + (o.recommended ? ' *(Recomendado)*' : '') + (o.description ? ' — ' + o.description : '')).join('\n')).join('\n\n')
+    : p.question + '\n\n' + numbered;
+  return reply(p.chatId, '❓ *' + p.title + '*\n' + qBlock + pinHint + '\n\n_Responda com o número da opção ou escreva sua resposta._', true);
 }
 function startPrompt(body) {
   const chatId = String(body.chatId || body.from || '');
-  const question = String(body.question || body.text || '').trim();
   const kind = body.kind === 'secret' ? 'secret' : body.kind === 'nudge' ? 'nudge' : 'prompt';
   const title = String(body.title || (kind === 'secret' ? 'Credencial protegida' : kind === 'nudge' ? 'Sugestão proativa' : 'Pergunta / Aprovação')).trim().slice(0, 120);
   if (!chatId || !chats[chatId]) throw new Error('chatId desconhecido');
+  let questions = null;
+  if (Array.isArray(body.questions) && body.questions.length) {
+    questions = [];
+    for (const q of body.questions.slice(0, 6)) {
+      const qText = String((q && (q.question || q.text)) || '').trim();
+      if (!qText) continue;
+      const norm = normalizePromptOptions(q.options, ['Sim', 'Não']);
+      if (!norm.labels.length) continue;
+      questions.push({ question: qText.slice(0, 500), options: norm.labels, optionItems: norm.items, multiSelect: Boolean(q.multiSelect) });
+    }
+    if (!questions.length) questions = null;
+  }
+  const question = String(body.question || body.text || (questions ? questions[0].question : '')).trim();
   if (!question) throw new Error('question obrigatório');
-  const rawOpts = Array.isArray(body.options) && body.options.length ? body.options : (kind === 'secret' ? ['Cancelar'] : ['Aprovar', 'Cancelar']);
-  const options = rawOpts.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 12);
+  const norm = questions
+    ? { labels: questions[0].options, items: questions[0].optionItems }
+    : normalizePromptOptions(body.options, kind === 'secret' ? ['Cancelar'] : ['Aprovar', 'Cancelar']);
+  const options = norm.labels;
   if (!options.length) throw new Error('options vazio');
   const callerBot = String(body.bot || '') || (running.get(chatId) && running.get(chatId).bot) || botOf(chats[chatId]).id;
   const p = {
@@ -2162,7 +2292,9 @@ function startPrompt(body) {
     topicKey: String(body.topicKey || '').trim().slice(0, 80),
     draft: String(body.draft || '').slice(0, 12000),
     actionPrompt: String(body.actionPrompt || '').slice(0, 8000),
-    title, question, options,
+    title, question, options, optionItems: norm.items,
+    multiSelect: Boolean(body.multiSelect || (questions && questions[0].multiSelect)),
+    ...(questions ? { questions } : {}),
     status: 'pending', answer: '', note: '', created: new Date().toISOString(), started: Date.now(),
   };
   p.promise = new Promise((resolve) => { p.resolve = resolve; });
@@ -2185,11 +2317,28 @@ function startPrompt(body) {
   }
   return p;
 }
-function answerPrompt(id, answer, note = '', via = 'panel', secretValue = '', pin = '') {
+function answerPrompt(id, answer, note = '', via = 'panel', secretValue = '', pin = '', extra = null) {
   const p = prompts.get(id);
   if (!p) throw new Error('cartão não encontrado');
   if (p.status !== 'pending') return promptView(p);
-  const ansText = String(answer || '').trim();
+  let structuredAnswers = extra && extra.answers !== undefined ? extra.answers : undefined;
+  let ansText = '';
+  if (Array.isArray(answer)) {
+    const cleanArr = answer.map((x) => String(x || '').trim()).filter(Boolean);
+    if (structuredAnswers === undefined) structuredAnswers = cleanArr;
+    ansText = cleanArr.join(', ');
+  } else {
+    ansText = String(answer || '').trim();
+  }
+  if (!ansText && Array.isArray(structuredAnswers)) {
+    ansText = structuredAnswers.map((a, i) => {
+      if (a && typeof a === 'object' && 'answer' in a) {
+        const v = Array.isArray(a.answer) ? a.answer.join(', ') : String(a.answer || '');
+        return (a.question ? a.question + ': ' : (i + 1) + ') ') + v;
+      }
+      return Array.isArray(a) ? a.join(', ') : String(a || '');
+    }).filter(Boolean).join(' | ');
+  }
   const isCancel = /^(cancel|recus|ignor|nao|não)/i.test(fold(ansText));
   if (p.requirePin && settings.securityPinHash && !isCancel && !verifySecurityPin(pin)) {
     throw new Error('PIN de segurança inválido ou ausente');
@@ -2207,6 +2356,7 @@ function answerPrompt(id, answer, note = '', via = 'panel', secretValue = '', pi
   }
   p.status = 'answered';
   p.answer = ansText;
+  if (structuredAnswers !== undefined) p.answers = structuredAnswers;
   p.note = String(note || '').trim();
   p.answeredAt = new Date().toISOString();
   audit({ action: 'prompt-answer', chatId: p.chatId, id: p.id, answer: p.kind === 'secret' ? '[protegido]' : p.answer.slice(0, 80), via });
@@ -2824,13 +2974,16 @@ const saveTickets = () => saveState('tickets', TICKETS_FILE, tickets);
 const ticketView = (t) => ({
   ...t,
   botName: t.bot && bots[t.bot] ? botLabel(bots[t.bot]) : '',
-  running: Boolean(t.chatId && running.has(t.chatId)),
+  running: Boolean((t.runChatId && running.has(t.runChatId)) || (t.chatId && running.has(t.chatId))),
+  interrupted: Boolean(t.interrupted),
+  autoFailCount: Number(t.autoFailCount || 0),
 });
 function createTicket(b, via = 'panel') {
   const title = String(b.title || '').trim().slice(0, 160);
   if (!title) throw new Error('title obrigatório');
   const now = new Date().toISOString();
   const nextAt = b.nextCheckAt ? new Date(b.nextCheckAt) : null;
+  const rawChatId = b.chatId ? String(b.chatId).trim().slice(0, 120) : '';
   const t = {
     id: crypto.randomBytes(3).toString('hex'),
     title,
@@ -2845,12 +2998,14 @@ function createTicket(b, via = 'panel') {
     notifyChatId: b.notifyChatId && chats[b.notifyChatId] ? String(b.notifyChatId) : '',
     maxRuns: Math.min(Math.max(Number(b.maxRuns) || 0, 0), 200),
     runCount: 0,
+    autoFailCount: 0,
+    interrupted: false,
     comments: [],
-    chatId: '',
+    chatId: rawChatId,
     created: now, updated: now,
   };
   tickets.push(t); saveTickets();
-  audit({ action: 'ticket-create', id: t.id, title: t.title, bot: t.bot, goal: t.goal, via });
+  audit({ action: 'ticket-create', id: t.id, title: t.title, bot: t.bot, goal: t.goal, chatId: t.chatId, via });
   return ticketView(t);
 }
 function patchTicket(id, b, via = 'panel') {
@@ -2858,9 +3013,15 @@ function patchTicket(id, b, via = 'panel') {
   if (!t) throw new Error('tarefa não encontrada');
   if ('title' in b && String(b.title || '').trim()) t.title = String(b.title).trim().slice(0, 160);
   if ('description' in b) t.description = String(b.description || '').trim().slice(0, 8000);
-  if ('status' in b && TICKET_STATUSES.includes(b.status)) t.status = b.status;
+  if ('status' in b && TICKET_STATUSES.includes(b.status)) {
+    t.status = b.status;
+    if (b.status !== 'in_progress') t.interrupted = false;
+    if (b.status === 'todo' || b.status === 'done') t.autoFailCount = 0;
+  }
   if ('priority' in b && TICKET_PRIORITIES.includes(b.priority)) t.priority = b.priority;
   if ('bot' in b) t.bot = b.bot && bots[b.bot] ? b.bot : '';
+  if ('chatId' in b) t.chatId = String(b.chatId || '').trim().slice(0, 120);
+  if ('interrupted' in b) t.interrupted = Boolean(b.interrupted);
   if ('goal' in b) t.goal = Boolean(b.goal);
   if ('doneCriteria' in b) t.doneCriteria = String(b.doneCriteria || '').trim().slice(0, 1000);
   if ('nextCheckAt' in b) {
@@ -2897,14 +3058,17 @@ function deleteTicket(id, via = 'panel') {
   audit({ action: 'ticket-delete', id: t.id, via });
   return { deleted: id };
 }
-function runTicket(id) {
+function runTicket(id, opts = {}) {
   const t = tickets.find((x) => x.id === id);
   if (!t) throw new Error('tarefa não encontrada');
   const botId = t.bot && bots[t.bot] ? t.bot : DEFAULT_BOT;
   const botObj = bots[botId];
-  const cid = t.chatId || ('deleg:ticket-' + t.id);
-  t.chatId = cid;
+  const wasInterrupted = Boolean(t.interrupted || opts.resume);
+  const cid = (t.chatId && !isWeb(t.chatId)) ? t.chatId : (t.runChatId || ('deleg:ticket-' + t.id));
+  if (!t.chatId) t.chatId = cid;
+  t.runChatId = cid;
   t.status = 'in_progress';
+  t.interrupted = false;
   t.runCount = (t.runCount || 0) + 1;
   t.updated = new Date().toISOString();
   saveTickets();
@@ -2914,6 +3078,9 @@ function runTicket(id) {
   c.created = c.created || new Date().toISOString();
   save();
   const history = (t.comments || []).slice(-10).map((cm) => '[' + cm.author + ']: ' + cm.text).join('\n');
+  const resumeExtra = wasInterrupted
+    ? '\nNOTA DE RETOMADA: esta tarefa foi interrompida anteriormente por reinício ou queda. Revise os comentários anteriores, verifique o estado atual no workspace e retome do ponto em que parou.'
+    : '';
   const goalExtra = t.goal
     ? '\nESTE E UM OBJETIVO CONTINUO (Goal, ciclo #' + t.runCount + (t.maxRuns ? '/' + t.maxRuns : '') + ').' +
       (t.doneCriteria ? '\nCriterio de conclusao: ' + t.doneCriteria : '') +
@@ -2924,6 +3091,7 @@ function runTicket(id) {
     'Título: ' + t.title + '\nPrioridade: ' + t.priority + '\n' +
     (t.description ? 'Descrição:\n' + t.description + '\n' : '') +
     (history ? 'Comentários anteriores:\n' + history + '\n' : '') +
+    resumeExtra +
     goalExtra +
     '\nExecute a tarefa com autonomia. Ao terminar, apresente um resumo objetivo do que foi feito e do resultado. Se precisar de intervenção humana, explique claramente o que falta.';
   enqueue(cid, async () => {
@@ -2935,21 +3103,135 @@ function runTicket(id) {
     if (!cur) return;
     const replyText = r.error ? 'Erro ao executar: ' + r.error : (r.text || '(sem resposta)');
     addTicketComment(id, botLabel(botObj), replyText, 'bot');
-    if (cur.goal && !r.error && cur.status === 'in_progress' && !cur.nextCheckAt && cur.checkIntervalMin > 0 && (!cur.maxRuns || (cur.runCount || 0) < cur.maxRuns)) {
-      cur.nextCheckAt = new Date(Date.now() + cur.checkIntervalMin * 60000).toISOString();
+    if (r.error) {
+      cur.autoFailCount = (cur.autoFailCount || 0) + 1;
+      if (opts.via === 'board-runner') {
+        if (cur.autoFailCount >= 2) {
+          cur.status = 'blocked';
+          addTicketComment(id, 'Auto-Executor', '⛔ Tarefa movida para Bloqueada após ' + cur.autoFailCount + ' falhas consecutivas. Último erro: ' + r.error, 'system');
+        } else {
+          cur.status = 'todo';
+        }
+      } else if (cur.status === 'in_progress') {
+        cur.status = 'blocked';
+      }
       cur.updated = new Date().toISOString();
       saveTickets();
-    } else if (cur.status === 'in_progress' && (!cur.goal || !cur.nextCheckAt)) {
-      cur.status = r.error ? 'blocked' : 'review';
-      cur.updated = new Date().toISOString();
-      saveTickets();
+    } else {
+      cur.autoFailCount = 0;
+      if (cur.goal && cur.status === 'in_progress' && !cur.nextCheckAt && cur.checkIntervalMin > 0 && (!cur.maxRuns || (cur.runCount || 0) < cur.maxRuns)) {
+        cur.nextCheckAt = new Date(Date.now() + cur.checkIntervalMin * 60000).toISOString();
+        cur.updated = new Date().toISOString();
+        saveTickets();
+      } else if (cur.status === 'in_progress' && (!cur.goal || !cur.nextCheckAt)) {
+        cur.status = 'review';
+        cur.updated = new Date().toISOString();
+        saveTickets();
+      }
     }
     if (cur.goal && cur.notifyChatId && chats[cur.notifyChatId] && !r.error) {
       reply(cur.notifyChatId, '🎯 *Objetivo #' + cur.id + ' — ' + cur.title + '* (' + cur.status + ')\n\n' + replyText.slice(0, 1500), false).catch(() => {});
     }
   });
-  audit({ action: 'ticket-run', id: t.id, bot: botId });
+  audit({ action: opts.resume ? 'ticket-resume' : 'ticket-run', id: t.id, bot: botId, via: opts.via || 'panel' });
   return ticketView(t);
+}
+
+// ---------- Board Auto-Executor (recurring queue scanner) ----------
+const TICKET_PRIO_RANK = { urgent: 0, high: 1, medium: 2, low: 3 };
+const boardRunnerState = { lastScanAt: '', nextScanAt: '', lastStartedTicketId: '', lastSkipReason: '', lastScanMs: 0 };
+function boardRunnerConfig() {
+  const r = (settings.boardRunner && typeof settings.boardRunner === 'object') ? settings.boardRunner : {};
+  return {
+    enabled: Boolean(r.enabled),
+    intervalMin: Math.min(1440, Math.max(1, Math.round(Number(r.intervalMin) || 10))),
+    defaultBot: (r.defaultBot && bots[r.defaultBot]) ? r.defaultBot : (bots.infra ? 'infra' : DEFAULT_BOT),
+    maxConcurrent: Math.min(5, Math.max(1, Math.round(Number(r.maxConcurrent) || 1))),
+    respectQuietHours: r.respectQuietHours !== false,
+    onlyAssigned: Boolean(r.onlyAssigned),
+  };
+}
+function activeTicketRuns() {
+  return tickets.filter((t) => (t.runChatId && running.has(t.runChatId)) || (t.chatId && running.has(t.chatId)));
+}
+function boardRunnerView() {
+  const cfg = boardRunnerConfig();
+  const active = activeTicketRuns();
+  return {
+    ...cfg,
+    lastScanAt: boardRunnerState.lastScanAt,
+    nextScanAt: cfg.enabled ? (boardRunnerState.nextScanAt || new Date(Date.now() + cfg.intervalMin * 60000).toISOString()) : '',
+    lastStartedTicketId: boardRunnerState.lastStartedTicketId,
+    lastSkipReason: boardRunnerState.lastSkipReason,
+    activeRuns: active.map((t) => ({ id: t.id, title: t.title, bot: t.bot || DEFAULT_BOT })),
+    queueCount: tickets.filter((t) => t.status === 'todo' && (!cfg.onlyAssigned || Boolean(t.bot))).length,
+  };
+}
+function updateBoardRunnerConfig(body) {
+  const cur = boardRunnerConfig();
+  const next = { ...cur };
+  if ('enabled' in body) next.enabled = Boolean(body.enabled);
+  if ('intervalMin' in body) next.intervalMin = Math.min(1440, Math.max(1, Math.round(Number(body.intervalMin) || 10)));
+  if ('defaultBot' in body) {
+    const bId = String(body.defaultBot || '').trim();
+    if (bId && !bots[bId]) throw new Error('bot padrão não encontrado: ' + bId);
+    next.defaultBot = bId || DEFAULT_BOT;
+  }
+  if ('maxConcurrent' in body) next.maxConcurrent = Math.min(5, Math.max(1, Math.round(Number(body.maxConcurrent) || 1)));
+  if ('respectQuietHours' in body) next.respectQuietHours = Boolean(body.respectQuietHours);
+  if ('onlyAssigned' in body) next.onlyAssigned = Boolean(body.onlyAssigned);
+  settings.boardRunner = next;
+  saveSettings();
+  boardRunnerState.nextScanAt = next.enabled ? new Date(Date.now() + next.intervalMin * 60000).toISOString() : '';
+  if (next.enabled) boardRunnerState.lastScanMs = 0; // allow next scheduler tick to scan promptly if enabled
+  audit({ action: 'board-runner-update', enabled: next.enabled, intervalMin: next.intervalMin, defaultBot: next.defaultBot, maxConcurrent: next.maxConcurrent });
+  return boardRunnerView();
+}
+function boardRunnerTick(manual = false) {
+  const cfg = boardRunnerConfig();
+  const now = Date.now();
+  if (!manual) {
+    if (!cfg.enabled) return { started: false, reason: 'disabled' };
+    if (boardRunnerState.lastScanMs && now - boardRunnerState.lastScanMs < cfg.intervalMin * 60000) {
+      return { started: false, reason: 'interval' };
+    }
+  }
+  boardRunnerState.lastScanMs = now;
+  boardRunnerState.lastScanAt = new Date(now).toISOString();
+  boardRunnerState.nextScanAt = cfg.enabled ? new Date(now + cfg.intervalMin * 60000).toISOString() : '';
+  if (!manual && cfg.respectQuietHours && inQuietHours()) {
+    boardRunnerState.lastSkipReason = 'quiet_hours';
+    return { started: false, reason: 'quiet_hours' };
+  }
+  const active = activeTicketRuns();
+  if (active.length >= cfg.maxConcurrent) {
+    boardRunnerState.lastSkipReason = 'max_concurrent';
+    return { started: false, reason: 'max_concurrent' };
+  }
+  const busyBots = new Set(active.map((t) => t.bot || cfg.defaultBot));
+  const candidates = tickets
+    .filter((t) => t.status === 'todo')
+    .filter((t) => !cfg.onlyAssigned || Boolean(t.bot))
+    .filter((t) => !((t.runChatId && running.has(t.runChatId)) || (t.chatId && running.has(t.chatId))))
+    .sort((a, b) => {
+      const pa = TICKET_PRIO_RANK[a.priority] ?? 2;
+      const pb = TICKET_PRIO_RANK[b.priority] ?? 2;
+      if (pa !== pb) return pa - pb;
+      return String(a.created || '').localeCompare(String(b.created || ''));
+    });
+  const picked = candidates.find((t) => !busyBots.has(t.bot || cfg.defaultBot));
+  if (!picked) {
+    boardRunnerState.lastSkipReason = candidates.length ? 'bot_busy' : 'empty_queue';
+    return { started: false, reason: boardRunnerState.lastSkipReason };
+  }
+  if (!picked.bot) {
+    picked.bot = cfg.defaultBot;
+    saveTickets();
+  }
+  runTicket(picked.id, { via: 'board-runner' });
+  boardRunnerState.lastStartedTicketId = picked.id;
+  boardRunnerState.lastSkipReason = '';
+  return { started: true, ticketId: picked.id, bot: picked.bot };
 }
 
 // ---------- live agent computer (Xvfb + fluxbox + x11vnc + websockify/noVNC + persistent Chromium) ----------
@@ -3960,6 +4242,27 @@ function recoverPendingJobs() {
       }
     }
   }
+  // Detect tickets left in_progress across a bridge restart/crash
+  let recovered = 0;
+  for (const tk of tickets) {
+    if (tk.status !== 'in_progress') continue;
+    if (tk.goal && tk.nextCheckAt) continue; // sleeping goal waiting for nextCheckAt is normal
+    const active = Boolean((tk.runChatId && running.has(tk.runChatId)) || (tk.chatId && running.has(tk.chatId)));
+    if (active || tk.interrupted) continue;
+    tk.interrupted = true;
+    const cm = {
+      id: crypto.randomBytes(3).toString('hex'),
+      author: 'Sistema',
+      text: '⚠️ Execução interrompida por reinício ou queda da ponte. Use "Retomar" para continuar de onde parou.',
+      at: new Date().toISOString(),
+      via: 'system',
+    };
+    tk.comments = [...(tk.comments || []), cm].slice(-100);
+    tk.updated = cm.at;
+    recovered += 1;
+    audit({ action: 'ticket-interrupted', id: tk.id });
+  }
+  if (recovered > 0) saveTickets();
 }
 
 setInterval(() => {
@@ -4007,7 +4310,34 @@ function listArtifacts() {
   };
   scan(INBOX, 'inbox');
   if (fs.existsSync(ARTIFACTS_DIR)) scan(ARTIFACTS_DIR, 'artifacts');
-  return items.sort((a, b) => b.created.localeCompare(a.created)).slice(0, 300);
+  const sorted = items.sort((a, b) => b.created.localeCompare(a.created));
+  return sorted.slice(0, 300);
+}
+function artifactKind(a) {
+  if (a.type && a.type.startsWith('image/')) return 'image';
+  if ((a.type && a.type.startsWith('audio/')) || a.voice) return 'audio';
+  return 'doc';
+}
+function deleteArtifactsBulk({ names = null, kind = '' } = {}) {
+  const allowedKinds = new Set(['image', 'audio', 'doc']);
+  const filterKind = allowedKinds.has(kind) ? kind : '';
+  const nameSet = Array.isArray(names) && names.length ? new Set(names.map((n) => path.basename(String(n || ''))).filter(Boolean)) : null;
+  const all = listArtifacts();
+  let deleted = 0, freedBytes = 0;
+  for (const item of all) {
+    if (filterKind && artifactKind(item) !== filterKind) continue;
+    if (nameSet && !nameSet.has(item.name)) continue;
+    const fp = artifactPath(item.name);
+    if (!fp) continue;
+    try {
+      const st = fs.statSync(fp);
+      fs.unlinkSync(fp);
+      deleted += 1;
+      freedBytes += st.size || 0;
+    } catch {}
+  }
+  audit({ action: 'artifacts-bulk-delete', deleted, freedBytes, kind: filterKind || 'all', via: 'panel' });
+  return { deleted, freedBytes };
 }
 function artifactPath(name) {
   const base = path.basename(String(name || ''));
@@ -4283,11 +4613,13 @@ function webSend(chatId, text, files = [], transcript = '') {
       delegLog.delete(chatId);
       const cards = promptLog.get(chatId) || [];
       promptLog.delete(chatId);
+      const parsedReply = (!r.stopped && !r.error) ? extractSuggestions(r.text || '') : { text: r.stopped ? '(interrompido)' : 'Erro: ' + r.error, suggestions: [] };
       webAppend(chatId, {
         role: 'assistant', provider, bot: who.id, tools, ...(delegations.length ? { delegations } : {}), ...(cards.length ? { prompts: cards } : {}),
-        text: r.stopped ? '(interrompido)' : r.error ? 'Erro: ' + r.error : r.text,
+        ...(parsedReply.suggestions.length ? { suggestions: parsedReply.suggestions } : {}),
+        text: parsedReply.text,
         error: Boolean(r.error), stopped: Boolean(r.stopped),
-        usage: { ms, cost: r.usage ? r.usage.cost : 0, turns: r.usage ? r.usage.turns : 0 },
+        usage: { ms, cost: r.usage ? r.usage.cost : 0, turns: r.usage ? r.usage.turns : 0, ...(r.usage && r.usage.estimated ? { estimated: true } : {}) },
       });
       if (r.stopped) break;
     }
@@ -4308,10 +4640,11 @@ function webSend(chatId, text, files = [], transcript = '') {
 // Every run appends one line to usage.jsonl. Claude's history before that file existed is rebuilt from
 // Claude Code's own transcripts (~/.claude/projects/**/*.jsonl), which carry token counts per message.
 const USAGE_FILE = path.join(DATA_DIR, 'usage.jsonl');
-function logUsage(provider, chatId, cost, ms, u) {
+function logUsage(provider, chatId, cost, ms, u, model) {
   try {
     u = u || {};
     const line = { at: new Date().toISOString(), provider, web: isWeb(chatId), cost: cost || 0, ms: ms || 0,
+      ...(model ? { model: String(model) } : {}),
       in: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0), out: (u.output_tokens || 0) + (u.thinking_tokens || 0),
       cacheRead: u.cache_read_input_tokens || u.cache_read_tokens || 0 };
     fs.appendFileSync(USAGE_FILE, JSON.stringify(line) + '\n');
@@ -4473,7 +4806,10 @@ function monthlySpendSummary() {
       if (!line) continue;
       let j; try { j = JSON.parse(line); } catch { continue; }
       if (j.at && dayKey(j.at).startsWith(ym)) {
-        monthSpendUsd += Number(j.cost) || 0;
+        const lineCost = (j.provider === 'antigravity' && !(Number(j.cost) > 0))
+          ? estimateAgyCost(j.model, { input_tokens: j.in, output_tokens: j.out, cache_read_tokens: j.cacheRead })
+          : (Number(j.cost) || 0);
+        monthSpendUsd += lineCost;
         monthRuns += 1;
       }
     }
@@ -4543,7 +4879,10 @@ async function usageReport(nDays = 56) {
     for (const line of fs.readFileSync(USAGE_FILE, 'utf8').split('\n')) {
       if (!line) continue; let j; try { j = JSON.parse(line); } catch { continue; }
       const d = ((log[dayKey(j.at)] ||= {})[j.provider] ||= { runs: 0, cost: 0, ms: 0, in: 0, out: 0, cacheRead: 0 });
-      d.runs += 1; d.cost += j.cost || 0; d.ms += j.ms || 0; d.in += j.in || 0; d.out += j.out || 0; d.cacheRead += j.cacheRead || 0;
+      const lineCost = (j.provider === 'antigravity' && !(Number(j.cost) > 0))
+        ? estimateAgyCost(j.model, { input_tokens: j.in, output_tokens: j.out, cache_read_tokens: j.cacheRead })
+        : (Number(j.cost) || 0);
+      d.runs += 1; d.cost += lineCost; d.ms += j.ms || 0; d.in += j.in || 0; d.out += j.out || 0; d.cacheRead += j.cacheRead || 0;
     }
   } catch {}
   const days = [];
@@ -4552,7 +4891,7 @@ async function usageReport(nDays = 56) {
     const tc = tdays[date], lc = log[date]?.claude, la = log[date]?.antigravity;
     days.push({ date,
       claude: { tokens: tc ? tc.in + tc.out : (lc ? lc.in + lc.out : 0), out: tc?.out || lc?.out || 0, cacheRead: tc?.cacheRead || lc?.cacheRead || 0, msgs: tc?.msgs || 0, runs: lc?.runs || 0, cost: lc?.cost || 0 },
-      antigravity: { tokens: la ? la.in + la.out : 0, out: la?.out || 0, cacheRead: la?.cacheRead || 0, runs: la?.runs || 0 } });
+      antigravity: { tokens: la ? la.in + la.out : 0, out: la?.out || 0, cacheRead: la?.cacheRead || 0, runs: la?.runs || 0, cost: Math.round((la?.cost || 0) * 1000000) / 1000000 } });
   }
   return { fetchedAt: new Date().toISOString(), claude, antigravity, days, tz: TZ, spending: monthlySpendSummary(), routineForecasts: routineForecasts(), historySince: { antigravity: fs.existsSync(USAGE_FILE) ? (fs.readFileSync(USAGE_FILE, 'utf8').slice(0, 40).match(/"at":"([^"]+)/) || [])[1] || null : null } };
 }
@@ -4616,6 +4955,168 @@ function localMemDelete(file) {
   try { fs.writeFileSync(idx, fs.readFileSync(idx, 'utf8').split('\n').filter((l) => !l.includes('(' + slug + ')')).join('\n')); } catch {}
 }
 
+// ---------- AI bot avatar generator (3D glossy vinyl/Pixar ghost via agy image-generator) ----------
+const AVATAR_COLOR_NAMES = {
+  '#0a84ff': 'vibrant electric blue',
+  '#30d158': 'fresh emerald green',
+  '#ff9f0a': 'warm bright orange',
+  '#ff375f': 'cheerful coral pink-red',
+  '#bf5af2': 'vivid lavender purple',
+  '#64d2ff': 'bright sky cyan blue',
+  '#ffd60a': 'sunny golden yellow',
+  '#8e8e93': 'sleek silver gray',
+  '#30b0c7': 'crisp teal turquoise',
+  '#5ac8fa': 'bright azure blue',
+  '#1c3f94': 'deep royal navy blue',
+  '#8e5cf7': 'cosmic violet purple',
+};
+let avatarGenQueue = Promise.resolve();
+const avatarGenInFlight = new Set(); // bot ids currently generating in background
+function buildBotAvatarPrompt(info = {}) {
+  const name = String(info.name || 'Bot').trim().slice(0, 60);
+  const desc = String(info.description || '').trim().slice(0, 240);
+  const instr = String(info.instructions || '').trim().slice(0, 300);
+  const hint = String(info.hint || '').trim().slice(0, 160);
+  const rawColor = String(info.color || '#0a84ff').trim().toLowerCase();
+  const colorName = AVATAR_COLOR_NAMES[rawColor] || ('color ' + rawColor);
+  const emoji = String(info.emoji || '').trim();
+  const contextBits = [
+    hint ? ('Specific thematic accessory or detail requested: ' + hint) : '',
+    name ? ('Bot name: ' + name) : '',
+    emoji ? ('Emoji hint: ' + emoji) : '',
+    desc ? ('Role: ' + desc) : '',
+    (!desc && instr) ? ('Context: ' + instr) : '',
+  ].filter(Boolean).join('. ');
+  return [
+    'Use the image-generator subagent to generate a single square 1:1 3D avatar icon and reply with ONLY the absolute path of the generated image file.',
+    'Style specification (follow strictly):',
+    '- Cute glossy 3D vinyl toy / Pixar-style friendly little ghost mascot character with small rounded cat-like ears on top of its head, big glossy black eyes with soft catchlights, and a warm friendly smile.',
+    '- Primary body color: ' + colorName + ' (' + rawColor + ').',
+    '- Include ONE clear, charming thematic 3D accessory matching the bot role (' + contextBits + ').',
+    '- Smooth solid soft dark-neutral or harmonious pastel studio backdrop, centered portrait composition, soft studio rim lighting, clean glossy vinyl texture.',
+    '- NO text, NO letters, NO numbers, NO watermarks, NO UI chrome.',
+  ].join('\n');
+}
+function isValidImageFile(fp) {
+  try {
+    const fd = fs.openSync(fp, 'r');
+    const buf = Buffer.alloc(12);
+    const n = fs.readSync(fd, buf, 0, 12, 0);
+    fs.closeSync(fd);
+    if (n < 4) return false;
+    // JPEG (ff d8 ff), PNG (89 50 4e 47), WEBP (52 49 46 46 ... 57 45 42 50)
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true;
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return true;
+    if (n >= 12 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return true;
+    return false;
+  } catch { return false; }
+}
+function findGeneratedAvatarFile(text, convId, sinceMs) {
+  const candidates = [];
+  const matches = String(text || '').match(/\/[^\s"'`<>()[\]]+\.(?:jpe?g|png|webp)/gi) || [];
+  for (const m of matches) {
+    if (fs.existsSync(m) && isValidImageFile(m)) candidates.push({ fp: m, mt: fs.statSync(m).mtimeMs });
+  }
+  const brainRoot = path.join(HOME_DIR, '.gemini', 'antigravity-cli', 'brain');
+  const dirs = [];
+  if (convId) dirs.push(path.join(brainRoot, String(convId).replace(/[^\w-]/g, '')));
+  if (fs.existsSync(brainRoot)) {
+    try {
+      for (const e of fs.readdirSync(brainRoot, { withFileTypes: true })) {
+        if (!e.isDirectory()) continue;
+        const full = path.join(brainRoot, e.name);
+        try { if (fs.statSync(full).mtimeMs >= sinceMs - 5000) dirs.push(full); } catch {}
+      }
+    } catch {}
+  }
+  const seen = new Set();
+  for (const d of dirs) {
+    if (seen.has(d) || !fs.existsSync(d)) continue;
+    seen.add(d);
+    try {
+      for (const f of fs.readdirSync(d)) {
+        if (!/\.(?:jpe?g|png|webp)(?![\s\S])/i.test(f)) continue;
+        const fp = path.join(d, f);
+        let st; try { st = fs.statSync(fp); } catch { continue; }
+        if (st.isFile() && st.mtimeMs >= sinceMs - 2000 && isValidImageFile(fp)) {
+          candidates.push({ fp, mt: st.mtimeMs });
+        }
+      }
+    } catch {}
+  }
+  candidates.sort((a, b) => b.mt - a.mt);
+  return candidates[0] ? candidates[0].fp : '';
+}
+async function convertAvatarToDataUri(srcPath) {
+  const tmpDir = path.join(DATA_DIR, 'tmp-avatars');
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const outPath = path.join(tmpDir, 'av-' + crypto.randomBytes(6).toString('hex') + '.jpg');
+  try {
+    let quality = 4;
+    let uri = '';
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const ff = await execCmd('ffmpeg', ['-y', '-loglevel', 'error', '-i', srcPath, '-vf', 'crop=min(iw\\,ih):min(iw\\,ih),scale=256:256', '-q:v', String(quality), outPath], 30000);
+      if (ff.code === 0 && fs.existsSync(outPath) && isValidImageFile(outPath)) {
+        const buf = fs.readFileSync(outPath);
+        uri = 'data:image/jpeg;base64,' + buf.toString('base64');
+        if (uri.length <= 118000) return { avatar: uri, bytes: buf.length };
+        quality += 4;
+      } else {
+        break;
+      }
+    }
+    // Fallback: if ffmpeg is unavailable and source is already a small JPEG
+    const raw = fs.readFileSync(srcPath);
+    if (raw.length >= 3 && raw[0] === 0xff && raw[1] === 0xd8 && raw[2] === 0xff) {
+      const uriRaw = 'data:image/jpeg;base64,' + raw.toString('base64');
+      if (uriRaw.length <= 120000) return { avatar: uriRaw, bytes: raw.length };
+    }
+    throw new Error('falha ao converter avatar para JPEG 256x256 dentro do limite de tamanho');
+  } finally {
+    try { fs.unlinkSync(outPath); } catch {}
+  }
+}
+function generateBotAvatar(info = {}) {
+  const job = avatarGenQueue.then(async () => {
+    const bin = env.AVATAR_GEN_BIN || AGY_BIN;
+    if (!fs.existsSync(bin)) throw new Error('Antigravity CLI (agy) não encontrado em ' + bin);
+    const prompt = buildBotAvatarPrompt(info);
+    const sinceMs = Date.now();
+    const runAgyStep = (args) => execCmd(bin, args, 150000);
+    const baseArgs = ['-p', prompt, '--output-format', 'json'];
+    if (PERMISSION_MODE === 'bypassPermissions') baseArgs.push('--dangerously-skip-permissions');
+    const r1 = await runAgyStep(baseArgs);
+    let convId = '';
+    let respText = r1.out || '';
+    try {
+      const j = JSON.parse(r1.out || '{}');
+      convId = j.conversation_id || '';
+      respText = j.response || r1.out || '';
+      if (j.status && j.status !== 'SUCCESS' && !respText) throw new Error('Antigravity: ' + j.status);
+    } catch (e) {
+      if (r1.code !== 0 && !respText) throw new Error('agy falhou: ' + (r1.err || r1.out || e.message).slice(-300));
+    }
+    let imgPath = findGeneratedAvatarFile(respText, convId, sinceMs);
+    // The image-generator subagent runs asynchronously; follow up in the same conversation if needed.
+    for (let step = 0; !imgPath && step < 3; step++) {
+      await new Promise((res) => setTimeout(res, 2500));
+      imgPath = findGeneratedAvatarFile('', convId, sinceMs);
+      if (imgPath) break;
+      if (!convId) break;
+      const followArgs = ['--conversation', convId, '-p', 'Aguarde o subagente image-generator terminar e responda apenas com o caminho absoluto do arquivo de imagem gerado.', '--output-format', 'json'];
+      if (PERMISSION_MODE === 'bypassPermissions') followArgs.push('--dangerously-skip-permissions');
+      const rNext = await runAgyStep(followArgs);
+      let nextText = rNext.out || '';
+      try { nextText = JSON.parse(rNext.out || '{}').response || nextText; } catch {}
+      imgPath = findGeneratedAvatarFile(nextText, convId, sinceMs);
+    }
+    if (!imgPath) throw new Error('Não foi possível localizar a imagem gerada pelo Antigravity (timeout ou falha no image-generator)');
+    return convertAvatarToDataUri(imgPath);
+  });
+  avatarGenQueue = job.catch(() => {});
+  return job;
+}
+
 // ---------- admin API for the Agent Control panel ----------
 // Reached over the private coolify network at http://claude-bridge-claude-zap:3000/admin/...
 // Every call needs "Authorization: Bearer <BRIDGE_ADMIN_TOKEN>". Without that variable the API is off.
@@ -4675,7 +5176,7 @@ function chatView(id) {
   const c = chats[id] || {};
   const r = running.get(id);
   const lastRunAt = (c.runs && c.runs.at(-1) && c.runs.at(-1).at) || '';
-  const unread = Boolean(isWeb(id) && lastRunAt && (!c.readAt || lastRunAt > c.readAt));
+  const unread = Boolean(isWeb(id) && !c.archived && lastRunAt && (!c.readAt || lastRunAt > c.readAt));
   return {
     id, kind: isWeb(id) ? 'web' : isDeleg(id) ? 'delegation' : 'whatsapp', members: Array.isArray(c.members) ? c.members : [], title: c.title || (isWeb(id) ? 'Conversa web' : id.split('@')[0]),
     provider: providerOf(c), providerSet: Boolean(c.provider), bot: botOf(c).id, effModel: runConfig(c).model || '', effEffort: runConfig(c).effort || '',
@@ -4875,6 +5376,7 @@ async function handleAdmin(req, res, u, raw) {
         aiMemory: { status: aiMemory.status, restarts: aiMemory.restarts }, allowed: ALLOWED.length,
         settings: safeSettingsView(),
         running: [...running.entries()].map(([id, r]) => ({ chatId: id, started: r.started, prompt: r.prompt })),
+        webRunning: [...running.entries()].filter(([id]) => isWeb(id) && !(chats[id] && chats[id].archived)).map(([id, r]) => ({ chatId: id, started: r.started, prompt: r.prompt })),
         chats: Object.keys(chats).filter((id) => !isDeleg(id) && !isTaskChat(id)).length, schedules: schedules.length, bots: Object.keys(bots).length, pages: Object.keys(pages).length,
         skills: Object.keys(skills).length, tickets: tickets.length,
         openTickets: tickets.filter((t) => t.status !== 'done').length,
@@ -4888,7 +5390,7 @@ async function handleAdmin(req, res, u, raw) {
         localDevices: localBridgeDevices(),
         securityPinSet: Boolean(settings.securityPinHash),
         computer: { status: computer.status, control: computer.control, needsHuman: Boolean(computer.needsHuman.active) },
-        unread: Object.keys(chats).filter((id) => isWeb(id) && chatView(id).unread).length,
+        unread: Object.keys(chats).filter((id) => isWeb(id) && !(chats[id] && chats[id].archived) && chatView(id).unread).length,
         pendingPrompts: [...prompts.values()].filter((p) => p.status === 'pending').length });
     }
     if (a === 'pages') {
@@ -4989,6 +5491,17 @@ async function handleAdmin(req, res, u, raw) {
         if ('pauseRoutinesOnLimit' in sp) cur.pauseRoutinesOnLimit = Boolean(sp.pauseRoutinesOnLimit);
         settings.spending = cur;
       }
+      if ('agyPricing' in body) {
+        if (!body.agyPricing) delete settings.agyPricing;
+        else if (typeof body.agyPricing === 'object') {
+          const clean = {};
+          for (const [k, v] of Object.entries(body.agyPricing)) {
+            if (!v || typeof v !== 'object') continue;
+            clean[String(k).slice(0, 80)] = { in: Math.max(0, Number(v.in) || 0), out: Math.max(0, Number(v.out) || 0), cacheRead: Math.max(0, Number(v.cacheRead) || 0) };
+          }
+          settings.agyPricing = clean;
+        }
+      }
       if ('securityPin' in body) {
         if (!body.securityPin) delete settings.securityPinHash;
         else {
@@ -5026,6 +5539,16 @@ async function handleAdmin(req, res, u, raw) {
               throw new Error('páginas inválidas na barra inferior');
             }
             cur.dock = clean;
+          }
+        }
+        if ('profile' in body) {
+          if (body.profile === null || body.profile === undefined) {
+            delete cur.profile;
+          } else if (typeof body.profile === 'object') {
+            const name = String(body.profile.name || '').trim().slice(0, 120);
+            const picture = String(body.profile.picture || '').trim().slice(0, 1000);
+            if (picture && !/^https?:\/\//i.test(picture)) throw new Error('picture inválida');
+            cur.profile = { ...(cur.profile || {}), ...(name ? { name } : {}), ...(picture ? { picture } : {}) };
           }
         }
         settings.userPrefs = settings.userPrefs || {};
@@ -5097,7 +5620,7 @@ async function handleAdmin(req, res, u, raw) {
       return send(200, list);
     }
     if (a === 'prompts' && b && (c2 === 'answer' || !c2) && m === 'POST') {
-      return send(200, answerPrompt(b, body.answer, body.note, 'panel', body.secretValue || '', body.pin || ''));
+      return send(200, answerPrompt(b, body.answer, body.note, 'panel', body.secretValue || '', body.pin || '', { answers: body.answers }));
     }
     if (a === 'web' && b && c2 === 'tts' && m === 'POST') {
       const id = 'web:' + b;
@@ -5175,8 +5698,14 @@ async function handleAdmin(req, res, u, raw) {
       if (b === 'templates' && m === 'GET') return send(200, BOT_TEMPLATES);
       if (b === 'from-template' && m === 'POST') return send(200, createBotFromTemplate(body.templateId, body.chatId));
       if (b === 'import' && m === 'POST') return send(200, importBotRecipe(body.recipe !== undefined ? body.recipe : body, body.chatId));
+      if (b === 'generate-avatar' && m === 'POST') {
+        const resAv = await generateBotAvatar(body);
+        audit({ action: 'bot-avatar-generate', preview: String(body.name || '').slice(0, 40), bytes: resAv.bytes, via: 'panel' });
+        return send(200, resAv);
+      }
       if (!b && m === 'GET') {
         return send(200, Object.values(bots).map((x) => ({ ...x, isDefault: x.id === DEFAULT_BOT,
+          avatarGenerating: avatarGenInFlight.has(x.id),
           chats: Object.values(chats).filter((c) => botOf(c).id === x.id).length,
           routines: schedules.filter((r) => (r.bot || botOf(chats[r.chatId]).id) === x.id).length,
           skills: Object.values(skills).filter((s) => s.bot === x.id).length,
@@ -5185,6 +5714,34 @@ async function handleAdmin(req, res, u, raw) {
       if (!b && m === 'POST') return send(200, createBot(body));
       const bt = bots[b];
       if (!bt) return send(404, { error: 'bot não encontrado' });
+      if (c2 === 'generate-avatar' && m === 'POST') {
+        const info = { name: bt.name, description: bt.description, instructions: bt.instructions, color: bt.color, emoji: bt.emoji, ...body };
+        if (body.async) {
+          if (!avatarGenInFlight.has(bt.id)) {
+            avatarGenInFlight.add(bt.id);
+            generateBotAvatar(info).then((resAv) => {
+              if (bots[bt.id]) {
+                bots[bt.id].avatar = resAv.avatar;
+                bots[bt.id].updated = new Date().toISOString();
+                saveBots();
+                audit({ action: 'bot-avatar-generated', id: bt.id, bytes: resAv.bytes, async: true });
+              }
+            }).catch((e) => {
+              log('async bot avatar failed for', bt.id, e.message);
+              audit({ action: 'bot-avatar-error', id: bt.id, error: e.message });
+            }).finally(() => avatarGenInFlight.delete(bt.id));
+          }
+          return send(202, { started: true, id: bt.id });
+        }
+        const resAv = await generateBotAvatar(info);
+        if (body.save !== false) {
+          bt.avatar = resAv.avatar;
+          bt.updated = new Date().toISOString();
+          saveBots();
+        }
+        audit({ action: 'bot-avatar-generated', id: bt.id, bytes: resAv.bytes, via: 'panel' });
+        return send(200, { ...resAv, bot: bt });
+      }
       if (c2 === 'export' && m === 'GET') return send(200, exportBotRecipe(bt.id));
       if (!c2 && m === 'PATCH') { botPatch(bt, body, 'panel'); saveBots(); audit({ action: 'bot-update', id: bt.id, via: 'panel' }); return send(200, bt); }
       if (!c2 && m === 'DELETE') {
@@ -5233,12 +5790,16 @@ async function handleAdmin(req, res, u, raw) {
       if (b && m === 'DELETE') return send(200, deleteSecret(b, 'panel'));
     }
     if (a === 'tickets') {
+      if (b === 'runner' && !c2 && m === 'GET') return send(200, boardRunnerView());
+      if (b === 'runner' && !c2 && m === 'PUT') return send(200, updateBoardRunnerConfig(body));
+      if (b === 'runner' && c2 === 'tick' && m === 'POST') return send(200, { ...boardRunnerTick(true), runner: boardRunnerView() });
       if (!b && m === 'GET') return send(200, tickets.map(ticketView).sort((x, y) => String(y.updated).localeCompare(String(x.updated))));
       if (!b && m === 'POST') return send(200, createTicket(body, 'panel'));
       if (b && !c2 && m === 'PATCH') return send(200, patchTicket(b, body, 'panel'));
       if (b && !c2 && m === 'DELETE') return send(200, deleteTicket(b, 'panel'));
       if (b && c2 === 'comment' && m === 'POST') return send(200, addTicketComment(b, body.author || 'Usuário', body.text, 'panel'));
       if (b && c2 === 'run' && m === 'POST') return send(200, runTicket(b));
+      if (b && c2 === 'resume' && m === 'POST') return send(200, runTicket(b, { resume: true }));
     }
     if (a === 'computer') {
       if (b === 'status' && m === 'GET') return send(200, computerStatus());
@@ -5273,6 +5834,10 @@ async function handleAdmin(req, res, u, raw) {
     }
     if (a === 'artifacts') {
       if (!b && m === 'GET') return send(200, listArtifacts());
+      if (!b && m === 'DELETE') {
+        const resDel = deleteArtifactsBulk({ names: Array.isArray(body.names) ? body.names : null, kind: u.searchParams.get('kind') || body.kind || '' });
+        return send(200, resDel);
+      }
       if (b === 'file' && c2 && m === 'GET') {
         const fp = artifactPath(c2);
         if (!fp) return send(404, { error: 'arquivo não encontrado' });
@@ -5540,7 +6105,7 @@ const server = http.createServer((req, res) => {
           const p = prompts.get(id);
           if (!p) throw new Error('cartão não encontrado');
           out = await waitPrompt(p, u.searchParams.get('wait') || 0);
-        } else if (id && req.method === 'POST') out = answerPrompt(id, b.answer, b.note, 'agent');
+        } else if (id && req.method === 'POST') out = answerPrompt(id, b.answer, b.note, 'agent', '', '', { answers: b.answers });
         else throw new Error('cartão não encontrado ou método não suportado');
         res.writeHead(200, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify(out, null, 2));

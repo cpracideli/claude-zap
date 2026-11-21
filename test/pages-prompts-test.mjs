@@ -30,6 +30,25 @@ if (p.includes('ASK_PROMPT')) {
   const j = await r.json();
   extra = ' PROMPT_ANS=' + j.answer + (j.note ? '(' + j.note + ')' : '');
 }
+if (p.includes('ASK_RICH')) {
+  const r = await fetch('http://127.0.0.1:${PORT}/prompts', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chatId: process.env.WA_CHAT_ID, title: 'Arquitetura',
+      multiSelect: true,
+      questions: [
+        { question: 'Quais módulos ativar?', multiSelect: true, options: [{ label: 'Cache', description: 'Redis local', recommended: true }, { label: 'Fila', description: 'Worker async' }] },
+        { question: 'Ambiente?', options: [{ label: 'Staging', recommended: true }, { label: 'Prod' }] }
+      ],
+      wait: 20
+    })
+  });
+  const j = await r.json();
+  extra = ' RICH_ANS=' + JSON.stringify(j.answers || j.answer);
+}
+if (p.includes('WITH_SUG')) {
+  extra = '\\n\\n\`\`\`suggestions\\n[{"label":"Fazer deploy","description":"Publica agora"},{"label":"Ver diff"}]\\n\`\`\`';
+}
 console.log(JSON.stringify({ type: 'result', result: 'OK:' + p.slice(0, 30) + extra, session_id: 's1', is_error: false, num_turns: 1, duration_ms: 10, total_cost_usd: 0 }));
 process.exit(0);
 `);
@@ -135,6 +154,43 @@ try {
   await wa('1'); // picks option 1 ("Aprovar")
   const waAns = await until(() => sent.find((x) => x.includes('PROMPT_ANS=Aprovar')));
   check('whatsapp numeric reply answers prompt and unblocks agent', Boolean(waAns), sent);
+
+  // --- Rich AskUserQuestion prompts (options objects, multiSelect, questions) ---
+  const cRich = (await api('POST', '/web', { title: 'Rich Prompt Chat' })).body;
+  await api('POST', '/web/' + cRich.id.slice(4) + '/messages', { text: 'ASK_RICH' });
+  const richPending = await until(async () => {
+    const ch = (await api('GET', '/chats')).body.find((x) => x.id === cRich.id);
+    return ch && ch.pendingPrompt;
+  });
+  check('rich prompt exposes optionItems, multiSelect and questions', richPending
+    && Array.isArray(richPending.optionItems) && richPending.optionItems[0].recommended === true && richPending.optionItems[0].description === 'Redis local'
+    && richPending.multiSelect === true && Array.isArray(richPending.questions) && richPending.questions.length === 2, richPending);
+  r = await api('POST', '/prompts/' + richPending.id + '/answer', {
+    answer: '1) Cache, Fila | 2) Staging',
+    answers: [{ question: 'Quais módulos ativar?', answer: ['Cache', 'Fila'] }, { question: 'Ambiente?', answer: 'Staging' }],
+  });
+  check('rich prompt answered with structured answers', r.status === 200 && Array.isArray(r.body.answers) && r.body.answers.length === 2, r.body);
+  const richRep = await until(async () => {
+    const ms = (await api('GET', '/web/' + cRich.id.slice(4) + '/messages?read=0')).body.messages;
+    return ms.find((m) => m.role === 'assistant');
+  });
+  check('agent received structured rich answers', richRep && richRep.text.includes('RICH_ANS=') && richRep.text.includes('Staging'), richRep);
+
+  // --- Archived chat excluded from overview.unread + webRunning exposed ---
+  const ovBeforeArch = (await api('GET', '/overview')).body;
+  check('unread counts unarchived unread web chat & exposes webRunning', ovBeforeArch.unread >= 1 && Array.isArray(ovBeforeArch.webRunning), ovBeforeArch);
+  await api('PATCH', '/chats/' + encodeURIComponent(cRich.id), { archived: true });
+  const ovAfterArch = (await api('GET', '/overview')).body;
+  check('archived chat excluded from overview.unread', ovAfterArch.unread === 0, ovAfterArch);
+
+  // --- Non-blocking quick-reply suggestions ---
+  const cSug = (await api('POST', '/web', { title: 'Suggestions Chat' })).body;
+  await api('POST', '/web/' + cSug.id.slice(4) + '/messages', { text: 'WITH_SUG' });
+  const sugRep = await until(async () => {
+    const ms = (await api('GET', '/web/' + cSug.id.slice(4) + '/messages')).body.messages;
+    return ms.find((m) => m.role === 'assistant');
+  });
+  check('suggestions block parsed and stripped from text', sugRep && !sugRep.text.includes('```suggestions') && Array.isArray(sugRep.suggestions) && sugRep.suggestions.length === 2 && sugRep.suggestions[0].label === 'Fazer deploy', sugRep);
 
 } catch (err) {
   console.log('FAIL exception', err.stack);

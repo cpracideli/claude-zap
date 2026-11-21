@@ -37,7 +37,8 @@ if (m) {
   deleg = ' DELEG=' + (j.answer || j.error);
 }
 const ctx = p.includes('Contexto recente') ? ' ctx=' + (p.match(/^(Claude|Tradutor|Pesquisador): R\\[/m) ? 'saw-' + p.match(/^(Claude|Tradutor|Pesquisador): R\\[/m)[1] : 'none') : '';
-const text = 'R[' + me + '] ' + p.split('\\n').slice(-1)[0].slice(0, 60) + (msgs.length > 1 ? ' injected=' + msgs.slice(1).map((x) => x.split('\\n').slice(-1)[0]).join('|') : '') + ctx + deleg;
+const modTag = (get('--model') ? ' mod=' + get('--model') : '') + (get('--effort') ? ' eff=' + get('--effort') : '');
+const text = 'R[' + me + '] ' + p.split('\\n').slice(-1)[0].slice(0, 60) + modTag + (msgs.length > 1 ? ' injected=' + msgs.slice(1).map((x) => x.split('\\n').slice(-1)[0]).join('|') : '') + ctx + deleg;
 console.log(JSON.stringify({ type: 'result', result: text, session_id: 'sess-' + me, is_error: false, num_turns: 1, duration_ms: 10, total_cost_usd: 0 }));
 process.exit(0);
 `);
@@ -153,6 +154,24 @@ try {
   const done = await fetch(base + '/asks/' + pr.id + '?wait=10').then((x) => x.json());
   check('long poll returns the answer', done.status === 'done' && done.answer.includes('R[Pesquisador]'), done);
   check('ask needs a known from', (await fetch(base + '/bots/pesquisador/ask', { method: 'POST', body: JSON.stringify({ from: 'x', question: 'q' }) })).status === 400);
+
+  // --- inheritance on @mention and delegation ---
+  await api('PATCH', '/bots/default', { model: 'opus', effort: 'high' });
+  await api('PATCH', '/bots/pesquisador', { model: 'haiku' }); // explicit own model
+  // tradutor has no own model -> inherits chat override or default bot
+  const cInh = await newChat();
+  await say(cInh.id, '@tradutor herdar do default');
+  rep = await replies(cInh.id, 1);
+  check('@mention inherited bot falls back to default bot config', rep && rep[0].text.includes('mod=opus') && rep[0].text.includes('eff=high'), rep);
+  await api('PATCH', '/chats/' + encodeURIComponent(cInh.id), { model: 'sonnet', effort: 'low' });
+  await say(cInh.id, '@tradutor herdar do chat');
+  rep = await replies(cInh.id, 2);
+  check('@mention inherited bot uses chat override', rep && rep[1].text.includes('mod=sonnet') && rep[1].text.includes('eff=low'), rep);
+  // delegation to inherited bot copies chat/caller override; delegation to bot with own model respects own model
+  const dInh = await fetch(base + '/bots/tradutor/ask', { method: 'POST', body: JSON.stringify({ from: cInh.id, question: 'deleg herdada', wait: 10 }) }).then((x) => x.json());
+  check('delegation to inherited bot inherits chat config', dInh.status === 'done' && dInh.answer.includes('mod=sonnet') && dInh.answer.includes('eff=low'), dInh);
+  const dOwn = await fetch(base + '/bots/pesquisador/ask', { method: 'POST', body: JSON.stringify({ from: cInh.id, question: 'deleg proprio', wait: 10 }) }).then((x) => x.json());
+  check('delegation to bot with own model respects target model', dOwn.status === 'done' && dOwn.answer.includes('mod=haiku') && dOwn.answer.includes('eff=low'), dOwn);
 } catch (err) {
   console.log('FAIL exception', err.stack);
   failed++;

@@ -173,6 +173,31 @@ try {
   r = await local('POST', '/schedules', { chatId: c1.id, prompt: 'p', webhook: true });
   check('agent can create webhook routine', r.hookToken && r.webhook, r);
 
+  // --- inheritance: chat -> bot -> default bot (Agent) -> global ---
+  await api('PATCH', '/bots/default', { model: 'opus', effort: 'high' });
+  const rInh = await api('POST', '/bots', { name: 'Herdado', emoji: '🧬', description: 'herda config' });
+  const HBOT = rInh.body.id;
+  const cInh = (await api('POST', '/web', { bot: HBOT })).body;
+  await api('POST', '/web/' + cInh.id.slice(4) + '/messages', { text: 'heranca direta' });
+  e = echo(await until(() => lastWeb(cInh.id)));
+  check('inherited bot direct chat falls back to default bot config', e.model === 'opus' && e.effort === 'high', e);
+  // Routine with inherited bot on chat without override -> falls back to default bot
+  const rRt1 = await api('POST', '/schedules', { chatId: c1.id, prompt: 'rotina heranca 1', description: 'inh1', webhook: true, bot: HBOT });
+  const beforeRt1 = (await api('GET', '/web/' + c1.id.slice(4) + '/messages')).body.messages.length;
+  await api('POST', '/schedules/' + rRt1.body.id + '/run');
+  m = await until(async () => { const ms = (await api('GET', '/web/' + c1.id.slice(4) + '/messages')).body.messages; return ms.length > beforeRt1 ? ms.at(-1) : null; });
+  e = m ? echo({ text: m.text.replace(/^⏰ /, '') }) : {};
+  check('inherited bot routine falls back to default bot config', e.model === 'opus' && e.effort === 'high', e);
+  // Routine with inherited bot on chat WITH override -> inherits chat override
+  await api('PATCH', '/chats/' + encodeURIComponent(c1.id), { model: 'haiku', effort: 'low' });
+  const beforeRt2 = (await api('GET', '/web/' + c1.id.slice(4) + '/messages')).body.messages.length;
+  await api('POST', '/schedules/' + rRt1.body.id + '/run');
+  m = await until(async () => { const ms = (await api('GET', '/web/' + c1.id.slice(4) + '/messages')).body.messages; return ms.length > beforeRt2 ? ms.at(-1) : null; });
+  e = m ? echo({ text: m.text.replace(/^⏰ /, '') }) : {};
+  check('inherited bot routine uses chat override before default bot', e.model === 'haiku' && e.effort === 'low', e);
+  await api('DELETE', '/bots/' + HBOT);
+  await api('PATCH', '/bots/default', { model: '', effort: '' });
+
   // delete bot -> chats and routines fall back to default
   check('default bot cannot be deleted', (await api('DELETE', '/bots/default')).status === 400);
   await api('PATCH', '/schedules/' + H.id, { bot: B });
