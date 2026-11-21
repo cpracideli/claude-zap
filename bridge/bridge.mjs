@@ -911,7 +911,8 @@ async function getCopilotToken() {
 async function runCopilot(chatId, prompt, opts, onActivity, onEvent) {
   const token = await getCopilotToken();
   return new Promise((resolve) => {
-    const args = ['-p', prompt, '--output-format', 'json', '--silent', '--no-auto-update', '--no-ask-user', '--trust-folder'];
+    const args = ['-p', prompt, '--output-format', 'json', '--silent', '--no-auto-update', '--no-ask-user'];
+    if (!opts.resume) args.push('--trust-folder');
     if (fs.existsSync(MEMORY_DIR)) args.push('--add-dir', MEMORY_DIR);
     if (PERMISSION_MODE === 'bypassPermissions' && !opts.readOnly) args.push('--allow-all');
     if (opts.model && opts.model !== 'auto') args.push('--model', opts.model);
@@ -6278,10 +6279,11 @@ async function usageReport(nDays = 56) {
   const days = [];
   for (let i = nDays - 1; i >= 0; i--) {
     const date = dayKey(Date.now() - i * 86400000);
-    const tc = tdays[date], lc = log[date]?.claude, la = log[date]?.antigravity;
+    const tc = tdays[date], lc = log[date]?.claude, la = log[date]?.antigravity, lcp = log[date]?.copilot;
     days.push({ date,
       claude: { tokens: tc ? tc.in + tc.out : (lc ? lc.in + lc.out : 0), out: tc?.out || lc?.out || 0, cacheRead: tc?.cacheRead || lc?.cacheRead || 0, msgs: tc?.msgs || 0, runs: lc?.runs || 0, cost: lc?.cost || 0 },
-      antigravity: { tokens: la ? la.in + la.out : 0, out: la?.out || 0, cacheRead: la?.cacheRead || 0, runs: la?.runs || 0, cost: Math.round((la?.cost || 0) * 1000000) / 1000000 } });
+      antigravity: { tokens: la ? la.in + la.out : 0, out: la?.out || 0, cacheRead: la?.cacheRead || 0, runs: la?.runs || 0, cost: Math.round((la?.cost || 0) * 1000000) / 1000000 },
+      copilot: { tokens: lcp ? lcp.in + lcp.out : 0, out: lcp?.out || 0, cacheRead: lcp?.cacheRead || 0, runs: lcp?.runs || 0 } });
   }
   return { fetchedAt: new Date().toISOString(), claude, antigravity, days, tz: TZ, spending: monthlySpendSummary(), routineForecasts: routineForecasts(), historySince: { antigravity: fs.existsSync(USAGE_FILE) ? (fs.readFileSync(USAGE_FILE, 'utf8').slice(0, 40).match(/"at":"([^"]+)/) || [])[1] || null : null } };
 }
