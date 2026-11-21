@@ -230,7 +230,8 @@ function runConfig(c, botId) {
     model: pick('model', defModel()),
     effort: pick('effort', defEffort()),
     agy: { agyModel: pick('agyModel', ''), agyEffort: pick('agyEffort', '') },
-    oc: { ocModel: pick('ocModel', '') },
+    // The web panel's model picker writes chat.model; OpenCode ids always contain a provider prefix (opencode/...).
+    oc: { ocModel: pick('ocModel', '') || (String(pick('model', '')).includes('/') ? String(pick('model', '')) : '') },
   };
 }
 const providerOf = (c) => runConfig(c).provider;
