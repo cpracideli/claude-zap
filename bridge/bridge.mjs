@@ -1666,7 +1666,7 @@ async function handlePollVote(payload) {
       return;
     }
     answerPrompt(p.id, picked, '', 'whatsapp-poll');
-    remember(entry.chatId, 'user', picked);
+    if (p.chatId === entry.chatId) remember(entry.chatId, 'user', picked);
     log('poll vote answered prompt ->', p.id, picked);
     await reply(entry.chatId, '✅ Voto registrado: *' + picked + '*', true);
     return;
@@ -1710,7 +1710,7 @@ async function handleReaction(payload) {
   }
   const chosen = pos ? pp.options[0] : pp.options[1];
   answerPrompt(pp.id, chosen, '', 'whatsapp-reaction');
-  remember(chatId, 'user', chosen);
+  if (pp.chatId === chatId) remember(chatId, 'user', chosen);
   log('reaction answered prompt ->', pp.id, chosen);
   reply(chatId, '✅ Resposta registrada (' + text + '): *' + chosen + '*', true).catch(() => {});
 }
@@ -2093,7 +2093,7 @@ async function handleMessage(msg) {
   const hadMedia = Boolean(msg.hasMedia);
   const rawUserText = body;
   const ppEarly = pendingPromptFor(chatId);
-  if (ppEarly && (running.has(chatId) || ppEarly.nudgeId) && hadMedia && !rawUserText) {
+  if (ppEarly && isPromptActiveForWa(ppEarly, chatId, null) && hadMedia && !rawUserText) {
     reply(chatId, '⚠️ Áudios e anexos não valem como aprovação. Vote na enquete ou responda por texto/número.', true).catch(() => {});
     return;
   }
@@ -2116,24 +2116,19 @@ async function handleMessage(msg) {
   if (!body) return;
 
   const ppAny = pendingPromptFor(chatId);
-  if (ppAny && (running.has(chatId) || ppAny.nudgeId)) {
+  const cleanTextForPrompt = rawUserText || body;
+  if (ppAny && isPromptActiveForWa(ppAny, chatId, cleanTextForPrompt)) {
     // Security rule (Nod): voice notes or attachments alone never count as approval.
     if (hadMedia && !rawUserText) {
       reply(chatId, '⚠️ Áudios e anexos não valem como aprovação. Vote na enquete ou responda por texto/número.', true).catch(() => {});
       return;
     }
-    const cleanText = rawUserText || body;
-    const pinMatch = /\bPIN\s*[:=]\s*(\S+)/i.exec(cleanText);
-    const pin = pinMatch ? pinMatch[1] : '';
-    const withoutPin = pinMatch ? cleanText.replace(pinMatch[0], '').trim() : cleanText;
-    let ans = withoutPin;
-    const n = withoutPin.length <= 2 && /^\d+(?![\s\S])/.test(withoutPin) ? Number(withoutPin) : 0;
-    if (n >= 1 && n <= ppAny.options.length) ans = ppAny.options[n - 1];
-    else if (ppAny.options.length === 2 && POS_REACT.test(withoutPin)) ans = ppAny.options[0];
-    else if (ppAny.options.length === 2 && NEG_REACT.test(withoutPin)) ans = ppAny.options[1];
+    const { pin, withoutPin } = extractPinFromText(cleanTextForPrompt);
+    const matched = matchPromptReply(ppAny, withoutPin);
+    const ans = matched.answer;
     try {
       answerPrompt(ppAny.id, ans, '', 'whatsapp', '', pin);
-      remember(chatId, 'user', ans);
+      if (ppAny.chatId === chatId) remember(chatId, 'user', ans);
       reply(chatId, '✅ Resposta registrada: *' + ans + '*', true).catch(() => {});
     } catch (e) {
       reply(chatId, '🔐 ' + e.message, true).catch(() => {});
@@ -2900,12 +2895,81 @@ function emitPrompt(p) {
   if (idx >= 0) list[idx] = promptView(p); else list.push(promptView(p));
   promptLog.set(p.chatId, list);
 }
-async function sendPromptWhatsApp(p) {
+// ---------- Owner WhatsApp decision mirroring helpers ----------
+function waDigitsOf(chatId) {
+  const s = String(chatId || '');
+  if (!isWhatsApp(s) || s.endsWith('@g.us')) return '';
+  return s.split('@')[0].split(':')[0].replace(/\D/g, '');
+}
+function sameWaNumber(a, b) {
+  const da = waDigitsOf(a), db = waDigitsOf(b);
+  return Boolean(da && db && da === db);
+}
+function ownerWhatsAppChats() {
+  if (!ALLOWED.length || !String(env.WAHA_URL || '').trim()) return [];
+  const seen = new Set();
+  const out = [];
+  for (const num of ALLOWED) {
+    const clean = String(num || '').replace(/\D/g, '');
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    out.push(clean + '@c.us');
+  }
+  return out;
+}
+function panelLink(hashPath = '') {
+  if (!settings.panelUrl) return '';
+  const suffix = hashPath ? (hashPath.startsWith('/') ? hashPath : '/' + hashPath) : '';
+  return settings.panelUrl + suffix;
+}
+function promptOriginLabel(chatId) {
+  const s = String(chatId || '');
+  const title = chats[s] && chats[s].title ? String(chats[s].title).trim().slice(0, 50) : '';
+  if (isWeb(s)) return 'Painel Web' + (title ? ' (' + title + ')' : '');
+  if (isDeleg(s)) return 'Delegação' + (title ? ' (' + title + ')' : '');
+  if (isTaskChat(s)) return 'Tarefa paralela' + (title ? ' (' + title + ')' : '');
+  if (isTelegram(s)) return 'Telegram';
+  if (isDiscord(s)) return 'Discord';
+  if (isSlack(s)) return 'Slack';
+  return title || s || 'Painel';
+}
+async function notifyDecisionWhatsApp(text, opts = {}) {
+  const body = String(text || '').trim();
+  if (!body) return { sent: 0 };
+  const targets = ownerWhatsAppChats();
+  if (!targets.length) return { sent: 0 };
+  if (opts.respectQuietHours && inQuietHours()) return { sent: 0, skipped: 'quiet_hours' };
+  let finalText = body;
+  if (opts.panelPath !== false && settings.panelUrl && !finalText.includes(settings.panelUrl)) {
+    finalText += '\n🔗 ' + panelLink(opts.panelPath || '');
+  }
+  let sent = 0;
+  for (const target of targets) {
+    if (opts.excludeChatId && (target === opts.excludeChatId || sameWaNumber(target, opts.excludeChatId))) continue;
+    try {
+      await reply(target, finalText, opts.raw !== false);
+      sent += 1;
+    } catch (e) {
+      log('decision whatsapp notify failed:', e.message);
+    }
+  }
+  return { sent };
+}
+
+async function sendPromptWhatsApp(p, targetChatId = p.chatId, opts = {}) {
+  const to = targetChatId || p.chatId;
+  if (!to || !String(env.WAHA_URL || '').trim()) return;
+  menus.delete(to);
+  const mirrored = Boolean(opts.mirrored || (to !== p.chatId && !sameWaNumber(to, p.chatId)));
+  const originLine = mirrored ? '\n_Origem: ' + promptOriginLabel(p.chatId) + '_' : '';
+  const linkPath = isWeb(p.chatId) ? '/#/chat/' + String(p.chatId).slice(4) : '';
+  const linkLine = mirrored && settings.panelUrl ? '\n🔗 ' + panelLink(linkPath) : '';
+  const icon = p.kind === 'secret' ? '🔒' : p.kind === 'nudge' ? '💡' : '❓';
   const items = p.optionItems || p.options.map((label) => ({ label, description: '', recommended: false }));
   const numbered = items.map((o, i) => (i + 1) + '. ' + o.label + (o.recommended ? ' *(Recomendado)*' : '') + (o.description ? ' — ' + o.description : '')).join('\n');
   if (p.kind === 'secret') {
     const warn = '\n\n_Por segurança, prefira salvar esta credencial pelo painel web (aba Chat ou Cofre)._';
-    return reply(p.chatId, '🔒 *' + p.title + '*\n' + p.question + '\n\n' + numbered + warn + '\n\n_Responda com o número da opção ou escreva sua resposta._', true);
+    return reply(to, icon + ' *' + p.title + '*' + originLine + '\n' + p.question + '\n\n' + numbered + warn + linkLine + '\n\n_Responda com o número da opção ou escreva sua resposta._', true);
   }
   const canPoll = !p.questions && p.options.length >= 2 && p.options.length <= 12;
   const pinHint = (p.requirePin && settings.securityPinHash) ? '\n🔐 _Esta ação exige PIN de segurança (confirme no painel web ou inclua PIN:xxxx)._' : '';
@@ -2914,16 +2978,16 @@ async function sendPromptWhatsApp(p) {
   if (canPoll) {
     // Send readable context message first (keeps full markdown/question visible and preserves sendText listeners),
     // then send native WhatsApp Poll for 1-tap voting.
-    await reply(p.chatId, '❓ *' + p.title + '*\n' + p.question + descLines + pinHint + '\n\n_Vote na enquete abaixo' + reactHint + ' ou responda com o número._', true).catch(() => {});
+    await reply(to, icon + ' *' + p.title + '*' + originLine + '\n' + p.question + descLines + pinHint + linkLine + '\n\n_Vote na enquete abaixo' + reactHint + ' ou responda com o número._', true).catch(() => {});
     try {
       const r = await waha('POST', '/api/sendPoll', {
         session: WAHA_SESSION,
-        chatId: p.chatId,
+        chatId: to,
         poll: { name: String(p.title || 'Escolha uma opção').slice(0, 200), options: p.options.slice(0, 12), multipleAnswers: Boolean(p.multiSelect) },
       });
       const pid = msgIdOf(r);
       if (pid) {
-        polls.set(pollKey(pid), { chatId: p.chatId, promptId: p.id, options: Object.fromEntries(p.options.map((o) => [o, o])) });
+        polls.set(pollKey(pid), { chatId: to, promptId: p.id, options: Object.fromEntries(p.options.map((o) => [o, o])) });
         if (polls.size > 200) polls.delete(polls.keys().next().value);
         return;
       }
@@ -2934,7 +2998,7 @@ async function sendPromptWhatsApp(p) {
   const qBlock = p.questions
     ? p.questions.map((q, qi) => '*' + (qi + 1) + ') ' + q.question + '*\n' + q.optionItems.map((o, oi) => '  ' + (oi + 1) + '. ' + o.label + (o.recommended ? ' *(Recomendado)*' : '') + (o.description ? ' — ' + o.description : '')).join('\n')).join('\n\n')
     : p.question + '\n\n' + numbered;
-  return reply(p.chatId, '❓ *' + p.title + '*\n' + qBlock + pinHint + '\n\n_Responda com o número da opção ou escreva sua resposta._', true);
+  return reply(to, icon + ' *' + p.title + '*' + originLine + '\n' + qBlock + pinHint + linkLine + '\n\n_Responda com o número da opção ou escreva sua resposta._', true);
 }
 function startPrompt(body) {
   const chatId = String(body.chatId || body.from || '');
@@ -3002,8 +3066,19 @@ function startPrompt(body) {
     dcSendPrompt(p).catch((e) => log('dc prompt failed:', e.message));
   } else if (isSlack(chatId)) {
     slSendPrompt(p).catch((e) => log('sl prompt failed:', e.message));
-  } else if (!isWeb(chatId) && !isDeleg(chatId)) {
-    sendPromptWhatsApp(p).catch(() => {});
+  } else if (isWhatsApp(chatId)) {
+    sendPromptWhatsApp(p, chatId, { mirrored: false }).catch((e) => log('wa prompt failed:', e.message));
+  }
+  // Mirror any non-WhatsApp decision (Web, Deleg, Task, Telegram, Discord, Slack) to owner WhatsApp without duplicating.
+  if (!isWhatsApp(chatId)) {
+    const owners = ownerWhatsAppChats().filter((cid) => !sameWaNumber(chatId, cid));
+    if (owners.length) {
+      p.whatsappChatId = owners[0];
+      p.waMirrorChatIds = owners;
+      for (const ownerChatId of owners) {
+        sendPromptWhatsApp(p, ownerChatId, { mirrored: true }).catch((e) => log('wa mirror prompt failed:', e.message));
+      }
+    }
   }
   return p;
 }
@@ -3059,7 +3134,11 @@ function answerPrompt(id, answer, note = '', via = 'panel', secretValue = '', pi
   if (p.kind === 'nudge') {
     const fAns = fold(p.answer);
     if (p.draft && fAns.includes('rascunho')) {
-      reply(p.chatId, '📝 *Rascunho — ' + p.title + '*\n\n' + p.draft, true).catch(() => {});
+      const draftMsg = '📝 *Rascunho — ' + p.title + '*\n\n' + p.draft;
+      reply(p.chatId, draftMsg, true).catch(() => {});
+      if (String(via || '').startsWith('whatsapp') && p.whatsappChatId && p.whatsappChatId !== p.chatId) {
+        reply(p.whatsappChatId, draftMsg, true).catch(() => {});
+      }
     } else if (p.actionPrompt && (p.answer === p.options[0] || fAns.startsWith('sim') || fAns.startsWith('aprov') || fAns.startsWith('execut'))) {
       const follow = '[Acao aprovada pelo usuario a partir do nudge "' + p.title + '"]\n' + p.actionPrompt + (p.note ? '\nObservacao do usuario: ' + p.note : '');
       if (isWeb(p.chatId)) webSend(p.chatId, follow);
@@ -3104,9 +3183,50 @@ function createNudge(b) {
   });
   return { deduplicated: false, prompt: promptView(p) };
 }
-function pendingPromptFor(chatId) {
-  for (const p of prompts.values()) if (p.chatId === chatId && p.status === 'pending') return p;
-  return null;
+function isPromptMirroredTo(p, chatId) {
+  if (!p || !chatId || p.chatId === chatId) return false;
+  return p.whatsappChatId === chatId || (Array.isArray(p.waMirrorChatIds) && p.waMirrorChatIds.includes(chatId));
+}
+function extractPinFromText(text) {
+  const s = String(text || '');
+  const pinMatch = /\bPIN\s*[:=]\s*(\S+)/i.exec(s);
+  const pin = pinMatch ? pinMatch[1] : '';
+  const withoutPin = pinMatch ? s.replace(pinMatch[0], '').trim() : s.trim();
+  return { pin, withoutPin };
+}
+function matchPromptReply(p, withoutPin) {
+  const clean = String(withoutPin || '').trim();
+  const n = clean.length <= 2 && /^\d+(?![\s\S])/.test(clean) ? Number(clean) : 0;
+  if (n >= 1 && n <= p.options.length) return { matched: true, answer: p.options[n - 1] };
+  const fc = fold(clean);
+  if (fc) {
+    const exact = p.options.find((opt) => fold(opt) === fc);
+    if (exact) return { matched: true, answer: exact };
+  }
+  if (p.options.length === 2 && POS_REACT.test(clean)) return { matched: true, answer: p.options[0] };
+  if (p.options.length === 2 && NEG_REACT.test(clean)) return { matched: true, answer: p.options[1] };
+  return { matched: false, answer: clean };
+}
+function isPromptActiveForWa(p, chatId, text) {
+  if (!p || p.status !== 'pending') return false;
+  if (p.chatId === chatId) return running.has(chatId) || Boolean(p.nudgeId) || Boolean(p.workflowRunId);
+  if (isPromptMirroredTo(p, chatId)) {
+    if (text === null) return running.has(p.chatId) || Boolean(p.nudgeId) || Boolean(p.workflowRunId);
+    if (running.has(p.chatId)) return true;
+    const { withoutPin } = extractPinFromText(text);
+    return matchPromptReply(p, withoutPin).matched;
+  }
+  return false;
+}
+function pendingPromptFor(chatId, includeMirrored = true) {
+  let direct = null;
+  let mirrored = null;
+  for (const p of prompts.values()) {
+    if (p.status !== 'pending') continue;
+    if (p.chatId === chatId) direct = p;
+    else if (includeMirrored && isPromptMirroredTo(p, chatId)) mirrored = p;
+  }
+  return direct || mirrored;
 }
 async function waitPrompt(p, secs) {
   const ms = Math.min(Math.max(Number(secs) || 0, 0), 115) * 1000;
@@ -3679,6 +3799,34 @@ const ticketView = (t) => ({
   interrupted: Boolean(t.interrupted),
   autoFailCount: Number(t.autoFailCount || 0),
 });
+function notifyTicketDecisionWhatsApp(t, detail = '', opts = {}) {
+  if (!t) return Promise.resolve({ sent: 0 });
+  const icon = t.interrupted ? '⚠️' : t.status === 'blocked' ? '⛔' : '📋';
+  const label = t.interrupted ? 'Interrompida' : t.status === 'blocked' ? 'Bloqueada' : 'Aguardando revisão';
+  const bName = t.bot && bots[t.bot] ? botLabel(bots[t.bot]) : '';
+  const lines = [
+    icon + ' *Tarefa #' + t.id + ' — ' + label + '*',
+    '• *Título:* ' + t.title,
+  ];
+  if (bName) lines.push('• *Bot:* ' + bName);
+  if (t.priority) lines.push('• *Prioridade:* ' + t.priority);
+  const summary = cleanPushPreview(detail || t.description || '', 220);
+  if (summary) lines.push('• *Detalhe:* ' + summary);
+  return notifyDecisionWhatsApp(lines.join('\n'), { panelPath: '/#/board', excludeChatId: opts.excludeChatId || '' });
+}
+function notifyRecoveredTicketsWhatsApp(list) {
+  if (!Array.isArray(list) || !list.length) return Promise.resolve({ sent: 0 });
+  if (list.length === 1) {
+    return notifyTicketDecisionWhatsApp(list[0], 'Execução interrompida por reinício ou queda da ponte. Use "Retomar" para continuar.');
+  }
+  const lines = ['⚠️ *' + list.length + ' tarefas interrompidas após reinício da ponte*'];
+  for (const tk of list.slice(0, 10)) {
+    lines.push('• #' + tk.id + ' — ' + tk.title);
+  }
+  if (list.length > 10) lines.push('• _...e mais ' + (list.length - 10) + ' tarefa(s)_');
+  lines.push('_Use "Retomar" na Central de Decisões ou no Board._');
+  return notifyDecisionWhatsApp(lines.join('\n'), { panelPath: '/#/board' });
+}
 function createTicket(b, via = 'panel') {
   const title = String(b.title || '').trim().slice(0, 160);
   if (!title) throw new Error('title obrigatório');
@@ -3707,11 +3855,16 @@ function createTicket(b, via = 'panel') {
   };
   tickets.push(t); saveTickets();
   audit({ action: 'ticket-create', id: t.id, title: t.title, bot: t.bot, goal: t.goal, chatId: t.chatId, via });
+  if (t.status === 'review' || t.status === 'blocked') {
+    notifyTicketDecisionWhatsApp(t, b.reason || '').catch(() => {});
+  }
   return ticketView(t);
 }
 function patchTicket(id, b, via = 'panel') {
   const t = tickets.find((x) => x.id === id);
   if (!t) throw new Error('tarefa não encontrada');
+  const prevStatus = t.status;
+  const prevInterrupted = Boolean(t.interrupted);
   if ('title' in b && String(b.title || '').trim()) t.title = String(b.title).trim().slice(0, 160);
   if ('description' in b) t.description = String(b.description || '').trim().slice(0, 8000);
   if ('status' in b && TICKET_STATUSES.includes(b.status)) {
@@ -3739,6 +3892,11 @@ function patchTicket(id, b, via = 'panel') {
   t.updated = new Date().toISOString();
   saveTickets();
   audit({ action: 'ticket-update', id: t.id, status: t.status, nextCheckAt: t.nextCheckAt || '', via });
+  if ((t.status === 'review' || t.status === 'blocked') && prevStatus !== t.status) {
+    notifyTicketDecisionWhatsApp(t, b.reason || '').catch(() => {});
+  } else if (t.interrupted && !prevInterrupted) {
+    notifyTicketDecisionWhatsApp(t, b.reason || 'Execução interrompida. Use "Retomar" no Board para continuar.').catch(() => {});
+  }
   return ticketView(t);
 }
 function addTicketComment(id, author, text, via = 'panel') {
@@ -3804,6 +3962,7 @@ function runTicket(id, opts = {}) {
     if (!cur) return;
     const replyText = r.error ? 'Erro ao executar: ' + r.error : (r.text || '(sem resposta)');
     addTicketComment(id, botLabel(botObj), replyText, 'bot');
+    const prevStatus = cur.status;
     if (r.error) {
       cur.autoFailCount = (cur.autoFailCount || 0) + 1;
       if (opts.via === 'board-runner') {
@@ -3830,8 +3989,12 @@ function runTicket(id, opts = {}) {
         saveTickets();
       }
     }
+    const goalNotifiedWa = Boolean(cur.goal && cur.notifyChatId && chats[cur.notifyChatId] && !r.error && isWhatsApp(cur.notifyChatId));
     if (cur.goal && cur.notifyChatId && chats[cur.notifyChatId] && !r.error) {
       reply(cur.notifyChatId, '🎯 *Objetivo #' + cur.id + ' — ' + cur.title + '* (' + cur.status + ')\n\n' + replyText.slice(0, 1500), false).catch(() => {});
+    }
+    if ((cur.status === 'review' || cur.status === 'blocked') && prevStatus !== cur.status) {
+      notifyTicketDecisionWhatsApp(cur, r.error ? ('Erro: ' + r.error) : replyText, { excludeChatId: goalNotifiedWa ? cur.notifyChatId : '' }).catch(() => {});
     }
   });
   audit({ action: opts.resume ? 'ticket-resume' : 'ticket-run', id: t.id, bot: botId, via: opts.via || 'panel' });
@@ -4111,6 +4274,13 @@ async function requestComputerHuman(b) {
   if (chatId && isWeb(chatId)) webEmit(chatId, { type: 'computer', computer: computerStatus() });
   webGlobalEmit({ type: 'computer_need_human', chatId, reason, tag: 'computer-need-human', url: '/#/computer' });
   notifyPush({ title: 'Computador precisa de você', body: reason, chatId, tag: 'computer-need-human', url: '/#/computer' });
+  const compLines = [
+    '🖥️ *Computador ao Vivo precisa de você*',
+    '• *Motivo:* ' + reason,
+  ];
+  if (url) compLines.push('• *URL:* ' + url);
+  compLines.push('_Assuma a tela no painel para concluir (login, 2FA ou CAPTCHA)._');
+  notifyDecisionWhatsApp(compLines.join('\n'), { panelPath: '/#/computer' }).catch(() => {});
   captureComputerFrame('need-human').catch(() => {});
   audit({ action: 'computer-need-human', chatId, reason: reason.slice(0, 80) });
   const secs = Math.min(Math.max(Number(b.wait === undefined ? 110 : b.wait) || 0, 0), 115);
@@ -4961,7 +5131,7 @@ function recoverPendingJobs() {
     }
   }
   // Detect tickets left in_progress across a bridge restart/crash
-  let recovered = 0;
+  const recoveredTickets = [];
   for (const tk of tickets) {
     if (tk.status !== 'in_progress') continue;
     if (tk.goal && tk.nextCheckAt) continue; // sleeping goal waiting for nextCheckAt is normal
@@ -4977,10 +5147,13 @@ function recoverPendingJobs() {
     };
     tk.comments = [...(tk.comments || []), cm].slice(-100);
     tk.updated = cm.at;
-    recovered += 1;
+    recoveredTickets.push(tk);
     audit({ action: 'ticket-interrupted', id: tk.id });
   }
-  if (recovered > 0) saveTickets();
+  if (recoveredTickets.length > 0) {
+    saveTickets();
+    notifyRecoveredTicketsWhatsApp(recoveredTickets).catch(() => {});
+  }
 }
 
 setInterval(() => {
@@ -5003,6 +5176,15 @@ const DRAFTS_FILE = path.join(DATA_DIR, 'drafts.json');
 let drafts = loadState('drafts', DRAFTS_FILE, []);
 const saveDrafts = () => saveState('drafts', DRAFTS_FILE, drafts);
 const draftSending = new Set();
+function formatDecisionDate(iso) {
+  try {
+    const dt = new Date(iso);
+    if (isNaN(dt)) return String(iso || '');
+    return dt.toLocaleString('pt-BR', { timeZone: TZ, day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+  } catch {
+    return String(iso || '');
+  }
+}
 function createDraft(b, via = 'agent') {
   const channel = ['whatsapp', 'email'].includes(String(b.channel || '').toLowerCase()) ? String(b.channel).toLowerCase() : 'whatsapp';
   const to = String(b.to || '').trim().slice(0, 200);
@@ -5036,6 +5218,16 @@ function createDraft(b, via = 'agent') {
   saveDrafts();
   audit({ action: 'draft-create', id: d.id, channel, to, status: d.status, via });
   notifyPush({ title: 'Novo rascunho (' + channel + ')', body: 'Para ' + to + ': ' + body.slice(0, 120), tag: 'draft-' + d.id });
+  const chLabel = channel === 'email' ? 'E-mail' : 'WhatsApp';
+  const draftLines = [
+    '📝 *Rascunho aguardando decisão*',
+    '• *Canal:* ' + chLabel,
+    '• *Para:* ' + d.to,
+  ];
+  if (d.channel === 'email' && d.subject) draftLines.push('• *Assunto:* ' + d.subject);
+  if (d.status === 'scheduled' && d.scheduledAt) draftLines.push('• *Agendado para:* ' + formatDecisionDate(d.scheduledAt));
+  draftLines.push('• *Prévia:* ' + cleanPushPreview(d.body, 220));
+  notifyDecisionWhatsApp(draftLines.join('\n'), { panelPath: '' }).catch(() => {});
   return d;
 }
 function patchDraft(id, b, via = 'panel') {
@@ -5098,6 +5290,16 @@ async function sendDraft(id, via = 'panel') {
     d.updated = new Date().toISOString();
     saveDrafts();
     audit({ action: 'draft-error', id: d.id, error: e.message });
+    const chLabel = d.channel === 'email' ? 'E-mail' : 'WhatsApp';
+    const errLines = [
+      '⚠️ *Falha ao enviar rascunho*',
+      '• *Canal:* ' + chLabel,
+      '• *Para:* ' + d.to,
+    ];
+    if (d.channel === 'email' && d.subject) errLines.push('• *Assunto:* ' + d.subject);
+    errLines.push('• *Erro:* ' + cleanPushPreview(e.message, 220));
+    errLines.push('_Revise ou tente reenviar na Central de Decisões._');
+    notifyDecisionWhatsApp(errLines.join('\n'), { panelPath: '' }).catch(() => {});
     throw e;
   } finally {
     draftSending.delete(d.id);
