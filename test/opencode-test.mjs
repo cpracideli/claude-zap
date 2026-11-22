@@ -110,6 +110,11 @@ try {
   const usage = await api('GET', '/usage');
   check('usage endpoint responds', usage.status === 200, usage.status);
   check('usage log file records opencode runs', fs.existsSync(path.join(tmp, '.bridge', 'usage.jsonl')) ? fs.readFileSync(path.join(tmp, '.bridge', 'usage.jsonl'), 'utf8').includes('"provider":"opencode"') : false);
+  check('usage contract includes opencode in provider map', Boolean(usage.body.providers && usage.body.providers.opencode && usage.body.providers.opencode.runs >= 1), usage.body.providers);
+  check('usage history includes providers map', usage.body.days.every((day) => day.providers && typeof day.providers === 'object'), usage.body.days.at(-1));
+  for (const id of ['claude', 'antigravity', 'opencode', 'copilot', 'openai_compat']) {
+    check('usage contract includes provider ' + id, Boolean(usage.body.providers[id]), usage.body.providers);
+  }
 } catch (e) {
   check('no exception', false, e.stack);
 } finally {

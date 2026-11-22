@@ -6738,16 +6738,68 @@ async function usageReport(nDays = 56) {
       d.runs += 1; d.cost += lineCost; d.ms += j.ms || 0; d.in += j.in || 0; d.out += j.out || 0; d.cacheRead += j.cacheRead || 0;
     }
   } catch {}
+  const knownProviders = Object.keys(PROVIDERS);
+  const providerStats = () => Object.fromEntries(knownProviders.map((id) => [id, {
+    tokens: 0, runs: 0, cost: 0, msgs: 0,
+    telemetry: { runs: false, tokens: false, cost: false },
+    costEstimated: false,
+  }]));
   const days = [];
+  const providers = providerStats();
   for (let i = nDays - 1; i >= 0; i--) {
     const date = dayKey(Date.now() - i * 86400000);
     const tc = tdays[date], lc = log[date]?.claude, la = log[date]?.antigravity, lcp = log[date]?.copilot;
+    const dayProviders = providerStats();
+    for (const [id, stats] of Object.entries(log[date] || {})) {
+      if (!dayProviders[id]) dayProviders[id] = { tokens: 0, runs: 0, cost: 0, msgs: 0,
+        telemetry: { runs: false, tokens: false, cost: false }, costEstimated: false };
+      dayProviders[id].tokens = (stats.in || 0) + (stats.out || 0);
+      dayProviders[id].runs = stats.runs || 0;
+      dayProviders[id].cost = Math.round((stats.cost || 0) * 1000000) / 1000000;
+      dayProviders[id].telemetry.runs = true;
+      dayProviders[id].telemetry.tokens = (stats.in || 0) > 0 || (stats.out || 0) > 0 || (stats.cacheRead || 0) > 0;
+      dayProviders[id].telemetry.cost = id === 'claude' || id === 'antigravity' || id === 'opencode';
+      dayProviders[id].costEstimated = id === 'antigravity';
+    }
+    if (tc) {
+      dayProviders.claude.tokens = Math.max(dayProviders.claude.tokens, tc.in + tc.out);
+      dayProviders.claude.msgs = tc.msgs || 0;
+      dayProviders.claude.telemetry.tokens = true;
+      dayProviders.claude.telemetry.runs = dayProviders.claude.runs > 0 || tc.msgs > 0;
+    }
+    if (lc) {
+      dayProviders.claude.runs = lc.runs || dayProviders.claude.runs;
+      dayProviders.claude.cost = Math.round((lc.cost || dayProviders.claude.cost) * 1000000) / 1000000;
+      dayProviders.claude.telemetry.runs = true;
+      dayProviders.claude.telemetry.cost = true;
+    }
+    for (const [id, ds] of Object.entries(dayProviders)) {
+      const ps = providers[id] ||= { tokens: 0, runs: 0, cost: 0, msgs: 0,
+        telemetry: { runs: false, tokens: false, cost: false }, costEstimated: false };
+      ps.tokens += ds.tokens;
+      ps.runs += ds.runs;
+      ps.cost = Math.round((ps.cost + ds.cost) * 1000000) / 1000000;
+      ps.msgs += ds.msgs || 0;
+      ps.telemetry.runs ||= ds.telemetry.runs;
+      ps.telemetry.tokens ||= ds.telemetry.tokens;
+      ps.telemetry.cost ||= ds.telemetry.cost;
+      ps.costEstimated ||= ds.costEstimated;
+      ds.telemetry.available = Boolean(ds.telemetry.runs || ds.telemetry.tokens || ds.telemetry.cost);
+    }
     days.push({ date,
       claude: { tokens: tc ? tc.in + tc.out : (lc ? lc.in + lc.out : 0), out: tc?.out || lc?.out || 0, cacheRead: tc?.cacheRead || lc?.cacheRead || 0, msgs: tc?.msgs || 0, runs: lc?.runs || 0, cost: lc?.cost || 0 },
       antigravity: { tokens: la ? la.in + la.out : 0, out: la?.out || 0, cacheRead: la?.cacheRead || 0, runs: la?.runs || 0, cost: Math.round((la?.cost || 0) * 1000000) / 1000000 },
-      copilot: { tokens: lcp ? lcp.in + lcp.out : 0, out: lcp?.out || 0, cacheRead: lcp?.cacheRead || 0, runs: lcp?.runs || 0 } });
+      copilot: { tokens: lcp ? lcp.in + lcp.out : 0, out: lcp?.out || 0, cacheRead: lcp?.cacheRead || 0, runs: lcp?.runs || 0 },
+      providers: dayProviders });
   }
-  return { fetchedAt: new Date().toISOString(), claude, antigravity, days, tz: TZ, spending: monthlySpendSummary(), routineForecasts: routineForecasts(), historySince: { antigravity: fs.existsSync(USAGE_FILE) ? (fs.readFileSync(USAGE_FILE, 'utf8').slice(0, 40).match(/"at":"([^"]+)/) || [])[1] || null : null } };
+  for (const id of Object.keys(providers)) {
+    if (!providers[id].telemetry.runs && !providers[id].telemetry.tokens && !providers[id].telemetry.cost) {
+      providers[id].telemetry = { ...providers[id].telemetry, available: false };
+    } else {
+      providers[id].telemetry.available = true;
+    }
+  }
+  return { fetchedAt: new Date().toISOString(), claude, antigravity, providers, days, tz: TZ, spending: monthlySpendSummary(), routineForecasts: routineForecasts(), historySince: { antigravity: fs.existsSync(USAGE_FILE) ? (fs.readFileSync(USAGE_FILE, 'utf8').slice(0, 40).match(/"at":"([^"]+)/) || [])[1] || null : null } };
 }
 
 // ---------- memory explorer: ai-memory wiki pages + Claude Code's own memory files ----------
