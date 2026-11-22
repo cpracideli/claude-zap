@@ -713,7 +713,7 @@ function runClaude(chatId, prompt, opts, onActivity, onEvent) {
       child.stdin.on('error', () => { inputOpen = false; });
       child.stdin.write(userLine(prompt));
     }
-    const entry = { child, started: Date.now(), prompt: prompt.slice(0, 80), bot: opts.bot ? opts.bot.id : '',
+    const entry = { child, started: Date.now(), prompt: String(opts.displayPrompt || prompt || '').replace(/\s+/g, ' ').trim().slice(0, 80), bot: opts.bot ? opts.bot.id : '',
       inject: steer ? (text) => { if (!inputOpen) return false; child.stdin.write(userLine(STEER_NOTE + text)); injected.push(text); return true; } : null };
     running.set(chatId, entry);
     let out = '', err = '', timedOut = false, buf = '';
@@ -812,7 +812,7 @@ function runAntigravity(chatId, prompt, opts) {
     const started = Date.now();
     const childEnv = buildChildEnv({ WA_CHAT_ID: chatId, WA_BOT_ID: opts.botId || DEFAULT_BOT, WA_READONLY: opts.readOnly ? '1' : '0' }, Boolean(opts.sandboxed));
     const child = spawn(AGY_BIN, args, { cwd: WORKDIR, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
-    running.set(chatId, { child, started: Date.now(), prompt: prompt.slice(0, 80), bot: opts.botId || '' });
+    running.set(chatId, { child, started: Date.now(), prompt: String(opts.displayPrompt || prompt || '').replace(/\s+/g, ' ').trim().slice(0, 80), bot: opts.botId || '' });
     let out = '', err = '', timedOut = false;
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { err += d; });
@@ -861,7 +861,7 @@ function runOpenCode(chatId, prompt, opts) {
     const started = Date.now();
     const childEnv = buildChildEnv({ WA_CHAT_ID: chatId, WA_BOT_ID: opts.botId || DEFAULT_BOT, WA_READONLY: opts.readOnly ? '1' : '0' }, Boolean(opts.sandboxed));
     const child = spawn(OPENCODE_BIN, args, { cwd: WORKDIR, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
-    running.set(chatId, { child, started: Date.now(), prompt: prompt.slice(0, 80), bot: opts.botId || '' });
+    running.set(chatId, { child, started: Date.now(), prompt: String(opts.displayPrompt || prompt || '').replace(/\s+/g, ' ').trim().slice(0, 80), bot: opts.botId || '' });
     let out = '', err = '', timedOut = false;
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { err += d; });
@@ -939,7 +939,7 @@ async function runCopilot(chatId, prompt, opts, onActivity, onEvent) {
     const childEnv = buildChildEnv(extraEnv, Boolean(opts.sandboxed));
     const child = spawn(isScript ? process.execPath : COPILOT_BIN, isScript ? [COPILOT_BIN, ...args] : args,
       { cwd: WORKDIR, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
-    running.set(chatId, { child, started, prompt: prompt.slice(0, 80), bot: opts.botId || '' });
+    running.set(chatId, { child, started, prompt: String(opts.displayPrompt || prompt || '').replace(/\s+/g, ' ').trim().slice(0, 80), bot: opts.botId || '' });
     let out = '', err = '', buf = '', timedOut = false;
     const texts = [];
     let sessionId = '', modelUsed = opts.model || '', turns = 0, premiumRequests = 0, durationMs = 0, exitCode = 0;
@@ -1253,7 +1253,7 @@ async function runOpenAiCompat(chatId, prompt, opts, onActivity) {
   const sysText = systemPrompt(chatId, opts.bot);
   const messages = [{ role: 'system', content: sysText }, ...history.slice(-24), { role: 'user', content: prompt }];
   const ctrl = new AbortController();
-  const entry = { child: { kill: () => ctrl.abort() }, started, prompt: prompt.slice(0, 80), bot: opts.bot ? opts.bot.id : '' };
+  const entry = { child: { kill: () => ctrl.abort() }, started, prompt: String(opts.displayPrompt || prompt || '').replace(/\s+/g, ' ').trim().slice(0, 80), bot: opts.bot ? opts.bot.id : '' };
   running.set(chatId, entry);
   let totalIn = 0, totalOut = 0, turns = 0, finalText = '', lastErr = '';
   try {
@@ -1366,29 +1366,30 @@ function isLightPromptText(text) {
 async function invokeProviderOnce(provider, chatId, actualPrompt, cfg, opts, onActivity, onEvent) {
   const isSandboxed = Boolean((cfg.bot && cfg.bot.sandboxed) || opts.sandboxed);
   const effectiveBot = isSandboxed && cfg.bot && !cfg.bot.sandboxed ? { ...cfg.bot, sandboxed: true } : cfg.bot;
+  const displayPrompt = opts.displayPrompt || actualPrompt;
   if (provider === 'antigravity') {
     const first = !opts.resume;
     const text = first ? antigravityPrompt(chatId, effectiveBot, 'antigravity') + '\n\n---\n\n' + actualPrompt : actualPrompt;
     const agyCfg = opts.modelOverride ? { agyModel: opts.modelOverride, agyEffort: '' } : cfg.agy;
     const pick = resolveAgyRun(agyCfg);
-    return runAntigravity(chatId, text, { model: pick.model, effort: pick.effort, resume: opts.resume, botId: effectiveBot.id, sandboxed: isSandboxed, readOnly: opts.readOnly });
+    return runAntigravity(chatId, text, { model: pick.model, effort: pick.effort, resume: opts.resume, botId: effectiveBot.id, sandboxed: isSandboxed, readOnly: opts.readOnly, displayPrompt });
   }
   if (provider === 'opencode') {
     const text = !opts.resume ? antigravityPrompt(chatId, effectiveBot, 'opencode') + '\n\n---\n\n' + actualPrompt : actualPrompt;
     const model = opts.modelOverride || cfg.oc.ocModel || settings.opencodeModel || OPENCODE_DEFAULT_MODEL;
-    return runOpenCode(chatId, text, { model, resume: opts.resume, botId: effectiveBot.id, sandboxed: isSandboxed, readOnly: opts.readOnly });
+    return runOpenCode(chatId, text, { model, resume: opts.resume, botId: effectiveBot.id, sandboxed: isSandboxed, readOnly: opts.readOnly, displayPrompt });
   }
   if (provider === 'copilot') {
     const text = !opts.resume ? antigravityPrompt(chatId, effectiveBot, 'copilot') + '\n\n---\n\n' + actualPrompt : actualPrompt;
     const model = opts.modelOverride || (cfg.cp && cfg.cp.cpModel) || settings.copilotModel || COPILOT_DEFAULT_MODEL;
-    return runCopilot(chatId, text, { model, effort: cfg.effort, resume: opts.resume, botId: effectiveBot.id, bot: effectiveBot, sandboxed: isSandboxed, readOnly: opts.readOnly }, onActivity, onEvent);
+    return runCopilot(chatId, text, { model, effort: cfg.effort, resume: opts.resume, botId: effectiveBot.id, bot: effectiveBot, sandboxed: isSandboxed, readOnly: opts.readOnly, displayPrompt }, onActivity, onEvent);
   }
   if (provider === 'openai_compat') {
     const model = opts.modelOverride || cfg.model;
-    return runOpenAiCompat(chatId, actualPrompt, { model, resume: opts.resume, bot: effectiveBot, readOnly: opts.readOnly }, onActivity);
+    return runOpenAiCompat(chatId, actualPrompt, { model, resume: opts.resume, bot: effectiveBot, readOnly: opts.readOnly, displayPrompt }, onActivity);
   }
   const model = opts.modelOverride || cfg.model;
-  return runClaude(chatId, actualPrompt, { model, effort: cfg.effort, ...opts, bot: effectiveBot }, onActivity, onEvent);
+  return runClaude(chatId, actualPrompt, { model, effort: cfg.effort, ...opts, bot: effectiveBot, displayPrompt }, onActivity, onEvent);
 }
 
 async function runAgent(chatId, prompt, opts, onActivity, onEvent) {
@@ -1407,9 +1408,10 @@ async function runAgent(chatId, prompt, opts, onActivity, onEvent) {
   }
   const sem = !opts.skipSemantic ? await semanticMemoryContext(prompt) : { text: '', hits: [] };
   const actualPrompt = sem.text ? sem.text + prompt : prompt;
+  const displayPrompt = opts.displayPrompt || prompt;
   if (opts.readOnly) readOnlyRuns.add(chatId);
   try {
-    let r = await invokeProviderOnce(provider, chatId, actualPrompt, cfg, { ...opts, modelOverride }, onActivity, onEvent);
+    let r = await invokeProviderOnce(provider, chatId, actualPrompt, cfg, { ...opts, modelOverride, displayPrompt }, onActivity, onEvent);
     let usedProvider = provider;
     let fallbackFrom = '';
     if (r && r.error && !r.stopped && !opts.noFallback && routing.enabled) {
@@ -1419,7 +1421,7 @@ async function runAgent(chatId, prompt, opts, onActivity, onEvent) {
       for (const nextProv of order) {
         if (!PROVIDERS[nextProv] || nextProv === provider || !isProviderAvailable(nextProv)) continue;
         log('provider failover:', provider, '->', nextProv, 'reason:', String(r.error).slice(0, 120));
-        const r2 = await invokeProviderOnce(nextProv, chatId, actualPrompt, cfg, { ...opts, resume: undefined, modelOverride: '', noFallback: true }, onActivity, onEvent);
+        const r2 = await invokeProviderOnce(nextProv, chatId, actualPrompt, cfg, { ...opts, resume: undefined, modelOverride: '', noFallback: true, displayPrompt }, onActivity, onEvent);
         if (r2 && !r2.error && !r2.stopped) {
           fallbackFrom = provider;
           usedProvider = nextProv;
@@ -2247,7 +2249,7 @@ function startAsk(targetId, body) {
   emitAsk(a);
   a.promise = new Promise((resolve) => enqueue(dId, async () => {
     const prompt = '[Pedido do bot ' + (bots[callerBot] ? botLabel(bots[callerBot]) : callerBot) + ' (delegação). Sua resposta final volta para ele, não para o usuário: responda de forma completa e objetiva.]\n\n' + question;
-    const r = await runTurn(dId, null, prompt, null, null, null, { noSteer: true });
+    const r = await runTurn(dId, null, prompt, null, null, null, { noSteer: true, displayPrompt: question });
     a.ms = Date.now() - a.started;
     a.status = r.stopped ? 'stopped' : r.error ? 'error' : 'done';
     a.answer = r.text || ''; a.error = r.error || (r.stopped ? 'interrompido' : '');
@@ -2454,7 +2456,7 @@ function runSchedule(s, trigger = 'schedule', payload = '') {
       '\n\n' + s.prompt +
       (payload ? '\n\n' + wrapUntrusted(trigger, payload) : '');
     const started = Date.now();
-    const bgOpts = { bot: s.bot, noSteer: true, readOnly: Boolean(s.readOnly) };
+    const bgOpts = { bot: s.bot, noSteer: true, readOnly: Boolean(s.readOnly), displayPrompt: s.description || s.prompt };
     if (!s.bot && pro.backgroundProvider) bgOpts.providerOverride = pro.backgroundProvider;
     if (!s.bot && pro.backgroundModel) bgOpts.modelOverride = pro.backgroundModel;
     const r = await runAgent(s.chatId, prompt, bgOpts);
@@ -3688,7 +3690,7 @@ function runTicket(id, opts = {}) {
     '\nExecute a tarefa com autonomia. Ao terminar, apresente um resumo objetivo do que foi feito e do resultado. Se precisar de intervenção humana, explique claramente o que falta.';
   enqueue(cid, async () => {
     const started = Date.now();
-    const r = await runAgent(cid, prompt, { bot: botId, noSteer: true });
+    const r = await runAgent(cid, prompt, { bot: botId, noSteer: true, displayPrompt: 'Ticket #' + t.id + ': ' + t.title });
     const ms = r.usage ? r.usage.ms : Date.now() - started;
     recordRun(cid, { prompt: ('Ticket #' + t.id + ': ' + t.title).slice(0, 80), ms, cost: r.usage ? r.usage.cost : 0, error: r.error });
     const cur = tickets.find((x) => x.id === id);
@@ -4188,7 +4190,7 @@ function startTaskSession(b) {
   enqueue(cid, async () => {
     const started = Date.now();
     try {
-      const r = await runAgent(cid, prompt, { bot: botId, noSteer: true, readOnly: Boolean(b.readOnly) });
+      const r = await runAgent(cid, prompt, { bot: botId, noSteer: true, readOnly: Boolean(b.readOnly), displayPrompt: title });
       tk.ms = r.usage ? r.usage.ms : Date.now() - started;
       tk.cost = r.usage ? r.usage.cost : 0;
       tk.doneAt = new Date().toISOString();
@@ -6003,7 +6005,7 @@ function webSend(chatId, text, files = [], transcript = '') {
       delegLog.delete(chatId);
       promptLog.delete(chatId);
       const r = await runTurn(chatId, id, targets.length ? groupPrompt(chatId, id, prompt) : prompt, null, onEvent,
-        () => webEmit(chatId, { type: 'text', text: '(a sessão anterior não abriu; começando uma nova)' }));
+        () => webEmit(chatId, { type: 'text', text: '(a sessão anterior não abriu; começando uma nova)' }), { displayPrompt: label || prompt });
       const ms = r.usage ? r.usage.ms : Date.now() - started;
       recordRun(chatId, { prompt: label.slice(0, 80), ms, cost: r.usage ? r.usage.cost : 0, error: r.stopped ? 'interrompido pelo usuário' : r.error });
       const delegations = delegLog.get(chatId) || [];
@@ -7062,8 +7064,8 @@ async function handleAdmin(req, res, u, raw) {
         storage: { engine: storageEngine, pendingJobs: listPendingJobs().length },
         aiMemory: { status: aiMemory.status, restarts: aiMemory.restarts }, allowed: ALLOWED.length,
         settings: safeSettingsView(),
-        running: [...running.entries()].map(([id, r]) => ({ chatId: id, started: r.started, prompt: r.prompt })),
-        webRunning: [...running.entries()].filter(([id]) => isWeb(id) && !(chats[id] && chats[id].archived)).map(([id, r]) => ({ chatId: id, started: r.started, prompt: r.prompt })),
+        running: [...running.entries()].map(([id, r]) => ({ chatId: id, started: r.started, prompt: r.prompt, bot: r.bot || (chats[id] && chats[id].bot) || DEFAULT_BOT })),
+        webRunning: [...running.entries()].filter(([id]) => isWeb(id) && !(chats[id] && chats[id].archived)).map(([id, r]) => ({ chatId: id, started: r.started, prompt: r.prompt, bot: r.bot || (chats[id] && chats[id].bot) || DEFAULT_BOT })),
         chats: Object.keys(chats).filter((id) => !isDeleg(id) && !isTaskChat(id)).length, schedules: schedules.length, bots: Object.keys(bots).length, pages: Object.keys(pages).length,
         skills: Object.keys(skills).length, tickets: tickets.length,
         openTickets: tickets.filter((t) => t.status !== 'done').length,

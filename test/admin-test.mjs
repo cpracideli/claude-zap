@@ -26,7 +26,7 @@ ev({ type: 'system', subtype: 'init', model: get('--model') || 'default', mcp_se
 ev({ type: 'assistant', message: { content: [{ type: 'text', text: 'vou olhar' }, { type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] } });
 ev({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'a.txt' }] } });
 const sys = get('--append-system-prompt') || '';
-setTimeout(() => ev({ type: 'result', result: 'ECHO:' + p + ' |web=' + sys.includes('painel web') + ' |resume=' + get('--resume') + ' |model=' + get('--model'), session_id: 'sess-web', is_error: false, num_turns: 2, duration_ms: 900, total_cost_usd: 0.01 }), p === 'slow' ? 4000 : 100);
+setTimeout(() => ev({ type: 'result', result: 'ECHO:' + p + ' |web=' + sys.includes('painel web') + ' |resume=' + get('--resume') + ' |model=' + get('--model'), session_id: 'sess-web', is_error: false, num_turns: 2, duration_ms: 900, total_cost_usd: 0.01 }), p.trim().endsWith('slow') ? 4000 : 100);
 `);
 
 const PORT = 3999, TOKEN = 'tok-123';
@@ -90,10 +90,40 @@ try {
 
   await api('POST', '/web/' + id + '/messages', { text: 'slow' });
   await wait(600);
+  const ovRun = await api('GET', '/overview');
+  const runEntry = (ovRun.body.running || []).find((r) => r.chatId === 'web:' + id);
+  const webRunEntry = (ovRun.body.webRunning || []).find((r) => r.chatId === 'web:' + id);
+  check('overview running includes bot + clean prompt', runEntry && runEntry.bot === 'default' && runEntry.prompt === 'slow' && webRunEntry && webRunEntry.bot === 'default', { runEntry, webRunEntry });
   const stop = await api('POST', '/chats/' + encodeURIComponent('web:' + id) + '/stop');
   for (let i = 0; i < 40 && sse.events.filter((e) => e.type === 'idle').length < 3; i++) await wait(100);
   const h3 = (await api('GET', '/web/' + id + '/messages')).body.messages.at(-1);
   check('stop', stop.body.stopped && h3.stopped, { stop: stop.body, h3 });
+
+  // Secondary bot in web chat + delegation should report its own bot id and clean prompt in /admin/overview
+  const secBot = await api('POST', '/bots', { name: 'InfraBot', description: 'DevOps' });
+  check('secondary bot created', secBot.status === 200 && secBot.body.id, secBot);
+  const secChat = await api('POST', '/web', { bot: secBot.body.id });
+  const secId = secChat.body.id.slice(4);
+  await api('POST', '/web/' + secId + '/messages', { text: 'slow' });
+  await wait(600);
+  const ovSec = await api('GET', '/overview');
+  const secRun = (ovSec.body.running || []).find((r) => r.chatId === 'web:' + secId);
+  const secWebRun = (ovSec.body.webRunning || []).find((r) => r.chatId === 'web:' + secId);
+  check('overview running reports secondary bot', secRun && secRun.bot === secBot.body.id && secRun.prompt === 'slow' && secWebRun && secWebRun.bot === secBot.body.id, { secRun, secWebRun });
+  await api('POST', '/chats/' + encodeURIComponent('web:' + secId) + '/stop');
+  await wait(300);
+  const delegAsk = await fetch('http://127.0.0.1:' + PORT + '/bots/' + encodeURIComponent(secBot.body.id) + '/ask', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: 'web:' + id, question: 'slow', wait: 0 }),
+  }).then((r) => r.json());
+  await wait(600);
+  const ovDeleg = await api('GET', '/overview');
+  const delegRun = (ovDeleg.body.running || []).find((r) => r.chatId.startsWith('deleg:'));
+  check('overview running reports delegated bot + clean prompt', delegRun && delegRun.bot === secBot.body.id && delegRun.prompt === 'slow' && !String(delegRun.prompt).includes('Pedido do bot'), { delegAsk, delegRun });
+  if (delegRun) await api('POST', '/chats/' + encodeURIComponent(delegRun.chatId) + '/stop');
+  await wait(200);
+  await api('DELETE', '/chats/' + encodeURIComponent('web:' + secId));
+  await api('DELETE', '/bots/' + encodeURIComponent(secBot.body.id));
 
   const patched = await api('PATCH', '/chats/' + encodeURIComponent('web:' + id), { model: 'opus', reset: true });
   // attachments + voice transcript
