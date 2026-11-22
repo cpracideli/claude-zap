@@ -6936,6 +6936,7 @@ function openCodeDbHistory() {
   if (!db) return { days: {}, since: null, lastOkAt: 0, hasPaid: false, hasAccount: false, monthByYm: {} };
   const days = {};
   const monthRaw = {};
+  const events = [];
   let minTs = 0, lastOkAt = 0, hasPaid = false, hasAccount = false;
   try {
     try {
@@ -6967,6 +6968,7 @@ function openCodeDbHistory() {
       if (completedTs > lastOkAt) lastOkAt = completedTs;
       if (!minTs || ts < minTs) minTs = ts;
       if (cost > 0) hasPaid = true;
+      events.push([ts, nonCacheIn + outTok]);
 
       let dk;
       try { dk = dayKey(ts); } catch { continue; }
@@ -7000,7 +7002,7 @@ function openCodeDbHistory() {
       messages: m.messages, sessionsCount: m.sessions.size, models: [...m.models].sort(),
     };
   }
-  const value = { days: cleanDays, since: minTs ? new Date(minTs).toISOString() : null, lastOkAt, hasPaid, hasAccount, monthByYm };
+  const value = { days: cleanDays, since: minTs ? new Date(minTs).toISOString() : null, lastOkAt, hasPaid, hasAccount, monthByYm, events };
   ocDbCache = { sig, value };
   return value;
 }
@@ -7042,6 +7044,47 @@ function openCodeLogLimit() {
   return found;
 }
 
+// Estimated usage meter for the free tier (no official quota API): rolling window, limit calibrated from
+// how much was used right before each past "free usage limit" streak (median of the samples).
+const OC_EST_WINDOW_MS = 5 * 3600000;
+let ocHitsCache = { sig: '', value: [] };
+function openCodeLimitHits() {
+  const dataRoot = env.XDG_DATA_HOME || path.join(HOME_DIR, '.local', 'share');
+  const logPath = path.join(dataRoot, 'opencode', 'log', 'opencode.log');
+  let st; try { st = fs.statSync(logPath); } catch { return []; }
+  const sig = st.size + ':' + st.mtimeMs;
+  if (ocHitsCache.sig === sig) return ocHitsCache.value;
+  const out = [];
+  try {
+    for (const line of fs.readFileSync(logPath, 'utf8').split('\n')) {
+      if (!/level=ERROR/i.test(line) || !OPENCODE_LIMIT_RE.test(line)) continue;
+      const m = line.match(/timestamp=(\S+)/); const t = m ? Date.parse(m[1]) : NaN;
+      if (Number.isFinite(t)) out.push(t);
+    }
+  } catch {}
+  out.sort((a, b) => a - b);
+  ocHitsCache = { sig, value: out };
+  return out;
+}
+function openCodeEstimate(events, rateLimited, now = Date.now()) {
+  if (!Array.isArray(events) || !events.length) return null;
+  const countIn = (from, to) => { let n = 0, tok = 0; for (const [t, k] of events) if (t >= from && t < to) { n++; tok += k; } return { n, tok }; };
+  const samples = [];
+  let prev = 0;
+  for (const h of openCodeLimitHits()) {
+    if (h - prev > OC_EST_WINDOW_MS) { const c = countIn(h - OC_EST_WINDOW_MS, h); if (c.n >= 5) samples.push(c.n); }
+    prev = h;
+  }
+  const cur = countIn(now - OC_EST_WINDOW_MS, now + 1);
+  if (!samples.length) return { estimated: true, windowHours: OC_EST_WINDOW_MS / 3600000, used: cur.n, tokens: cur.tok, limit: null, percent: rateLimited ? 100 : null, samples: 0 };
+  samples.sort((a, b) => a - b);
+  const limit = samples[Math.floor(samples.length / 2)];
+  const percent = rateLimited ? 100 : Math.min(100, Math.round((cur.n / limit) * 100));
+  const oldest = events.filter(([t]) => t >= now - OC_EST_WINDOW_MS).reduce((a, [t]) => Math.min(a, t), Infinity);
+  return { estimated: true, windowHours: OC_EST_WINDOW_MS / 3600000, used: cur.n, tokens: cur.tok, limit, percent, samples: samples.length,
+    freesAt: Number.isFinite(oldest) && cur.n > 0 ? new Date(oldest + OC_EST_WINDOW_MS).toISOString() : null };
+}
+
 function openCodeSummary(ocDb, ocMonth, installed) {
   const logLim = openCodeLogLimit();
   const candidates = [openCodeLastLimit, logLim].filter((x) => x && x.at);
@@ -7063,6 +7106,7 @@ function openCodeSummary(ocDb, ocMonth, installed) {
     lastActivityAt: lastOkAt ? new Date(lastOkAt).toISOString() : null,
     fetchedAt: new Date().toISOString(),
     month: ocMonth,
+    estimate: openCodeEstimate(ocDb.events, rateLimited),
   };
 }
 
