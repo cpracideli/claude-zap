@@ -33,7 +33,27 @@ const COPILOT_MODELS = [
   { id: 'gemini-3-pro-preview', label: 'Gemini 3 Pro' },
   { id: 'mai-code-2-flash', label: 'MAI Code 2 Flash' },
 ];
-const PROVIDERS = { claude: 'Claude Code', antigravity: 'Antigravity', opencode: 'OpenCode', copilot: 'GitHub Copilot', openai_compat: 'API Direta (BYOM)' };
+const PROVIDERS = { claude: 'Claude Code', antigravity: 'Antigravity', opencode: 'OpenCode', copilot: 'GitHub Copilot', openai_compat: 'API Direta (BYOM)', ollama: 'Ollama Cloud' };
+// Ollama Cloud runs through the Claude Code binary, pointed at the local Ollama daemon (signed in with
+// `ollama signin`, which offloads "-cloud" models to Ollama's servers). Env vars are per child process only,
+// so the regular Claude provider is never touched.
+const OLLAMA_URL = env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434';
+const OLLAMA_BIN = env.OLLAMA_BIN || path.join(env.HOME || '/tmp', '.local', 'ollama', 'bin', 'ollama');
+const OLLAMA_DEFAULT_MODEL = env.OLLAMA_DEFAULT_MODEL || 'glm-5.3-flash:cloud';
+async function ensureOllama() {
+  const up = async () => { try { return (await fetch(OLLAMA_URL + '/api/version', { signal: AbortSignal.timeout(2000) })).ok; } catch { return false; } };
+  if (await up()) return;
+  if (!fs.existsSync(OLLAMA_BIN)) throw new Error('Ollama não instalado (' + OLLAMA_BIN + ').');
+  const out = fs.openSync(path.join(path.dirname(OLLAMA_BIN), '..', 'serve.log'), 'a');
+  spawn(OLLAMA_BIN, ['serve'], { env, detached: true, stdio: ['ignore', out, out] }).unref();
+  for (let i = 0; i < 20; i++) { await new Promise((r) => setTimeout(r, 500)); if (await up()) return; }
+  throw new Error('Não consegui iniciar o daemon do Ollama.');
+}
+function ollamaEnv(model) {
+  return { ANTHROPIC_BASE_URL: OLLAMA_URL, ANTHROPIC_AUTH_TOKEN: 'ollama', ANTHROPIC_API_KEY: '',
+    ANTHROPIC_MODEL: model, ANTHROPIC_DEFAULT_OPUS_MODEL: model, ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: model, CLAUDE_CODE_SUBAGENT_MODEL: model, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' };
+}
 // Claude keeps its memory notes here; Antigravity gets the same folder so it can read them too.
 const MEMORY_DIR = env.MEMORY_DIR || path.join(env.HOME || '/tmp', '.claude', 'projects', '-home-node-workspace', 'memory');
 const WORKDIR = env.CLAUDE_WORKDIR || path.join(env.HOME || '/tmp', 'workspace');
@@ -199,7 +219,7 @@ const defEffort = () => settings.claudeEffort || ENV_EFFORT;
 const BOTS_FILE = path.join(DATA_DIR, 'bots.json');
 const BOTS_DIR = path.join(DATA_DIR, 'bots');
 const DEFAULT_BOT = 'default';
-const BOT_FIELDS = ['name', 'emoji', 'avatar', 'color', 'description', 'instructions', 'provider', 'model', 'effort', 'agyModel', 'agyEffort', 'ocModel', 'cpModel', 'memory', 'approvalMode', 'allowRules', 'blockRules', 'policyEnforce', 'sandboxed'];
+const BOT_FIELDS = ['name', 'emoji', 'avatar', 'color', 'description', 'instructions', 'provider', 'model', 'effort', 'agyModel', 'agyEffort', 'ocModel', 'cpModel', 'olModel', 'memory', 'approvalMode', 'allowRules', 'blockRules', 'policyEnforce', 'sandboxed'];
 const APPROVAL_MODES = ['ask', 'auto', 'when_asked', 'handoff', 'never'];
 let bots = loadState('bots', BOTS_FILE, {});
 if (!bots[DEFAULT_BOT]) {
@@ -280,6 +300,7 @@ function runConfig(c, botId) {
     agy: { agyModel: pick('agyModel', ''), agyEffort: pick('agyEffort', '') },
     // The web panel's model picker writes chat.model; OpenCode ids always contain a provider prefix (opencode/...).
     oc: { ocModel: pick('ocModel', '') || (String(pick('model', '')).includes('/') ? String(pick('model', '')) : '') },
+    ol: { olModel: pick('olModel', '') || (pick('provider', settings.defaultProvider || 'claude') === 'ollama' ? String(pick('model', '')) : '') },
     cp: { cpModel: pick('cpModel', '') || (pick('provider', settings.defaultProvider || 'claude') === 'copilot' ? String(pick('model', '')) : '') },
   };
 }
@@ -722,9 +743,9 @@ function runClaude(chatId, prompt, opts, onActivity, onEvent) {
     const policyFile = (!isScript || env.BRIDGE_FORCE_POLICY_HOOK === '1') ? botPolicySettingsFile(opts.bot, opts) : null;
     if (policyFile) args.push('--settings', policyFile);
     if (opts.model) args.push('--model', opts.model);
-    if (opts.effort) args.push('--effort', opts.effort);
+    if (opts.effort && !opts.extraEnv) args.push('--effort', opts.effort);
     if (opts.resume) args.push('--resume', opts.resume);
-    const childEnv = buildChildEnv({ WA_CHAT_ID: chatId, WA_BOT_ID: opts.bot ? opts.bot.id : DEFAULT_BOT, WA_READONLY: opts.readOnly ? '1' : '0' }, Boolean(opts.bot && opts.bot.sandboxed));
+    const childEnv = buildChildEnv({ WA_CHAT_ID: chatId, WA_BOT_ID: opts.bot ? opts.bot.id : DEFAULT_BOT, WA_READONLY: opts.readOnly ? '1' : '0', ...(opts.extraEnv || {}) }, Boolean(opts.bot && opts.bot.sandboxed));
     const child = spawn(isScript ? process.execPath : CLAUDE_BIN, isScript ? [CLAUDE_BIN, ...args] : args,
       { cwd: WORKDIR, env: childEnv, stdio: [steer ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
     let inputOpen = steer;
@@ -1455,6 +1476,7 @@ function isProviderAvailable(p) {
   if (p === 'antigravity') return fs.existsSync(AGY_BIN);
   if (p === 'opencode') return Boolean(OPENCODE_BIN && (OPENCODE_BIN === 'opencode' || fs.existsSync(OPENCODE_BIN)));
   if (p === 'copilot') return Boolean(COPILOT_BIN && (COPILOT_BIN === 'copilot' || fs.existsSync(COPILOT_BIN)));
+  if (p === 'ollama') return fs.existsSync(OLLAMA_BIN);
   if (p === 'openai_compat') return compatConfig().enabled;
   return false;
 }
@@ -1484,6 +1506,12 @@ async function invokeProviderOnce(provider, chatId, actualPrompt, cfg, opts, onA
     const text = !opts.resume ? antigravityPrompt(chatId, effectiveBot, 'copilot') + '\n\n---\n\n' + actualPrompt : actualPrompt;
     const model = opts.modelOverride || (cfg.cp && cfg.cp.cpModel) || settings.copilotModel || COPILOT_DEFAULT_MODEL;
     return runCopilot(chatId, text, { model, effort: cfg.effort, resume: opts.resume, botId: effectiveBot.id, bot: effectiveBot, sandboxed: isSandboxed, readOnly: opts.readOnly, displayPrompt }, onActivity, onEvent);
+  }
+  if (provider === 'ollama') {
+    const model = opts.modelOverride || (cfg.ol && cfg.ol.olModel) || settings.ollamaModel || OLLAMA_DEFAULT_MODEL;
+    try { await ensureOllama(); } catch (e) { return { error: e.message, text: '', isError: true }; }
+    const { effort: _e, ...rest } = opts;
+    return runClaude(chatId, actualPrompt, { model, ...rest, resume: opts.resume, extraEnv: ollamaEnv(model), bot: effectiveBot, displayPrompt }, onActivity, onEvent);
   }
   if (provider === 'openai_compat') {
     const model = opts.modelOverride || cfg.model;
@@ -1671,7 +1699,7 @@ const MODEL_CHOICES = [['Opus', '/model opus'], ['Sonnet', '/model sonnet'], ['H
 const EFFORT_CHOICES = [['low', '/effort low'], ['medium', '/effort medium'], ['high', '/effort high'], ['xhigh', '/effort xhigh'], ['max', '/effort max'], ['Padrão', '/effort default']];
 const HELP_MENU = [['Status', '/status'], ['Nova conversa', '/new'], ['Trocar modelo', '/model'], ['Trocar esforço', '/effort'],
   ['Uso e custo', '/usage'], ['Últimas execuções', '/log'], ['Agendamentos', '/schedules'], ['Interromper tarefa', '/stop'], ['Trocar provedor', '/provider'], ['Trocar bot', '/bot']];
-const PROVIDER_CHOICES = [['Claude Code', '/provider claude'], ['Antigravity', '/provider antigravity'], ['GitHub Copilot', '/provider copilot'], ['OpenCode (grátis)', '/provider opencode']];
+const PROVIDER_CHOICES = [['Claude Code', '/provider claude'], ['Antigravity', '/provider antigravity'], ['GitHub Copilot', '/provider copilot'], ['OpenCode (grátis)', '/provider opencode'], ['Ollama Cloud', '/provider ollama']];
 const MENU_TTL = 120000;
 const menus = new Map();  // chatId -> { at, options: [command] }   numbered menu waiting for a "1", "2"...
 const polls = new Map();  // poll message id (last segment) -> { chatId, options: { label: command } }
@@ -1859,18 +1887,24 @@ async function command(chatId, body) {
   switch (cmd) {
     case '/help': return sendMenu(chatId, 'O que você quer fazer?', HELP_MENU, HELP);
     case '/new':
-      delete c.session; delete c.agySession; delete c.ocSession; delete c.cpSession; save();
+      delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; delete c.cpSession; delete c.olSession; save();
       return reply(chatId, 'Nova conversa iniciada com ' + botLabel(botOf(c)) + '. Modelo: ' + (runConfig(c).model || 'padrão') + '.', true);
     case '/provider': {
       const cur = PROVIDERS[providerOf(c)];
       if (!arg) return sendChoice(chatId, 'Provedor atual: ' + cur + '. Escolha:', PROVIDER_CHOICES);
-      const a = arg.toLowerCase(); const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : a;
-      if (!PROVIDERS[want] || want === 'openai_compat') return reply(chatId, 'Provedor inválido. Opções: claude, antigravity, copilot, opencode.', true);
+      const a = arg.toLowerCase(); const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : (a === 'ollama' || a === 'cloud') ? 'ollama' : a;
+      if (!PROVIDERS[want] || want === 'openai_compat') return reply(chatId, 'Provedor inválido. Opções: claude, antigravity, copilot, opencode, ollama.', true);
       c.provider = want; save();
       return reply(chatId, 'Provedor desta conversa: ' + PROVIDERS[want] + '. Vale a partir da próxima mensagem. Use /new para começar do zero no novo provedor.', true);
     }
     case '/model':
       if (providerOf(c) === 'antigravity') return agyModelCommand(chatId, c, arg, isDefault);
+      if (providerOf(c) === 'ollama') {
+        if (!arg) return reply(chatId, 'Modelo Ollama atual: ' + ((runConfig(c).ol && runConfig(c).ol.olModel) || OLLAMA_DEFAULT_MODEL) + '. Use /model <nome>, ex.: /model glm-5.3-flash:cloud, /model kimi-k2.6:cloud, /model default.', true);
+        if (isDefault(arg)) { delete c.olModel; delete c.model; } else { c.olModel = arg.trim(); c.model = arg.trim(); }
+        save();
+        return reply(chatId, 'Modelo Ollama desta conversa: ' + ((runConfig(c).ol && runConfig(c).ol.olModel) || OLLAMA_DEFAULT_MODEL) + '. Use /new para começar do zero.', true);
+      }
       if (providerOf(c) === 'copilot') {
         if (!arg) {
           const cur = (runConfig(c).cp && runConfig(c).cp.cpModel) || COPILOT_DEFAULT_MODEL;
@@ -1914,7 +1948,7 @@ async function command(chatId, body) {
       const b = findBot(arg);
       if (!b) return reply(chatId, 'Bot não encontrado. Disponíveis: ' + Object.values(bots).map((x) => x.name).join(', ') + '.', true);
       if (b.id === DEFAULT_BOT) delete c.bot; else c.bot = b.id;
-      delete c.session; delete c.agySession; delete c.ocSession; save();
+      delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; save();
       audit({ action: 'chat-bot', chatId, bot: b.id });
       return reply(chatId, 'Agora quem responde é ' + botLabel(b) + '. Conversa nova iniciada.', true);
     }
@@ -2023,21 +2057,22 @@ async function handleWebCommand(chatId, body) {
     case '/help':
       return out('**Comandos disponíveis no Chat Web:**\n- `/new` — inicia nova sessão limpa\n- `/status` — mostra bot, provedor, modelo e fila\n- `/usage` — uso desta conversa e gasto do mês\n- `/log [n]` — últimas execuções\n- `/provider <claude|antigravity|copilot|opencode|openai_compat>` — troca provedor\n- `/model <id|default>` — troca modelo\n- `/effort <low|medium|high|xhigh|max|default>` — troca esforço\n- `/bot <nome>` — troca bot da conversa\n- `/stop` — interrompe execução atual\n- `/schedules` — lista agendamentos desta conversa\n- `/council <pergunta>` — consulta múltiplos modelos em paralelo e sintetiza\n- `/<slug-da-skill>` — executa uma skill');
     case '/new':
-      delete c.session; delete c.agySession; delete c.ocSession; delete c.cpSession; save();
+      delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; delete c.cpSession; delete c.olSession; save();
       return out('Nova conversa iniciada com **' + botLabel(botOf(c)) + '**. Provedor: ' + PROVIDERS[providerOf(c)] + '.');
     case '/provider': {
-      if (!arg) return out('Provedor atual: **' + PROVIDERS[providerOf(c)] + '**. Use `/provider claude`, `/provider antigravity`, `/provider copilot`, `/provider opencode` ou `/provider openai_compat`.');
+      if (!arg) return out('Provedor atual: **' + PROVIDERS[providerOf(c)] + '**. Use `/provider claude`, `/provider antigravity`, `/provider copilot`, `/provider opencode`, `/provider ollama` ou `/provider openai_compat`.');
       const a = arg.toLowerCase();
-      const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : (a === 'byom' || a === 'compat' || a === 'openai_compat') ? 'openai_compat' : a;
-      if (!PROVIDERS[want]) return out('Provedor inválido. Opções: `claude`, `antigravity`, `copilot`, `opencode`, `openai_compat`.');
+      const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : (a === 'ollama' || a === 'cloud') ? 'ollama' : (a === 'byom' || a === 'compat' || a === 'openai_compat') ? 'openai_compat' : a;
+      if (!PROVIDERS[want]) return out('Provedor inválido. Opções: `claude`, `antigravity`, `copilot`, `opencode`, `ollama`, `openai_compat`.');
       c.provider = want; save();
       return out('Provedor desta conversa alterado para **' + PROVIDERS[want] + '** (vale a partir da próxima mensagem).');
     }
     case '/model': {
       const p = providerOf(c);
-      if (!arg) return out('Modelo atual (' + PROVIDERS[p] + '): `' + (p === 'antigravity' ? (c.agyModel || 'padrão') : p === 'opencode' ? (runConfig(c).oc.ocModel || OPENCODE_DEFAULT_MODEL) : p === 'copilot' ? ((runConfig(c).cp && runConfig(c).cp.cpModel) || COPILOT_DEFAULT_MODEL) : (runConfig(c).model || 'padrão')) + '`.');
+      if (!arg) return out('Modelo atual (' + PROVIDERS[p] + '): `' + (p === 'antigravity' ? (c.agyModel || 'padrão') : p === 'opencode' ? (runConfig(c).oc.ocModel || OPENCODE_DEFAULT_MODEL) : p === 'copilot' ? ((runConfig(c).cp && runConfig(c).cp.cpModel) || COPILOT_DEFAULT_MODEL) : p === 'ollama' ? ((runConfig(c).ol && runConfig(c).ol.olModel) || OLLAMA_DEFAULT_MODEL) : (runConfig(c).model || 'padrão')) + '`.');
       if (p === 'antigravity') { if (isDefault(arg)) delete c.agyModel; else c.agyModel = arg; }
       else if (p === 'opencode') { if (isDefault(arg)) { delete c.ocModel; delete c.model; } else { c.ocModel = arg; c.model = arg; } }
+      else if (p === 'ollama') { if (isDefault(arg)) { delete c.olModel; delete c.model; } else { c.olModel = arg; c.model = arg; } }
       else if (p === 'copilot') { if (isDefault(arg)) { delete c.cpModel; delete c.model; } else { c.cpModel = arg; c.model = arg; } }
       else { if (isDefault(arg)) delete c.model; else c.model = arg; }
       save();
@@ -2056,7 +2091,7 @@ async function handleWebCommand(chatId, body) {
       const b = findBot(arg);
       if (!b) return out('Bot não encontrado. Disponíveis: ' + Object.values(bots).map((x) => x.name).join(', ') + '.');
       if (b.id === DEFAULT_BOT) delete c.bot; else c.bot = b.id;
-      delete c.session; delete c.agySession; delete c.ocSession; save();
+      delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; save();
       audit({ action: 'chat-bot', chatId, bot: b.id, via: 'web-cmd' });
       return out('Agora quem responde é **' + botLabel(b) + '**. Nova sessão iniciada.');
     }
@@ -2308,7 +2343,7 @@ async function runTurn(chatId, botId, prompt, onActivity, onEvent, onRetry, extr
   const id = botId || botOf(c).id;
   const own = id === botOf(c).id;
   const prov = runConfig(c, own ? undefined : id).provider;
-  const key = prov === 'antigravity' ? 'agySession' : prov === 'opencode' ? 'ocSession' : prov === 'copilot' ? 'cpSession' : 'session';
+  const key = prov === 'antigravity' ? 'agySession' : prov === 'opencode' ? 'ocSession' : prov === 'copilot' ? 'cpSession' : prov === 'ollama' ? 'olSession' : 'session';
   const store = own ? c : ((c.botSessions = c.botSessions || {})[id] = c.botSessions[id] || {});
   const opts = { resume: store[key], bot: own ? undefined : id, ...(extra || {}) };
   let r = await runAgent(chatId, prompt, opts, onActivity, onEvent);
@@ -7749,7 +7784,7 @@ function chatView(id) {
     id, kind: isWeb(id) ? 'web' : isDeleg(id) ? 'delegation' : 'whatsapp', members: Array.isArray(c.members) ? c.members : [], title: c.title || (isWeb(id) ? 'Conversa web' : id.split('@')[0]),
     provider: providerOf(c), providerSet: Boolean(c.provider), bot: botOf(c).id, effModel: runConfig(c).model || '', effEffort: runConfig(c).effort || '',
     model: c.model || '', effort: c.effort || '', agyModel: c.agyModel || '', agyEffort: c.agyEffort || '',
-    session: c.session || '', agySession: c.agySession || '', ocSession: c.ocSession || '', cpSession: c.cpSession || '', created: c.created || '', readAt: c.readAt || '', unread,
+    session: c.session || '', agySession: c.agySession || '', ocSession: c.ocSession || '', olSession: c.olSession || '', cpSession: c.cpSession || '', created: c.created || '', readAt: c.readAt || '', unread,
     pinned: Boolean(c.pinned), archived: Boolean(c.archived),
     totals: c.totals || { runs: 0, cost: 0, ms: 0, errors: 0 }, runs: c.runs || [], lastUsage: c.lastUsage || null,
     running: r ? { started: r.started, prompt: r.prompt } : null,
@@ -8436,13 +8471,13 @@ async function handleAdmin(req, res, u, raw) {
       if ('bot' in body) {
         const nb = body.bot ? bots[body.bot] : bots[DEFAULT_BOT];
         if (!nb) throw new Error('bot desconhecido');
-        if (nb.id !== botOf(c).id) { delete c.session; delete c.agySession; delete c.ocSession; audit({ action: 'chat-bot', chatId: b, bot: nb.id, via: 'panel' }); }
+        if (nb.id !== botOf(c).id) { delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; audit({ action: 'chat-bot', chatId: b, bot: nb.id, via: 'panel' }); }
         if (nb.id === DEFAULT_BOT) delete c.bot; else c.bot = nb.id;
       }
       if ('pinned' in body) { if (body.pinned) c.pinned = true; else delete c.pinned; }
       if ('archived' in body) { if (body.archived) c.archived = true; else delete c.archived; }
       if (body.read) c.readAt = new Date().toISOString();
-      if (body.reset) { delete c.session; delete c.agySession; delete c.ocSession; delete c.cpSession; }
+      if (body.reset) { delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; delete c.cpSession; delete c.olSession; }
       save();
       return send(200, chatView(b));
     }
@@ -8623,7 +8658,7 @@ async function handleAdmin(req, res, u, raw) {
       if (!c2 && m === 'DELETE') {
         if (bt.id === DEFAULT_BOT) throw new Error('o bot padrão não pode ser apagado');
         delete bots[bt.id]; saveBots();
-        for (const c of Object.values(chats)) if (c.bot === bt.id) { delete c.bot; delete c.session; delete c.agySession; delete c.ocSession; }
+        for (const c of Object.values(chats)) if (c.bot === bt.id) { delete c.bot; delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; }
         save();
         for (const r of schedules) if (r.bot === bt.id) delete r.bot;
         saveSched();
