@@ -1443,7 +1443,8 @@ async function runAgent(chatId, prompt, opts, onActivity, onEvent) {
     const alertUsd = Number(settings.spending && settings.spending.taskAlertUsd || 0);
     if (alertUsd > 0 && r && r.usage && Number(r.usage.cost) >= alertUsd) {
       audit({ action: 'spending-alert', chatId, bot: cfg.bot.id, cost: r.usage.cost, threshold: alertUsd });
-      notifyPush({ title: 'Alerta de custo', body: 'Execucao custou USD ' + Number(r.usage.cost).toFixed(2) + ' (limite por tarefa: USD ' + alertUsd.toFixed(2) + ')', chatId });
+      const costUrl = isWeb(chatId) ? '/#/chat/' + String(chatId).slice(4) : '';
+      notifyPush({ title: 'Alerta de custo', body: 'Execucao custou USD ' + Number(r.usage.cost).toFixed(2) + ' (limite por tarefa: USD ' + alertUsd.toFixed(2) + ')', chatId, ...(costUrl ? { url: costUrl } : {}) });
     }
     return r;
   } finally {
@@ -2979,10 +2980,22 @@ function startPrompt(body) {
   if (prompts.size > 300) prompts.delete(prompts.keys().next().value);
   audit({ action: kind === 'secret' ? 'secret-request' : kind === 'nudge' ? 'nudge-ask' : 'prompt-ask', chatId, id: p.id, title, question: question.slice(0, 80) });
   emitPrompt(p);
-  if (isWeb(chatId) && kind === 'nudge') {
-    webAppend(chatId, { role: 'assistant', bot: callerBot, text: '💡 **' + title + '**\n\n' + question, prompts: [promptView(p)] });
+  const promptUrl = isWeb(chatId) ? '/#/chat/' + String(chatId).slice(4) : '';
+  if (isWeb(chatId)) {
+    const c = chats[chatId];
+    webGlobalEmit({
+      type: 'prompt',
+      chatId,
+      chatTitle: (c && c.title) || 'Conversa web',
+      prompt: promptView(p),
+      tag: 'prompt-' + p.id,
+      url: promptUrl,
+    });
   }
-  notifyPush({ title: title, body: question.slice(0, 180), chatId, tag: 'prompt-' + p.id });
+  if (isWeb(chatId) && kind === 'nudge') {
+    webAppend(chatId, { role: 'assistant', bot: callerBot, text: '💡 **' + title + '**\n\n' + question, prompts: [promptView(p)], noPush: true });
+  }
+  notifyPush({ title: title, body: cleanPushPreview(question, 180), chatId, tag: 'prompt-' + p.id, ...(promptUrl ? { url: promptUrl } : {}) });
   if (isTelegram(chatId)) {
     tgSendPrompt(p).catch((e) => log('tg prompt failed:', e.message));
   } else if (isDiscord(chatId)) {
@@ -4096,7 +4109,8 @@ async function requestComputerHuman(b) {
   nh.promise = new Promise((resolve) => { nh.resolve = resolve; });
   computer.needsHuman = nh;
   if (chatId && isWeb(chatId)) webEmit(chatId, { type: 'computer', computer: computerStatus() });
-  notifyPush({ title: 'Computador precisa de você', body: reason, chatId, tag: 'computer-need-human' });
+  webGlobalEmit({ type: 'computer_need_human', chatId, reason, tag: 'computer-need-human', url: '/#/computer' });
+  notifyPush({ title: 'Computador precisa de você', body: reason, chatId, tag: 'computer-need-human', url: '/#/computer' });
   captureComputerFrame('need-human').catch(() => {});
   audit({ action: 'computer-need-human', chatId, reason: reason.slice(0, 80) });
   const secs = Math.min(Math.max(Number(b.wait === undefined ? 110 : b.wait) || 0, 0), 115);
@@ -4293,13 +4307,23 @@ function startTaskSession(b) {
       else { tk.status = 'done'; tk.result = String(r.text || '').slice(0, 8000); }
       saveTasks();
       recordRun(cid, { prompt: '[task #' + id + '] ' + title.slice(0, 60), ms: tk.ms, cost: tk.cost, error: tk.error });
+      const taskUrl = isWeb(parentChatId) ? '/#/chat/' + String(parentChatId).slice(4) : '';
       if (isWeb(parentChatId)) {
         webEmit(parentChatId, { type: 'task', task: taskView(tk) });
-        webAppend(parentChatId, { role: 'assistant', bot: botId, text: '🧵 **Tarefa paralela concluída — ' + title + '**\n\n' + (tk.error ? 'Erro: ' + tk.error : tk.result) });
+        webAppend(parentChatId, { role: 'assistant', bot: botId, text: '🧵 **Tarefa paralela concluída — ' + title + '**\n\n' + (tk.error ? 'Erro: ' + tk.error : tk.result), noPush: true });
+        webGlobalEmit({
+          type: 'task',
+          chatId: parentChatId,
+          title,
+          error: Boolean(tk.error),
+          text: cleanPushPreview(tk.error || tk.result, 200),
+          tag: 'task-' + id,
+          url: taskUrl,
+        });
       } else if (!isDeleg(parentChatId)) {
         reply(parentChatId, '🧵 *Tarefa paralela concluída — ' + title + '*\n\n' + (tk.error ? 'Erro: ' + tk.error : tk.result), Boolean(tk.error)).catch(() => {});
       }
-      notifyPush({ title: 'Tarefa concluída: ' + title, body: (tk.error || tk.result).slice(0, 160), chatId: parentChatId, tag: 'task-' + id });
+      notifyPush({ title: 'Tarefa concluída: ' + title, body: cleanPushPreview(tk.error || tk.result, 160), chatId: parentChatId, tag: 'task-' + id, ...(taskUrl ? { url: taskUrl } : {}) });
     } finally {
       finishPendingJob('task:' + id);
     }
@@ -5916,18 +5940,76 @@ const WEB_DIR = path.join(DATA_DIR, 'web');
 fs.mkdirSync(WEB_DIR, { recursive: true });
 const webFile = (chatId) => path.join(WEB_DIR, String(chatId).slice(4).replace(/[^a-f0-9]/g, '') + '.json');
 const webListeners = new Map(); // chatId -> Set(fn(event))
+const webGlobalListeners = new Set(); // Set(fn(event)) for app-wide web notifications
+function cleanPushPreview(text, max = 180) {
+  let s = String(text || '');
+  if (!s) return '';
+  s = s.replace(/```suggestions[\s\S]*?```/gi, ' ');
+  s = s.replace(/<suggestions>[\s\S]*?<\/suggestions>/gi, ' ');
+  s = s.replace(/```[a-z0-9_-]*\s*/gi, ' ').replace(/```/g, ' ');
+  s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_, alt) => (alt ? alt + ' ' : ' '));
+  s = s.replace(/\[([^\]]+)\]\([^)]*\)/g, (_, label) => label);
+  s = s.replace(/`([^`]+)`/g, (_, code) => code);
+  s = s.replace(/^\s*#{1,6}\s+/gm, '');
+  s = s.replace(/^\s*>\s?/gm, '');
+  s = s.replace(/(\*\*|__|~~)/g, '');
+  s = s.replace(/[`*_~#]/g, '');
+  s = s.replace(/\s+/g, ' ').trim();
+  if (max > 1 && s.length > max) return s.slice(0, max - 1).trimEnd() + '…';
+  return s.slice(0, max);
+}
 function webHistory(chatId) {
   try { return JSON.parse(fs.readFileSync(webFile(chatId), 'utf8')); } catch { return []; }
 }
 function webEmit(chatId, ev) {
   for (const fn of webListeners.get(chatId) || []) { try { fn(ev); } catch {} }
 }
+function webGlobalEmit(ev) {
+  for (const fn of webGlobalListeners) { try { fn(ev); } catch {} }
+}
 function webAppend(chatId, msg) {
-  const m = { id: crypto.randomBytes(4).toString('hex'), at: new Date().toISOString(), ...msg };
+  const { noPush, ...cleanMsg } = msg || {};
+  const m = { id: crypto.randomBytes(4).toString('hex'), at: new Date().toISOString(), ...cleanMsg };
   const h = webHistory(chatId);
   h.push(m);
   fs.writeFileSync(webFile(chatId), JSON.stringify(h.slice(-500)));
   webEmit(chatId, { type: 'message', message: m });
+  if (isWeb(chatId) && m.role === 'assistant') {
+    const c = chats[chatId];
+    const rawTitle = (c && c.title) || '';
+    const chatTitle = rawTitle || 'Conversa web';
+    const bObj = (m.bot && bots[m.bot]) || (c ? botOf(c) : bots[DEFAULT_BOT]);
+    const botName = bObj ? botLabel(bObj) : (m.bot || '');
+    const url = '/#/chat/' + String(chatId).slice(4);
+    if (!noPush) {
+      webGlobalEmit({
+        type: 'message',
+        chatId,
+        chatTitle,
+        botName,
+        message: {
+          id: m.id,
+          role: m.role,
+          text: cleanPushPreview(m.text, 220),
+          bot: m.bot || '',
+          error: Boolean(m.error),
+          stopped: Boolean(m.stopped),
+          at: m.at,
+        },
+        tag: 'msg-' + m.id,
+        url,
+      });
+    }
+    if (!m.stopped && !noPush) {
+      notifyPush({
+        title: rawTitle || botName || 'Agent Control',
+        body: cleanPushPreview(m.text, 180) || 'Nova resposta',
+        chatId,
+        tag: 'msg-' + m.id,
+        url,
+      });
+    }
+  }
   return m;
 }
 function webUpdate(chatId, msgId, patch) {
@@ -7419,6 +7501,15 @@ async function handleAdmin(req, res, u, raw) {
       if (body.bot && bots[body.bot] && body.bot !== DEFAULT_BOT) c.bot = body.bot;
       save();
       return send(200, chatView(id));
+    }
+    if (a === 'web' && b === 'events' && !c2 && m === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+      const write = (ev) => res.write('data: ' + JSON.stringify(ev) + '\n\n');
+      write({ type: 'hello' });
+      webGlobalListeners.add(write);
+      const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 20000);
+      res.on('close', () => { clearInterval(ping); webGlobalListeners.delete(write); });
+      return;
     }
     if (a === 'web' && b && c2 === 'fork' && m === 'POST') {
       const id = 'web:' + b;

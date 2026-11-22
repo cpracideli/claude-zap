@@ -54,6 +54,14 @@ function listen(id) {
   });
   return { events, close: () => req.destroy() };
 }
+function listenGlobal() {
+  const events = [];
+  const req = http.get(base + '/web/events', { headers: { Authorization: 'Bearer ' + TOKEN } }, (res) => {
+    let buf = '';
+    res.on('data', (d) => { buf += d; let i; while ((i = buf.indexOf('\n\n')) !== -1) { const chunk = buf.slice(0, i); buf = buf.slice(i + 2); if (chunk.startsWith('data: ')) events.push(JSON.parse(chunk.slice(6))); } });
+  });
+  return { events, close: () => req.destroy() };
+}
 
 try {
   await wait(800);
@@ -261,6 +269,108 @@ try {
   check('prefs isolated per user', pOther.status === 200 && !pOther.body.dock, pOther);
   const pReset = await api('PUT', '/prefs/' + encodeURIComponent('caio@example.com'), { dock: null });
   check('prefs restores default', pReset.status === 200 && !pReset.body.dock, pReset);
+
+  // App-wide global web notifications: SSE /admin/web/events + Web Push dispatch & dedupe
+  const pushReceived = [];
+  const pushStub = http.createServer((q, s) => {
+    let b = '';
+    q.on('data', (d) => { b += d; });
+    q.on('end', () => {
+      if (q.url === '/api/push/dispatch' && q.method === 'POST') {
+        try { pushReceived.push(JSON.parse(b)); } catch {}
+      }
+      s.writeHead(200, { 'Content-Type': 'application/json' });
+      s.end(JSON.stringify({ sent: 1, failed: 0 }));
+    });
+  });
+  await new Promise((r) => pushStub.listen(0, '127.0.0.1', r));
+  const pushStubUrl = 'http://127.0.0.1:' + pushStub.address().port;
+  const subRes = await api('POST', '/push/subscriptions', {
+    subscription: { endpoint: 'https://push.example/sub-global', keys: { p256dh: 'k1', auth: 'k2' } },
+    panelPushUrl: pushStubUrl,
+  });
+  check('push subscription registered', subRes.status === 200 && subRes.body.count >= 1, subRes);
+
+  const gSse = listenGlobal();
+  for (let i = 0; i < 20 && !gSse.events.some((e) => e.type === 'hello'); i++) await wait(50);
+  check('global sse hello', gSse.events.some((e) => e.type === 'hello'), gSse.events);
+
+  const gChat = await api('POST', '/web', { title: 'Projeto Global' });
+  const gId = gChat.body.id.slice(4);
+  const gChatId = gChat.body.id;
+
+  // 1) Normal assistant message in any web chat emits global SSE message + clean Web Push
+  await api('POST', '/web/' + gId + '/messages', { text: '## Titulo\n**Ola** _mundo_ `code` [doc](https://example.com)' });
+  for (let i = 0; i < 40 && !gSse.events.some((e) => e.type === 'message' && e.chatId === gChatId); i++) await wait(100);
+  for (let i = 0; i < 20 && !pushReceived.some((p) => p.chatId === gChatId && String(p.tag || '').startsWith('msg-')); i++) await wait(50);
+  const gMsgEv = gSse.events.find((e) => e.type === 'message' && e.chatId === gChatId);
+  const gMsgPush = pushReceived.find((p) => p.chatId === gChatId && String(p.tag || '').startsWith('msg-'));
+  check('global sse receives assistant message with clean preview + url',
+    gMsgEv && gMsgEv.chatTitle === 'Projeto Global' && gMsgEv.botName && gMsgEv.url === '/#/chat/' + gId
+    && gMsgEv.tag === 'msg-' + gMsgEv.message.id && gMsgEv.message.role === 'assistant'
+    && !gMsgEv.message.text.includes('**') && !gMsgEv.message.text.includes('##') && gMsgEv.message.text.includes('Ola mundo code doc'),
+    gMsgEv);
+  check('web push sent for assistant reply with clean preview + url',
+    gMsgPush && gMsgPush.title === 'Projeto Global' && gMsgPush.url === '/#/chat/' + gId
+    && gMsgPush.tag === gMsgEv.tag && !gMsgPush.body.includes('**') && gMsgPush.body.includes('Ola mundo code doc'),
+    gMsgPush);
+
+  // 2) Stopped reply does NOT send Web Push
+  const pushBeforeStop = pushReceived.length;
+  await api('POST', '/web/' + gId + '/messages', { text: 'slow' });
+  await wait(400);
+  await api('POST', '/chats/' + encodeURIComponent(gChatId) + '/stop');
+  for (let i = 0; i < 40 && !gSse.events.some((e) => e.type === 'message' && e.chatId === gChatId && e.message && e.message.stopped); i++) await wait(100);
+  await wait(250);
+  const stopPushes = pushReceived.slice(pushBeforeStop).filter((p) => p.chatId === gChatId);
+  check('stopped reply does not trigger web push', stopPushes.length === 0, stopPushes);
+
+  // 3) Nudge in web chat emits global prompt event, sends single push (no duplicate msg push), and does not persist noPush
+  const pushBeforeNudge = pushReceived.length;
+  const gMsgCountBeforeNudge = gSse.events.filter((e) => e.type === 'message' && e.chatId === gChatId).length;
+  const nudgeRes = await fetch('http://127.0.0.1:' + PORT + '/nudges', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chatId: gChatId, topicKey: 'nudge-global-test', title: 'Revisar PR', summary: '**Novo** PR pronto', actionLabel: 'Abrir' }),
+  }).then((r) => r.json());
+  for (let i = 0; i < 20 && !gSse.events.some((e) => e.type === 'prompt' && e.chatId === gChatId); i++) await wait(50);
+  await wait(250);
+  const gPromptEv = gSse.events.find((e) => e.type === 'prompt' && e.chatId === gChatId);
+  const nudgePushes = pushReceived.slice(pushBeforeNudge).filter((p) => p.chatId === gChatId);
+  const gHistAfterNudge = (await api('GET', '/web/' + gId + '/messages')).body.messages;
+  const gMsgCountAfterNudge = gSse.events.filter((e) => e.type === 'message' && e.chatId === gChatId).length;
+  check('global sse prompt event for web nudge',
+    nudgeRes && gPromptEv && gPromptEv.chatTitle === 'Projeto Global' && gPromptEv.url === '/#/chat/' + gId && String(gPromptEv.tag).startsWith('prompt-'),
+    { nudgeRes, gPromptEv });
+  check('nudge sends single prompt push without duplicate msg push and omits noPush in history',
+    nudgePushes.length === 1 && String(nudgePushes[0].tag).startsWith('prompt-') && nudgePushes[0].url === '/#/chat/' + gId
+    && gMsgCountAfterNudge === gMsgCountBeforeNudge && gHistAfterNudge.every((m) => !('noPush' in m)),
+    { nudgePushes, gMsgCountBeforeNudge, gMsgCountAfterNudge, lastMsg: gHistAfterNudge.at(-1) });
+
+  // 4) Parallel background task completion emits global task event, sends single task push (no duplicate msg push), and omits noPush
+  const pushBeforeTask = pushReceived.length;
+  const gMsgCountBeforeTask = gSse.events.filter((e) => e.type === 'message' && e.chatId === gChatId).length;
+  const taskRes = await fetch('http://127.0.0.1:' + PORT + '/tasks', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parentChatId: gChatId, title: 'Auditoria', prompt: 'checar logs' }),
+  }).then((r) => r.json());
+  for (let i = 0; i < 40 && !gSse.events.some((e) => e.type === 'task' && e.chatId === gChatId); i++) await wait(100);
+  await wait(250);
+  const gTaskEv = gSse.events.find((e) => e.type === 'task' && e.chatId === gChatId);
+  const taskPushes = pushReceived.slice(pushBeforeTask).filter((p) => p.chatId === gChatId);
+  const gHistAfterTask = (await api('GET', '/web/' + gId + '/messages')).body.messages;
+  const gMsgCountAfterTask = gSse.events.filter((e) => e.type === 'message' && e.chatId === gChatId).length;
+  check('global sse task event for web parentChatId',
+    taskRes && taskRes.id && gTaskEv && gTaskEv.title === 'Auditoria' && gTaskEv.error === false
+    && gTaskEv.tag === 'task-' + taskRes.id && gTaskEv.url === '/#/chat/' + gId && gTaskEv.text.includes('ECHO:checar logs'),
+    { taskRes, gTaskEv });
+  check('task sends single task push without duplicate msg push and omits noPush in history',
+    taskPushes.length === 1 && taskPushes[0].tag === 'task-' + taskRes.id && taskPushes[0].url === '/#/chat/' + gId
+    && gMsgCountAfterTask === gMsgCountBeforeTask && gHistAfterTask.every((m) => !('noPush' in m)),
+    { taskPushes, gMsgCountBeforeTask, gMsgCountAfterTask, lastMsg: gHistAfterTask.at(-1) });
+
+  gSse.close();
+  pushStub.close();
+  await api('DELETE', '/chats/' + encodeURIComponent(gChatId));
   sse.close();
 } catch (e) {
   failed++; console.log('ERROR', e);
