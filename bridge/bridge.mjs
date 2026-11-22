@@ -1541,8 +1541,8 @@ async function runAgent(chatId, prompt, opts, onActivity, onEvent) {
     const alertUsd = Number(settings.spending && settings.spending.taskAlertUsd || 0);
     if (alertUsd > 0 && r && r.usage && Number(r.usage.cost) >= alertUsd) {
       audit({ action: 'spending-alert', chatId, bot: cfg.bot.id, cost: r.usage.cost, threshold: alertUsd });
-      const costUrl = isWeb(chatId) ? '/#/chat/' + String(chatId).slice(4) : '';
-      notifyPush({ title: 'Alerta de custo', body: 'Execucao custou USD ' + Number(r.usage.cost).toFixed(2) + ' (limite por tarefa: USD ' + alertUsd.toFixed(2) + ')', chatId, ...(costUrl ? { url: costUrl } : {}) });
+      const costUrl = isWeb(chatId) ? '/#/chat/' + String(chatId).slice(4) : '/#/usage';
+      notifyPush({ title: 'Alerta de custo', body: 'Execucao custou USD ' + Number(r.usage.cost).toFixed(2) + ' (limite por tarefa: USD ' + alertUsd.toFixed(2) + ')', chatId, url: costUrl });
     }
     return r;
   } finally {
@@ -3158,22 +3158,20 @@ function startPrompt(body) {
   if (prompts.size > 300) prompts.delete(prompts.keys().next().value);
   audit({ action: kind === 'secret' ? 'secret-request' : kind === 'nudge' ? 'nudge-ask' : 'prompt-ask', chatId, id: p.id, title, question: question.slice(0, 80) });
   emitPrompt(p);
-  const promptUrl = isWeb(chatId) ? '/#/chat/' + String(chatId).slice(4) : '';
-  if (isWeb(chatId)) {
-    const c = chats[chatId];
-    webGlobalEmit({
-      type: 'prompt',
-      chatId,
-      chatTitle: (c && c.title) || 'Conversa web',
-      prompt: promptView(p),
-      tag: 'prompt-' + p.id,
-      url: promptUrl,
-    });
-  }
+  const promptUrl = isWeb(chatId) ? '/#/chat/' + String(chatId).slice(4) : '/#/inbox';
+  const promptChat = isWeb(chatId) ? chats[chatId] : null;
+  webGlobalEmit({
+    type: 'prompt',
+    chatId,
+    chatTitle: isWeb(chatId) ? ((promptChat && promptChat.title) || 'Conversa web') : 'Central de Decisões',
+    prompt: promptView(p),
+    tag: 'prompt-' + p.id,
+    url: promptUrl,
+  });
   if (isWeb(chatId) && kind === 'nudge') {
     webAppend(chatId, { role: 'assistant', bot: callerBot, text: '💡 **' + title + '**\n\n' + question, prompts: [promptView(p)], noPush: true });
   }
-  notifyPush({ title: title, body: cleanPushPreview(question, 180), chatId, tag: 'prompt-' + p.id, ...(promptUrl ? { url: promptUrl } : {}) });
+  notifyPush({ title: title, body: cleanPushPreview(question, 180), chatId, tag: 'prompt-' + p.id, url: promptUrl });
   if (isTelegram(chatId)) {
     tgSendPrompt(p).catch((e) => log('tg prompt failed:', e.message));
   } else if (isDiscord(chatId)) {
@@ -4643,7 +4641,7 @@ function startTaskSession(b) {
       else { tk.status = 'done'; tk.result = String(r.text || '').slice(0, 8000); }
       saveTasks();
       recordRun(cid, { prompt: '[task #' + id + '] ' + title.slice(0, 60), ms: tk.ms, cost: tk.cost, error: tk.error });
-      const taskUrl = isWeb(parentChatId) ? '/#/chat/' + String(parentChatId).slice(4) : '';
+      const taskUrl = isWeb(parentChatId) ? '/#/chat/' + String(parentChatId).slice(4) : '/#/board';
       if (isWeb(parentChatId)) {
         webEmit(parentChatId, { type: 'task', task: taskView(tk) });
         webAppend(parentChatId, { role: 'assistant', bot: botId, text: '🧵 **Tarefa paralela concluída — ' + title + '**\n\n' + (tk.error ? 'Erro: ' + tk.error : tk.result), noPush: true });
@@ -4659,7 +4657,7 @@ function startTaskSession(b) {
       } else if (!isDeleg(parentChatId)) {
         reply(parentChatId, '🧵 *Tarefa paralela concluída — ' + title + '*\n\n' + (tk.error ? 'Erro: ' + tk.error : tk.result), Boolean(tk.error)).catch(() => {});
       }
-      notifyPush({ title: 'Tarefa concluída: ' + title, body: cleanPushPreview(tk.error || tk.result, 160), chatId: parentChatId, tag: 'task-' + id, ...(taskUrl ? { url: taskUrl } : {}) });
+      notifyPush({ title: 'Tarefa concluída: ' + title, body: cleanPushPreview(tk.error || tk.result, 160), chatId: parentChatId, tag: 'task-' + id, url: taskUrl });
     } finally {
       finishPendingJob('task:' + id);
     }
@@ -5383,7 +5381,8 @@ function createDraft(b, via = 'agent') {
   drafts = drafts.slice(-200);
   saveDrafts();
   audit({ action: 'draft-create', id: d.id, channel, to, status: d.status, via });
-  notifyPush({ title: 'Novo rascunho (' + channel + ')', body: 'Para ' + to + ': ' + body.slice(0, 120), tag: 'draft-' + d.id });
+  notifyPush({ title: 'Novo rascunho (' + channel + ')', body: 'Para ' + to + ': ' + body.slice(0, 120), tag: 'draft-' + d.id, url: '/#/inbox' });
+  webGlobalEmit({ type: 'draft', id: d.id, channel, to, body: cleanPushPreview(body, 160), tag: 'draft-' + d.id, url: '/#/inbox' });
   const chLabel = channel === 'email' ? 'E-mail' : 'WhatsApp';
   const draftLines = [
     '📝 *Rascunho aguardando decisão*',
@@ -5393,7 +5392,7 @@ function createDraft(b, via = 'agent') {
   if (d.channel === 'email' && d.subject) draftLines.push('• *Assunto:* ' + d.subject);
   if (d.status === 'scheduled' && d.scheduledAt) draftLines.push('• *Agendado para:* ' + formatDecisionDate(d.scheduledAt));
   draftLines.push('• *Prévia:* ' + cleanPushPreview(d.body, 220));
-  notifyDecisionWhatsApp(draftLines.join('\n'), { panelPath: '' }).catch(() => {});
+  notifyDecisionWhatsApp(draftLines.join('\n'), { panelPath: '/#/inbox' }).catch(() => {});
   return d;
 }
 function patchDraft(id, b, via = 'panel') {
@@ -5465,7 +5464,7 @@ async function sendDraft(id, via = 'panel') {
     if (d.channel === 'email' && d.subject) errLines.push('• *Assunto:* ' + d.subject);
     errLines.push('• *Erro:* ' + cleanPushPreview(e.message, 220));
     errLines.push('_Revise ou tente reenviar na Central de Decisões._');
-    notifyDecisionWhatsApp(errLines.join('\n'), { panelPath: '' }).catch(() => {});
+    notifyDecisionWhatsApp(errLines.join('\n'), { panelPath: '/#/inbox' }).catch(() => {});
     throw e;
   } finally {
     draftSending.delete(d.id);
