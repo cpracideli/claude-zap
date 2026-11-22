@@ -55,10 +55,12 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ---------- SQLite WAL persistence (Node 22 native node:sqlite, zero npm deps) + JSON mirror ----------
 const DB_FILE = path.join(DATA_DIR, 'state.db');
+let SqliteDatabaseSync = null;
 let stateDb = null;
 let storageEngine = 'json';
 try {
   const { DatabaseSync } = await import('node:sqlite');
+  SqliteDatabaseSync = DatabaseSync;
   stateDb = new DatabaseSync(DB_FILE);
   stateDb.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;');
   stateDb.exec('CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated TEXT NOT NULL);');
@@ -66,8 +68,23 @@ try {
   stateDb.exec('CREATE TABLE IF NOT EXISTS page_data (page_id TEXT PRIMARY KEY, data TEXT NOT NULL, updated TEXT NOT NULL);');
   storageEngine = 'sqlite-wal';
 } catch (e) {
+  SqliteDatabaseSync = null;
   stateDb = null;
   storageEngine = 'json';
+}
+function openReadOnlySqlite(dbPath) {
+  if (!SqliteDatabaseSync || !dbPath || !fs.existsSync(dbPath)) return null;
+  try { return new SqliteDatabaseSync(dbPath, { readOnly: true }); }
+  catch { return null; }
+}
+function sqliteSig(dbPath) {
+  if (!dbPath || !fs.existsSync(dbPath)) return '';
+  try {
+    const s1 = fs.statSync(dbPath);
+    let walPart = '0:0';
+    try { const s2 = fs.statSync(dbPath + '-wal'); walPart = s2.size + ':' + s2.mtimeMs; } catch {}
+    return s1.size + ':' + s1.mtimeMs + '|' + walPart;
+  } catch { return ''; }
 }
 function checkpointWal() {
   if (!stateDb) return false;
@@ -854,6 +871,10 @@ async function openCodeModels(force = false) {
   if (models.length) ocCatalog = { at: Date.now(), models };
   return ocCatalog.models;
 }
+let openCodeLastLimit = null;
+let openCodeLastOkAt = 0;
+const OPENCODE_LIMIT_RE = /free usage limit|rate limit|429|quota|freeusagelimit/i;
+
 function runOpenCode(chatId, prompt, opts) {
   return new Promise((resolve) => {
     const args = ['run', '--format', 'json', '--dir', WORKDIR];
@@ -872,11 +893,9 @@ function runOpenCode(chatId, prompt, opts) {
     const done = (r) => { clearTimeout(timer); running.delete(chatId); resolve(r); };
     child.on('error', (e) => done({ error: e.message }));
     child.on('close', (code, signal) => {
-      if (signal && !timedOut) return done({ stopped: true });
-      if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
       const texts = [];
       let sessionId = '', errMsg = '', steps = 0, cost = 0;
-      const u = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+      const u = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_input_tokens: 0 };
       for (const line of out.split('\n')) {
         if (!line.trim()) continue;
         let ev;
@@ -891,17 +910,37 @@ function runOpenCode(chatId, prompt, opts) {
           u.input_tokens += Number(t.input) || 0;
           u.output_tokens += (Number(t.output) || 0) + (Number(t.reasoning) || 0);
           u.cache_read_tokens += Number(t.cache && t.cache.read) || 0;
+          u.cache_creation_input_tokens += Number(t.cache && t.cache.write) || 0;
         }
-        if (ev.type === 'error') errMsg = (ev.error && (ev.error.data?.message || ev.error.message || ev.error.name)) || JSON.stringify(ev).slice(0, 300);
+        if (ev.type === 'error') {
+          errMsg = (ev.error && (ev.error.data?.message || ev.error.message || ev.error.name)) || JSON.stringify(ev).slice(0, 300);
+          if (OPENCODE_LIMIT_RE.test(errMsg + ' ' + ((ev.error && ev.error.name) || ''))) {
+            openCodeLastLimit = { at: new Date().toISOString(), model: opts.model || '', message: errMsg };
+          }
+        }
       }
-      const text = texts.join('\n\n');
-      if (!text && (errMsg || code !== 0)) {
-        return done({ error: 'OpenCode: ' + (errMsg || (err || out).slice(-500) || 'saiu com código ' + code), sessionId: sessionId || undefined });
+      if (!errMsg && err && OPENCODE_LIMIT_RE.test(err)) {
+        openCodeLastLimit = { at: new Date().toISOString(), model: opts.model || '', message: err.trim().slice(-300) };
       }
       const ms = Date.now() - started;
       const costUsd = Math.round(cost * 1000000) / 1000000;
+      const hasUsage = steps > 0 || u.input_tokens > 0 || u.output_tokens > 0 || u.cache_creation_input_tokens > 0 || u.cache_read_tokens > 0;
+      if (signal && !timedOut) {
+        if (hasUsage) logUsage('opencode', chatId, costUsd, ms, u, opts.model);
+        return done({ stopped: true });
+      }
+      if (timedOut) {
+        if (hasUsage) logUsage('opencode', chatId, costUsd, ms, u, opts.model);
+        return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
+      }
+      const text = texts.join('\n\n');
+      if (!text && (errMsg || code !== 0)) {
+        if (hasUsage) logUsage('opencode', chatId, costUsd, ms, u, opts.model);
+        return done({ error: 'OpenCode: ' + (errMsg || (err || out).slice(-500) || 'saiu com código ' + code), sessionId: sessionId || undefined });
+      }
+      if (!errMsg && code === 0 && (steps > 0 || text)) openCodeLastOkAt = Date.now();
       logUsage('opencode', chatId, costUsd, ms, u, opts.model);
-      done({ text, sessionId, provider: 'opencode', usage: { cost: costUsd, ms, turns: steps, in: u.input_tokens, out: u.output_tokens, cacheRead: u.cache_read_tokens } });
+      done({ text, sessionId, provider: 'opencode', usage: { cost: costUsd, ms, turns: steps, in: u.input_tokens + u.cache_creation_input_tokens, out: u.output_tokens, cacheRead: u.cache_read_tokens } });
     });
   });
 }
@@ -946,7 +985,34 @@ async function runCopilot(chatId, prompt, opts, onActivity, onEvent) {
     let out = '', err = '', buf = '', timedOut = false;
     const texts = [];
     let sessionId = '', modelUsed = opts.model || '', turns = 0, premiumRequests = 0, durationMs = 0, exitCode = 0;
-    const u = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+    let nanoAiu = 0, hasSnapshotTokens = false;
+    let stepUncachedIn = 0, stepCacheWrite = 0, stepCacheRead = 0, stepOut = 0, stepReasoning = 0, stepDurationMs = 0, stepCalls = 0;
+    const u = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_input_tokens: 0, thinking_tokens: 0 };
+    const applySnapshot = (snap, modelMetrics) => {
+      if (snap && typeof snap === 'object') {
+        if (snap.currentModel) modelUsed = snap.currentModel;
+        if (snap.totalPremiumRequestCost != null) premiumRequests = Number(snap.totalPremiumRequestCost) || premiumRequests;
+        if (snap.totalNanoAiu != null) nanoAiu = Number(snap.totalNanoAiu) || nanoAiu;
+        if (snap.totalApiDurationMs) durationMs = Number(snap.totalApiDurationMs) || durationMs;
+        if (snap.tokenDetails) {
+          u.input_tokens = Number(snap.tokenDetails.input && snap.tokenDetails.input.tokenCount) || 0;
+          u.cache_creation_input_tokens = Number(snap.tokenDetails.cache_write && snap.tokenDetails.cache_write.tokenCount) || 0;
+          u.output_tokens = Number(snap.tokenDetails.output && snap.tokenDetails.output.tokenCount) || 0;
+          u.cache_read_tokens = Number(snap.tokenDetails.cache_read && snap.tokenDetails.cache_read.tokenCount) || 0;
+          hasSnapshotTokens = true;
+        }
+      }
+      if (modelMetrics && typeof modelMetrics === 'object') {
+        let reas = 0;
+        const keys = Object.keys(modelMetrics);
+        for (const k of keys) {
+          const mm = modelMetrics[k];
+          if (mm && mm.usage) reas += Number(mm.usage.reasoningTokens) || 0;
+        }
+        if (reas > 0) u.thinking_tokens = reas;
+        if ((!modelUsed || modelUsed === 'auto') && keys.length) modelUsed = keys[0];
+      }
+    };
     const handleLine = (line) => {
       if (!line) return;
       let ev;
@@ -966,23 +1032,38 @@ async function runCopilot(chatId, prompt, opts, onActivity, onEvent) {
           }
         }
       }
-      if (ev.type === 'session.usage_checkpoint' && ev.data && ev.data.accountingSnapshot) {
-        const snap = ev.data.accountingSnapshot;
-        if (snap.currentModel) modelUsed = snap.currentModel;
-        if (snap.totalPremiumRequestCost) premiumRequests = Number(snap.totalPremiumRequestCost) || premiumRequests;
-        if (snap.totalApiDurationMs) durationMs = Number(snap.totalApiDurationMs) || durationMs;
-        if (snap.tokenDetails) {
-          u.input_tokens = Number(snap.tokenDetails.input && snap.tokenDetails.input.tokenCount) || u.input_tokens;
-          u.output_tokens = Number(snap.tokenDetails.output && snap.tokenDetails.output.tokenCount) || u.output_tokens;
-          u.cache_read_tokens = Number(snap.tokenDetails.cache_read && snap.tokenDetails.cache_read.tokenCount) || u.cache_read_tokens;
-        }
+      if (ev.type === 'session.usage_record' && ev.data && ev.data.usage) {
+        const ru = ev.data.usage;
+        stepCalls++;
+        if (ru.responseModel || ru.model) modelUsed = ru.responseModel || ru.model;
+        const tin = Number(ru.inputTokens) || 0;
+        const cr = Number(ru.cacheReadTokens) || 0;
+        const cw = Number(ru.cacheWriteTokens) || 0;
+        stepUncachedIn += Math.max(0, tin - cr - cw);
+        stepCacheWrite += cw;
+        stepCacheRead += cr;
+        stepOut += Number(ru.outputTokens) || 0;
+        stepReasoning += Number(ru.reasoningTokens) || 0;
+        stepDurationMs += Number(ru.duration) || 0;
+      }
+      if (ev.type === 'session.usage_checkpoint' && ev.data) {
+        if (ev.data.totalNanoAiu != null) nanoAiu = Number(ev.data.totalNanoAiu) || nanoAiu;
+        if (ev.data.totalPremiumRequests != null) premiumRequests = Number(ev.data.totalPremiumRequests) || premiumRequests;
+        if (ev.data.accountingSnapshot || ev.data.modelMetrics) applySnapshot(ev.data.accountingSnapshot, ev.data.modelMetrics);
+      }
+      if (ev.type === 'session.shutdown' && ev.data) {
+        if (ev.data.totalNanoAiu != null) nanoAiu = Number(ev.data.totalNanoAiu) || nanoAiu;
+        if (ev.data.totalPremiumRequests != null) premiumRequests = Number(ev.data.totalPremiumRequests) || premiumRequests;
+        if (ev.data.totalApiDurationMs) durationMs = Number(ev.data.totalApiDurationMs) || durationMs;
+        if (ev.data.accountingSnapshot || ev.data.modelMetrics) applySnapshot(ev.data.accountingSnapshot, ev.data.modelMetrics);
       }
       if (ev.type === 'result') {
         if (ev.sessionId) sessionId = ev.sessionId;
         if (typeof ev.exitCode === 'number') exitCode = ev.exitCode;
         if (ev.usage) {
           if (ev.usage.sessionDurationMs) durationMs = Number(ev.usage.sessionDurationMs) || durationMs;
-          if (ev.usage.premiumRequests) premiumRequests = Number(ev.usage.premiumRequests) || premiumRequests;
+          if (ev.usage.premiumRequests != null) premiumRequests = Number(ev.usage.premiumRequests) || premiumRequests;
+          if (ev.usage.totalNanoAiu != null) nanoAiu = Number(ev.usage.totalNanoAiu) || nanoAiu;
         }
       }
     };
@@ -1000,16 +1081,33 @@ async function runCopilot(chatId, prompt, opts, onActivity, onEvent) {
     child.on('error', (e) => done({ error: e.message }));
     child.on('close', (code, signal) => {
       if (buf.trim()) handleLine(buf.trim());
-      if (signal && !timedOut) return done({ stopped: true });
-      if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
-      const text = texts.join('\n\n').trim();
-      if (!text && (code !== 0 || exitCode !== 0)) {
-        return done({ error: 'copilot saiu com código ' + (code || exitCode) + ': ' + (err || out).slice(-500) });
+      if (!hasSnapshotTokens && stepCalls > 0) {
+        u.input_tokens = stepUncachedIn;
+        u.cache_creation_input_tokens = stepCacheWrite;
+        u.output_tokens = stepOut;
+        u.thinking_tokens = stepReasoning;
+        u.cache_read_tokens = stepCacheRead;
+        if (!durationMs && stepDurationMs) durationMs = stepDurationMs;
       }
       const ms = durationMs || (Date.now() - started);
-      logUsage('copilot', chatId, 0, ms, u, modelUsed || opts.model || 'auto');
+      const aiu = nanoAiu > 0 ? Math.round((nanoAiu / 1e9) * 10000) / 10000 : 0;
+      const hasAnyUsage = u.input_tokens > 0 || u.cache_creation_input_tokens > 0 || u.output_tokens > 0 || u.thinking_tokens > 0 || u.cache_read_tokens > 0 || aiu > 0;
+      if (signal && !timedOut) {
+        if (hasAnyUsage) logUsage('copilot', chatId, 0, ms, u, modelUsed || opts.model || 'auto', { aiu, premiumRequests });
+        return done({ stopped: true });
+      }
+      if (timedOut) {
+        if (hasAnyUsage) logUsage('copilot', chatId, 0, ms, u, modelUsed || opts.model || 'auto', { aiu, premiumRequests });
+        return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
+      }
+      const text = texts.join('\n\n').trim();
+      if (!text && (code !== 0 || exitCode !== 0)) {
+        if (hasAnyUsage) logUsage('copilot', chatId, 0, ms, u, modelUsed || opts.model || 'auto', { aiu, premiumRequests });
+        return done({ error: 'copilot saiu com código ' + (code || exitCode) + ': ' + (err || out).slice(-500) });
+      }
+      logUsage('copilot', chatId, 0, ms, u, modelUsed || opts.model || 'auto', { aiu, premiumRequests });
       done({ text: text || '(sem resposta)', sessionId, provider: 'copilot',
-        usage: { cost: 0, ms, turns: turns || 1, premiumRequests, in: u.input_tokens, out: u.output_tokens, cacheRead: u.cache_read_tokens } });
+        usage: { cost: 0, ms, turns: turns || 1, premiumRequests, aiu, in: u.input_tokens + u.cache_creation_input_tokens, out: u.output_tokens + u.thinking_tokens, cacheRead: u.cache_read_tokens } });
     });
   });
 }
@@ -6493,11 +6591,15 @@ function webSend(chatId, text, files = [], transcript = '') {
 // Every run appends one line to usage.jsonl. Claude's history before that file existed is rebuilt from
 // Claude Code's own transcripts (~/.claude/projects/**/*.jsonl), which carry token counts per message.
 const USAGE_FILE = path.join(DATA_DIR, 'usage.jsonl');
-function logUsage(provider, chatId, cost, ms, u, model) {
+function logUsage(provider, chatId, cost, ms, u, model, extra) {
   try {
     u = u || {};
+    const aiuVal = extra && Number(extra.aiu) > 0 ? Math.round(Number(extra.aiu) * 10000) / 10000 : 0;
+    const premVal = extra && Number(extra.premiumRequests) > 0 ? Number(extra.premiumRequests) : 0;
     const line = { at: new Date().toISOString(), provider, web: isWeb(chatId), cost: cost || 0, ms: ms || 0,
       ...(model ? { model: String(model) } : {}),
+      ...(aiuVal > 0 ? { aiu: aiuVal } : {}),
+      ...(premVal > 0 ? { premiumRequests: premVal } : {}),
       in: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0), out: (u.output_tokens || 0) + (u.thinking_tokens || 0),
       cacheRead: u.cache_read_input_tokens || u.cache_read_tokens || 0 };
     fs.appendFileSync(USAGE_FILE, JSON.stringify(line) + '\n');
@@ -6507,8 +6609,9 @@ const dayKey = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: TZ, year: 'nu
 const HOME_DIR = env.HOME || '/tmp';
 const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
 
-const usageCache = { claude: null, agy: null, agyProject: null, claudeBlockedUntil: 0 };
+const usageCache = { claude: null, agy: null, agyProject: null, claudeBlockedUntil: 0, copilot: null };
 const CLAUDE_USAGE_TTL = 5 * 60000; // the oauth/usage endpoint rate-limits hard: poll at most every 5 min
+const COPILOT_USAGE_TTL = 2 * 60000;
 const CLAUDE_CRED_FILE = path.join(HOME_DIR, '.claude', '.credentials.json');
 const CLAUDE_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 // Refreshes ~/.claude/.credentials.json with its refreshToken. Runs use CLAUDE_CODE_OAUTH_TOKEN, so nothing
@@ -6614,6 +6717,313 @@ async function agyLimits() {
   }
   usageCache.agy = { t: Date.now(), v };
   return v;
+}
+
+async function copilotLimits() {
+  const c = usageCache.copilot;
+  if (c && Date.now() - c.t < (c.v && c.v.error ? 60000 : COPILOT_USAGE_TTL)) return c.v;
+  const prevOk = c && c.v && c.v.plan ? c.v : null;
+  const installed = await isCliBinInstalled(COPILOT_BIN, 'cp');
+  if (!installed && !env.COPILOT_USAGE_URL && !env.COPILOT_GITHUB_TOKEN) {
+    const v = { installed: false, plan: null, planLabel: null, quotas: [], fetchedAt: new Date().toISOString(), error: null, stale: false };
+    usageCache.copilot = { t: Date.now(), v };
+    return v;
+  }
+  const token = await getCopilotToken();
+  if (!token) {
+    const v = {
+      installed,
+      ...(prevOk || {}),
+      plan: prevOk ? prevOk.plan : null,
+      planLabel: prevOk ? prevOk.planLabel : null,
+      quotas: prevOk ? prevOk.quotas : [],
+      fetchedAt: prevOk ? prevOk.fetchedAt : new Date().toISOString(),
+      error: installed ? 'GitHub Copilot sem token (rode gh auth login ou configure COPILOT_GITHUB_TOKEN)' : null,
+      stale: Boolean(prevOk),
+    };
+    usageCache.copilot = { t: Date.now(), v };
+    return v;
+  }
+  let v;
+  try {
+    const url = env.COPILOT_USAGE_URL || 'https://api.github.com/copilot_internal/user';
+    const r = await fetch(url, {
+      signal: AbortSignal.timeout(15000),
+      headers: {
+        Authorization: 'Bearer ' + token,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'claude-zap',
+      },
+    });
+    if (!r.ok) throw new Error('Copilot cota: HTTP ' + r.status + (r.status === 401 || r.status === 403 ? ' (token sem acesso ou expirado)' : ''));
+    const j = await r.json();
+    const plan = j.access_type_sku || j.copilot_plan || null;
+    const cpPlanNames = {
+      free_limited_copilot: 'Free',
+      individual: 'Pro',
+      copilot_for_individuals: 'Pro',
+      pro_plus: 'Pro+',
+      copilot_pro_plus: 'Pro+',
+      business: 'Business',
+      copilot_for_business: 'Business',
+      enterprise: 'Enterprise',
+      copilot_for_enterprise: 'Enterprise',
+    };
+    const planLabel = cpPlanNames[plan] || cpPlanNames[j.copilot_plan] || j.copilot_plan || plan || null;
+    const resetsAt = j.quota_reset_date_utc || (j.quota_reset_date ? j.quota_reset_date + 'T00:00:00.000Z' : null);
+    const quotaLabels = { chat: 'Chat', completions: 'Autocompletar', premium_interactions: 'Premium' };
+    const quotaOrder = { chat: 0, premium_interactions: 1, completions: 2 };
+    const quotas = [];
+    for (const [k, q] of Object.entries(j.quota_snapshots || {})) {
+      if (!q || typeof q !== 'object') continue;
+      const ent = Number(q.entitlement) || 0;
+      if (!q.unlimited && !q.has_quota && ent <= 0) continue;
+      const used = Number(q.credits_used ?? q.used ?? 0) || 0;
+      const rem = Number(q.remaining ?? q.quota_remaining ?? 0) || 0;
+      let percent = null;
+      if (!q.unlimited) {
+        if (typeof q.percent_remaining === 'number' && Number.isFinite(q.percent_remaining)) {
+          percent = Math.round(Math.max(0, Math.min(100, 100 - q.percent_remaining)) * 10) / 10;
+        } else if (ent > 0) {
+          percent = Math.round(Math.max(0, Math.min(100, (used / ent) * 100)) * 10) / 10;
+        }
+      }
+      quotas.push({
+        id: k,
+        label: quotaLabels[k] || k,
+        unlimited: Boolean(q.unlimited),
+        percent,
+        used,
+        remaining: rem,
+        entitlement: ent,
+        overageCount: Number(q.overage_count) || 0,
+        resetsAt,
+      });
+    }
+    quotas.sort((a, b) => (quotaOrder[a.id] ?? 99) - (quotaOrder[b.id] ?? 99));
+    v = {
+      installed,
+      login: j.login || null,
+      plan,
+      planLabel,
+      quotas,
+      resetsAt,
+      tokenBasedBilling: Boolean(j.token_based_billing),
+      fetchedAt: new Date().toISOString(),
+    };
+  } catch (e) {
+    v = { installed, ...(prevOk || {}), error: e.message, stale: Boolean(prevOk) };
+  }
+  usageCache.copilot = { t: Date.now(), v };
+  return v;
+}
+
+let cpDbCache = { sig: '', value: null };
+function copilotDbHistory() {
+  const dbPath = path.join(HOME_DIR, '.copilot', 'session-store.db');
+  const sig = sqliteSig(dbPath);
+  if (!sig) return { days: {}, since: null, models: [], monthByYm: {} };
+  if (cpDbCache.sig === sig && cpDbCache.value) return cpDbCache.value;
+  const db = openReadOnlySqlite(dbPath);
+  if (!db) return { days: {}, since: null, models: [], monthByYm: {} };
+  const days = {};
+  const monthRaw = {};
+  const allModels = new Set();
+  let minIso = '';
+  try {
+    const rows = db.prepare('SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_nano_aiu, request_multiplier, duration_ms, initiator, created_at FROM assistant_usage_events').all();
+    for (const r of rows) {
+      if (!r || !r.created_at) continue;
+      let dk;
+      try { dk = dayKey(r.created_at); } catch { continue; }
+      if (!minIso || r.created_at < minIso) minIso = r.created_at;
+      const ym = dk.slice(0, 7);
+      const inpTotal = Number(r.input_tokens) || 0;
+      const cr = Number(r.cache_read_tokens) || 0;
+      const cw = Number(r.cache_write_tokens) || 0;
+      const nonCacheIn = Math.max(0, inpTotal - cr);
+      const outTok = (Number(r.output_tokens) || 0) + (Number(r.reasoning_tokens) || 0);
+      const totTok = inpTotal + outTok;
+      const aiu = (Number(r.total_nano_aiu) || 0) / 1e9;
+      const req = r.initiator === 'user' ? (Number(r.request_multiplier) || 1) : 0;
+      const dur = Number(r.duration_ms) || 0;
+
+      const d = (days[dk] ||= { in: 0, out: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, calls: 0, requests: 0, aiu: 0, ms: 0, sessions: new Set(), models: new Set() });
+      d.in += nonCacheIn; d.out += outTok; d.cacheRead += cr; d.cacheWrite += cw; d.totalTokens += totTok;
+      d.calls += 1; d.requests += req; d.aiu += aiu; d.ms += dur;
+      if (r.session_id) d.sessions.add(r.session_id);
+      if (r.model) { d.models.add(r.model); allModels.add(r.model); }
+
+      const m = (monthRaw[ym] ||= { tokens: 0, cacheRead: 0, totalTokens: 0, aiu: 0, requests: 0, calls: 0, sessions: new Set(), models: new Set() });
+      m.tokens += nonCacheIn + outTok; m.cacheRead += cr; m.totalTokens += totTok; m.aiu += aiu; m.requests += req; m.calls += 1;
+      if (r.session_id) m.sessions.add(r.session_id);
+      if (r.model) m.models.add(r.model);
+    }
+  } catch {}
+  finally { try { db.close(); } catch {} }
+
+  const cleanDays = {};
+  for (const [k, d] of Object.entries(days)) {
+    cleanDays[k] = {
+      in: d.in, out: d.out, cacheRead: d.cacheRead, cacheWrite: d.cacheWrite, totalTokens: d.totalTokens,
+      calls: d.calls, requests: Math.round(d.requests * 10) / 10,
+      aiu: Math.round(d.aiu * 10000) / 10000, ms: d.ms,
+      sessionsCount: d.sessions.size, models: [...d.models].sort(),
+    };
+  }
+  const monthByYm = {};
+  for (const [ym, m] of Object.entries(monthRaw)) {
+    monthByYm[ym] = {
+      tokens: m.tokens, cacheRead: m.cacheRead, totalTokens: m.totalTokens,
+      credits: Math.round(m.aiu * 100) / 100, requests: Math.round(m.requests * 10) / 10,
+      calls: m.calls, sessionsCount: m.sessions.size, models: [...m.models].sort(),
+    };
+  }
+  const value = { days: cleanDays, since: minIso || null, models: [...allModels].sort(), monthByYm };
+  cpDbCache = { sig, value };
+  return value;
+}
+
+let ocDbCache = { sig: '', value: null };
+function openCodeDbHistory() {
+  const dataRoot = env.XDG_DATA_HOME || path.join(HOME_DIR, '.local', 'share');
+  const dbPath = path.join(dataRoot, 'opencode', 'opencode.db');
+  const sig = sqliteSig(dbPath);
+  if (!sig) return { days: {}, since: null, lastOkAt: 0, hasPaid: false, hasAccount: false, monthByYm: {} };
+  if (ocDbCache.sig === sig && ocDbCache.value) return ocDbCache.value;
+  const db = openReadOnlySqlite(dbPath);
+  if (!db) return { days: {}, since: null, lastOkAt: 0, hasPaid: false, hasAccount: false, monthByYm: {} };
+  const days = {};
+  const monthRaw = {};
+  let minTs = 0, lastOkAt = 0, hasPaid = false, hasAccount = false;
+  try {
+    try {
+      const r1 = db.prepare('SELECT count(*) AS n FROM account').get();
+      if (r1 && Number(r1.n) > 0) hasAccount = true;
+    } catch {}
+    try {
+      const r2 = db.prepare('SELECT count(*) AS n FROM control_account').get();
+      if (r2 && Number(r2.n) > 0) hasAccount = true;
+    } catch {}
+    const rows = db.prepare('SELECT id, session_id, time_created, data FROM message WHERE data LIKE ?').all('%"assistant"%');
+    for (const r of rows) {
+      let msg;
+      try { msg = JSON.parse(r.data); } catch { continue; }
+      if (!msg || msg.role !== 'assistant') continue;
+      const ts = Number(msg.time && msg.time.created) || Number(r.time_created) || 0;
+      if (!ts) continue;
+      const tk = msg.tokens || {};
+      const inp = Number(tk.input) || 0;
+      const cw = Number(tk.cache && tk.cache.write) || 0;
+      const cr = Number(tk.cache && tk.cache.read) || 0;
+      const outTok = (Number(tk.output) || 0) + (Number(tk.reasoning) || 0);
+      const cost = Number(msg.cost) || 0;
+      const nonCacheIn = inp + cw;
+      const totalTok = Number(tk.total) || (nonCacheIn + outTok + cr);
+      const isValid = nonCacheIn > 0 || outTok > 0 || cr > 0 || Boolean(msg.finish);
+      if (!isValid) continue;
+      const completedTs = Number(msg.time && msg.time.completed) || ts;
+      if (completedTs > lastOkAt) lastOkAt = completedTs;
+      if (!minTs || ts < minTs) minTs = ts;
+      if (cost > 0) hasPaid = true;
+
+      let dk;
+      try { dk = dayKey(ts); } catch { continue; }
+      const ym = dk.slice(0, 7);
+      const d = (days[dk] ||= { in: 0, out: 0, cacheRead: 0, totalTokens: 0, cost: 0, msgs: 0, sessions: new Set(), models: new Set() });
+      d.in += nonCacheIn; d.out += outTok; d.cacheRead += cr; d.totalTokens += totalTok; d.cost += cost; d.msgs += 1;
+      if (r.session_id) d.sessions.add(r.session_id);
+      if (msg.modelID) d.models.add(msg.modelID);
+
+      const m = (monthRaw[ym] ||= { tokens: 0, cacheRead: 0, totalTokens: 0, costUsd: 0, messages: 0, sessions: new Set(), models: new Set() });
+      m.tokens += nonCacheIn + outTok; m.cacheRead += cr; m.totalTokens += totalTok; m.costUsd += cost; m.messages += 1;
+      if (r.session_id) m.sessions.add(r.session_id);
+      if (msg.modelID) m.models.add(msg.modelID);
+    }
+  } catch {}
+  finally { try { db.close(); } catch {} }
+
+  const cleanDays = {};
+  for (const [k, d] of Object.entries(days)) {
+    cleanDays[k] = {
+      in: d.in, out: d.out, cacheRead: d.cacheRead, totalTokens: d.totalTokens,
+      cost: Math.round(d.cost * 1000000) / 1000000,
+      msgs: d.msgs, sessionsCount: d.sessions.size, models: [...d.models].sort(),
+    };
+  }
+  const monthByYm = {};
+  for (const [ym, m] of Object.entries(monthRaw)) {
+    monthByYm[ym] = {
+      tokens: m.tokens, cacheRead: m.cacheRead, totalTokens: m.totalTokens,
+      costUsd: Math.round(m.costUsd * 1000000) / 1000000,
+      messages: m.messages, sessionsCount: m.sessions.size, models: [...m.models].sort(),
+    };
+  }
+  const value = { days: cleanDays, since: minTs ? new Date(minTs).toISOString() : null, lastOkAt, hasPaid, hasAccount, monthByYm };
+  ocDbCache = { sig, value };
+  return value;
+}
+
+let ocLogCache = { sig: '', value: null };
+function openCodeLogLimit() {
+  const dataRoot = env.XDG_DATA_HOME || path.join(HOME_DIR, '.local', 'share');
+  const logPath = path.join(dataRoot, 'opencode', 'log', 'opencode.log');
+  let st;
+  try { st = fs.statSync(logPath); } catch { return null; }
+  const sig = st.size + ':' + st.mtimeMs;
+  if (ocLogCache.sig === sig) return ocLogCache.value;
+  let found = null;
+  let fd;
+  try {
+    const bytesToRead = Math.min(st.size, 65536);
+    if (bytesToRead > 0) {
+      fd = fs.openSync(logPath, 'r');
+      const buf = Buffer.alloc(bytesToRead);
+      fs.readSync(fd, buf, 0, bytesToRead, st.size - bytesToRead);
+      const lines = buf.toString('utf8').split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i];
+        if (!/level=ERROR/i.test(line) || !OPENCODE_LIMIT_RE.test(line)) continue;
+        const tsM = line.match(/timestamp=(\S+)/);
+        const modM = line.match(/modelID=(\S+)/);
+        const errM = line.match(/error\.error="([^"]+)"/);
+        found = {
+          at: tsM ? tsM[1] : new Date(st.mtimeMs).toISOString(),
+          model: modM ? modM[1] : '',
+          message: errM ? errM[1] : 'Free usage limit reached',
+        };
+        break;
+      }
+    }
+  } catch {}
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+  ocLogCache = { sig, value: found };
+  return found;
+}
+
+function openCodeSummary(ocDb, ocMonth, installed) {
+  const logLim = openCodeLogLimit();
+  const candidates = [openCodeLastLimit, logLim].filter((x) => x && x.at);
+  candidates.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  const lim = candidates[0] || null;
+  const lastOkAt = Math.max(openCodeLastOkAt, ocDb.lastOkAt || 0);
+  const limMs = lim && lim.at ? Date.parse(lim.at) : NaN;
+  const rateLimited = Boolean(lim && Number.isFinite(limMs) && limMs >= lastOkAt && (Date.now() - limMs) < 24 * 3600000);
+  const hasPaid = Boolean(ocDb.hasPaid || (ocMonth && ocMonth.costUsd > 0));
+  return {
+    installed,
+    plan: hasPaid ? 'paid' : 'free',
+    planLabel: hasPaid ? 'Pago / API' : 'Gratuito',
+    hasAccount: Boolean(ocDb.hasAccount),
+    status: rateLimited ? 'limit_reached' : 'ok',
+    rateLimited,
+    error: rateLimited ? ('Limite gratuito do OpenCode atingido' + (lim.model ? ' (' + lim.model + ')' : '') + ' — aguarde renovação ou use outro provedor') : null,
+    limitHitAt: rateLimited ? lim.at : null,
+    lastActivityAt: lastOkAt ? new Date(lastOkAt).toISOString() : null,
+    fetchedAt: new Date().toISOString(),
+    month: ocMonth,
+  };
 }
 
 // Claude Code transcripts, parsed once per file version (size + mtime).
@@ -6725,44 +7135,64 @@ function auditCsv(limit = 500) {
 }
 
 async function usageReport(nDays = 56) {
-  const [claude, antigravity] = await Promise.all([claudeLimits(), agyLimits()]);
+  const [claude, antigravity, copilotLim, ocInstalled] = await Promise.all([
+    claudeLimits(),
+    agyLimits(),
+    copilotLimits(),
+    isCliBinInstalled(OPENCODE_BIN, 'oc'),
+  ]);
   const tdays = claudeTranscriptDays();
+  const cpDb = copilotDbHistory();
+  const ocDb = openCodeDbHistory();
   const log = {};
+  const firstByProvider = {};
   try {
     for (const line of fs.readFileSync(USAGE_FILE, 'utf8').split('\n')) {
       if (!line) continue; let j; try { j = JSON.parse(line); } catch { continue; }
-      const d = ((log[dayKey(j.at)] ||= {})[j.provider] ||= { runs: 0, cost: 0, ms: 0, in: 0, out: 0, cacheRead: 0 });
+      if (!j.at || !j.provider) continue;
+      if (!firstByProvider[j.provider]) firstByProvider[j.provider] = j.at;
+      const d = ((log[dayKey(j.at)] ||= {})[j.provider] ||= { runs: 0, cost: 0, ms: 0, in: 0, out: 0, cacheRead: 0, aiu: 0, premiumRequests: 0, models: new Set() });
       const lineCost = (j.provider === 'antigravity' && !(Number(j.cost) > 0))
         ? estimateAgyCost(j.model, { input_tokens: j.in, output_tokens: j.out, cache_read_tokens: j.cacheRead })
         : (Number(j.cost) || 0);
       d.runs += 1; d.cost += lineCost; d.ms += j.ms || 0; d.in += j.in || 0; d.out += j.out || 0; d.cacheRead += j.cacheRead || 0;
+      d.aiu += Number(j.aiu) || 0; d.premiumRequests += Number(j.premiumRequests) || 0;
+      if (j.model) d.models.add(String(j.model));
     }
   } catch {}
   const knownProviders = Object.keys(PROVIDERS);
-  const providerStats = () => Object.fromEntries(knownProviders.map((id) => [id, {
-    tokens: 0, runs: 0, cost: 0, msgs: 0,
-    telemetry: { runs: false, tokens: false, cost: false },
+  const emptyStats = () => ({
+    tokens: 0, cacheRead: 0, totalTokens: 0, runs: 0, cost: 0, msgs: 0, credits: 0,
+    telemetry: { runs: false, tokens: false, cost: false, credits: false },
     costEstimated: false,
-  }]));
+  });
+  const providerStats = () => Object.fromEntries(knownProviders.map((id) => [id, emptyStats()]));
   const days = [];
   const providers = providerStats();
   for (let i = nDays - 1; i >= 0; i--) {
     const date = dayKey(Date.now() - i * 86400000);
-    const tc = tdays[date], lc = log[date]?.claude, la = log[date]?.antigravity, lcp = log[date]?.copilot;
+    const tc = tdays[date], lc = log[date]?.claude, la = log[date]?.antigravity, lcp = log[date]?.copilot, loc = log[date]?.opencode;
+    const cpDay = cpDb.days[date];
+    const ocDay = ocDb.days[date];
     const dayProviders = providerStats();
     for (const [id, stats] of Object.entries(log[date] || {})) {
-      if (!dayProviders[id]) dayProviders[id] = { tokens: 0, runs: 0, cost: 0, msgs: 0,
-        telemetry: { runs: false, tokens: false, cost: false }, costEstimated: false };
+      if (!dayProviders[id]) dayProviders[id] = emptyStats();
       dayProviders[id].tokens = (stats.in || 0) + (stats.out || 0);
+      dayProviders[id].cacheRead = stats.cacheRead || 0;
+      dayProviders[id].totalTokens = dayProviders[id].tokens + dayProviders[id].cacheRead;
       dayProviders[id].runs = stats.runs || 0;
       dayProviders[id].cost = Math.round((stats.cost || 0) * 1000000) / 1000000;
+      dayProviders[id].credits = Math.round((stats.aiu || 0) * 100) / 100;
       dayProviders[id].telemetry.runs = true;
       dayProviders[id].telemetry.tokens = (stats.in || 0) > 0 || (stats.out || 0) > 0 || (stats.cacheRead || 0) > 0;
       dayProviders[id].telemetry.cost = id === 'claude' || id === 'antigravity' || id === 'opencode';
+      dayProviders[id].telemetry.credits = (stats.aiu || 0) > 0;
       dayProviders[id].costEstimated = id === 'antigravity';
     }
     if (tc) {
       dayProviders.claude.tokens = Math.max(dayProviders.claude.tokens, tc.in + tc.out);
+      dayProviders.claude.cacheRead = Math.max(dayProviders.claude.cacheRead, tc.cacheRead || 0);
+      dayProviders.claude.totalTokens = dayProviders.claude.tokens + dayProviders.claude.cacheRead;
       dayProviders.claude.msgs = tc.msgs || 0;
       dayProviders.claude.telemetry.tokens = true;
       dayProviders.claude.telemetry.runs = dayProviders.claude.runs > 0 || tc.msgs > 0;
@@ -6773,33 +7203,165 @@ async function usageReport(nDays = 56) {
       dayProviders.claude.telemetry.runs = true;
       dayProviders.claude.telemetry.cost = true;
     }
+    if (cpDay || lcp) {
+      const tok = Math.max(lcp ? lcp.in + lcp.out : 0, cpDay ? cpDay.in + cpDay.out : 0);
+      const cr = Math.max(lcp?.cacheRead || 0, cpDay?.cacheRead || 0);
+      const tot = Math.max(tok + cr, cpDay?.totalTokens || 0);
+      const runs = Math.max(lcp?.runs || 0, cpDay ? Math.round(cpDay.requests) : 0);
+      const msgs = cpDay?.calls || 0;
+      const credits = Math.round(Math.max(lcp?.aiu || 0, cpDay?.aiu || 0) * 100) / 100;
+      dayProviders.copilot.tokens = tok;
+      dayProviders.copilot.cacheRead = cr;
+      dayProviders.copilot.totalTokens = tot;
+      dayProviders.copilot.runs = runs;
+      dayProviders.copilot.msgs = msgs;
+      dayProviders.copilot.credits = credits;
+      dayProviders.copilot.cost = 0;
+      dayProviders.copilot.telemetry.runs = Boolean(runs > 0 || msgs > 0);
+      dayProviders.copilot.telemetry.tokens = Boolean(tok > 0 || cr > 0);
+      dayProviders.copilot.telemetry.cost = false;
+      dayProviders.copilot.telemetry.credits = Boolean(credits > 0);
+    }
+    if (ocDay || loc) {
+      const tok = Math.max(loc ? loc.in + loc.out : 0, ocDay ? ocDay.in + ocDay.out : 0);
+      const cr = Math.max(loc?.cacheRead || 0, ocDay?.cacheRead || 0);
+      const tot = Math.max(tok + cr, ocDay?.totalTokens || 0);
+      const runs = Math.max(loc?.runs || 0, ocDay?.sessionsCount || 0);
+      const msgs = ocDay?.msgs || 0;
+      const cost = Math.round(Math.max(loc?.cost || 0, ocDay?.cost || 0) * 1000000) / 1000000;
+      dayProviders.opencode.tokens = tok;
+      dayProviders.opencode.cacheRead = cr;
+      dayProviders.opencode.totalTokens = tot;
+      dayProviders.opencode.runs = runs;
+      dayProviders.opencode.msgs = msgs;
+      dayProviders.opencode.cost = cost;
+      dayProviders.opencode.telemetry.runs = Boolean(runs > 0 || msgs > 0);
+      dayProviders.opencode.telemetry.tokens = Boolean(tok > 0 || cr > 0);
+      dayProviders.opencode.telemetry.cost = Boolean(runs > 0 || msgs > 0 || cost > 0);
+    }
     for (const [id, ds] of Object.entries(dayProviders)) {
-      const ps = providers[id] ||= { tokens: 0, runs: 0, cost: 0, msgs: 0,
-        telemetry: { runs: false, tokens: false, cost: false }, costEstimated: false };
+      const ps = providers[id] ||= emptyStats();
       ps.tokens += ds.tokens;
+      ps.cacheRead += ds.cacheRead || 0;
+      ps.totalTokens += ds.totalTokens || 0;
       ps.runs += ds.runs;
       ps.cost = Math.round((ps.cost + ds.cost) * 1000000) / 1000000;
       ps.msgs += ds.msgs || 0;
+      ps.credits = Math.round((ps.credits + (ds.credits || 0)) * 100) / 100;
       ps.telemetry.runs ||= ds.telemetry.runs;
       ps.telemetry.tokens ||= ds.telemetry.tokens;
       ps.telemetry.cost ||= ds.telemetry.cost;
+      ps.telemetry.credits ||= Boolean(ds.telemetry.credits);
       ps.costEstimated ||= ds.costEstimated;
-      ds.telemetry.available = Boolean(ds.telemetry.runs || ds.telemetry.tokens || ds.telemetry.cost);
+      ds.telemetry.available = Boolean(ds.telemetry.runs || ds.telemetry.tokens || ds.telemetry.cost || ds.telemetry.credits);
     }
     days.push({ date,
       claude: { tokens: tc ? tc.in + tc.out : (lc ? lc.in + lc.out : 0), out: tc?.out || lc?.out || 0, cacheRead: tc?.cacheRead || lc?.cacheRead || 0, msgs: tc?.msgs || 0, runs: lc?.runs || 0, cost: lc?.cost || 0 },
       antigravity: { tokens: la ? la.in + la.out : 0, out: la?.out || 0, cacheRead: la?.cacheRead || 0, runs: la?.runs || 0, cost: Math.round((la?.cost || 0) * 1000000) / 1000000 },
-      copilot: { tokens: lcp ? lcp.in + lcp.out : 0, out: lcp?.out || 0, cacheRead: lcp?.cacheRead || 0, runs: lcp?.runs || 0 },
+      copilot: {
+        tokens: dayProviders.copilot.tokens,
+        out: Math.max(lcp?.out || 0, cpDay?.out || 0),
+        cacheRead: dayProviders.copilot.cacheRead,
+        totalTokens: dayProviders.copilot.totalTokens,
+        runs: dayProviders.copilot.runs,
+        msgs: dayProviders.copilot.msgs,
+        credits: dayProviders.copilot.credits,
+      },
+      opencode: {
+        tokens: dayProviders.opencode.tokens,
+        out: Math.max(loc?.out || 0, ocDay?.out || 0),
+        cacheRead: dayProviders.opencode.cacheRead,
+        totalTokens: dayProviders.opencode.totalTokens,
+        runs: dayProviders.opencode.runs,
+        msgs: dayProviders.opencode.msgs,
+        cost: dayProviders.opencode.cost,
+      },
       providers: dayProviders });
   }
   for (const id of Object.keys(providers)) {
-    if (!providers[id].telemetry.runs && !providers[id].telemetry.tokens && !providers[id].telemetry.cost) {
+    if (!providers[id].telemetry.runs && !providers[id].telemetry.tokens && !providers[id].telemetry.cost && !providers[id].telemetry.credits) {
       providers[id].telemetry = { ...providers[id].telemetry, available: false };
     } else {
       providers[id].telemetry.available = true;
     }
   }
-  return { fetchedAt: new Date().toISOString(), claude, antigravity, providers, days, tz: TZ, spending: monthlySpendSummary(), routineForecasts: routineForecasts(), historySince: { antigravity: fs.existsSync(USAGE_FILE) ? (fs.readFileSync(USAGE_FILE, 'utf8').slice(0, 40).match(/"at":"([^"]+)/) || [])[1] || null : null } };
+  const ym = dayKey(Date.now()).slice(0, 7);
+  const cpDbMonth = cpDb.monthByYm[ym];
+  const cpMonthDates = new Set([...Object.keys(cpDb.days), ...Object.keys(log)].filter((dk) => dk.startsWith(ym)));
+  const cpMonthModels = new Set(cpDbMonth ? cpDbMonth.models : []);
+  let cpMonthTok = 0, cpMonthCr = 0, cpMonthTot = 0, cpMonthCredits = 0, cpMonthReq = 0, cpMonthCalls = 0;
+  for (const dk of cpMonthDates) {
+    const dbd = cpDb.days[dk], ld = log[dk]?.copilot;
+    if (!dbd && !ld) continue;
+    const tok = Math.max(ld ? ld.in + ld.out : 0, dbd ? dbd.in + dbd.out : 0);
+    const cr = Math.max(ld?.cacheRead || 0, dbd?.cacheRead || 0);
+    cpMonthTok += tok;
+    cpMonthCr += cr;
+    cpMonthTot += Math.max(tok + cr, dbd?.totalTokens || 0);
+    cpMonthCredits += Math.max(ld?.aiu || 0, dbd?.aiu || 0);
+    cpMonthReq += Math.max(ld?.runs || 0, dbd?.requests || 0);
+    cpMonthCalls += Math.max(ld?.runs || 0, dbd?.calls || 0);
+    if (ld && ld.models) for (const m of ld.models) if (m && m !== 'auto') cpMonthModels.add(m);
+  }
+  const cpMonth = {
+    tokens: cpMonthTok,
+    cacheRead: cpMonthCr,
+    totalTokens: cpMonthTot,
+    credits: Math.round(cpMonthCredits * 100) / 100,
+    requests: Math.round(cpMonthReq * 10) / 10,
+    calls: cpMonthCalls,
+    sessions: cpDbMonth ? cpDbMonth.sessionsCount : 0,
+    models: [...cpMonthModels].sort(),
+  };
+
+  const ocDbMonth = ocDb.monthByYm[ym];
+  const ocMonthDates = new Set([...Object.keys(ocDb.days), ...Object.keys(log)].filter((dk) => dk.startsWith(ym)));
+  const ocMonthModels = new Set(ocDbMonth ? ocDbMonth.models : []);
+  let ocMonthTok = 0, ocMonthCr = 0, ocMonthTot = 0, ocMonthCost = 0, ocMonthMsgs = 0, ocMonthRuns = 0;
+  for (const dk of ocMonthDates) {
+    const dbd = ocDb.days[dk], ld = log[dk]?.opencode;
+    if (!dbd && !ld) continue;
+    const tok = Math.max(ld ? ld.in + ld.out : 0, dbd ? dbd.in + dbd.out : 0);
+    const cr = Math.max(ld?.cacheRead || 0, dbd?.cacheRead || 0);
+    ocMonthTok += tok;
+    ocMonthCr += cr;
+    ocMonthTot += Math.max(tok + cr, dbd?.totalTokens || 0);
+    ocMonthCost += Math.max(ld?.cost || 0, dbd?.cost || 0);
+    ocMonthMsgs += Math.max(ld?.runs || 0, dbd?.msgs || 0);
+    ocMonthRuns += Math.max(ld?.runs || 0, dbd?.sessionsCount || 0);
+    if (ld && ld.models) for (const m of ld.models) if (m) ocMonthModels.add(String(m).replace(/^opencode\//, ''));
+  }
+  const ocMonth = {
+    tokens: ocMonthTok,
+    cacheRead: ocMonthCr,
+    totalTokens: ocMonthTot,
+    costUsd: Math.round(ocMonthCost * 1000000) / 1000000,
+    messages: ocMonthMsgs,
+    runs: ocMonthRuns,
+    sessions: ocDbMonth ? ocDbMonth.sessionsCount : ocMonthRuns,
+    models: [...ocMonthModels].sort(),
+  };
+
+  const copilot = { ...copilotLim, month: cpMonth };
+  const opencode = openCodeSummary(ocDb, ocMonth, ocInstalled);
+  const agySince = fs.existsSync(USAGE_FILE) ? (fs.readFileSync(USAGE_FILE, 'utf8').slice(0, 40).match(/"at":"([^"]+)/) || [])[1] || null : null;
+  return {
+    fetchedAt: new Date().toISOString(),
+    claude,
+    antigravity,
+    copilot,
+    opencode,
+    providers,
+    days,
+    tz: TZ,
+    spending: monthlySpendSummary(),
+    routineForecasts: routineForecasts(),
+    historySince: {
+      antigravity: agySince,
+      copilot: cpDb.since || firstByProvider.copilot || null,
+      opencode: ocDb.since || firstByProvider.opencode || null,
+    },
+  };
 }
 
 // ---------- memory explorer: ai-memory wiki pages + Claude Code's own memory files ----------

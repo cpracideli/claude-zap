@@ -4,9 +4,35 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 
 const dir = path.dirname(new URL(import.meta.url).pathname);
 const tmp = path.join(dir, 'tmp-opencode'); fs.rmSync(tmp, { recursive: true, force: true }); fs.mkdirSync(tmp);
+const ocDataDir = path.join(tmp, '.local', 'share', 'opencode');
+fs.mkdirSync(ocDataDir, { recursive: true });
+const ocDb = new DatabaseSync(path.join(ocDataDir, 'opencode.db'));
+ocDb.exec(`
+  CREATE TABLE message (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL,
+    data TEXT NOT NULL
+  );
+`);
+const prevTs = Date.now() - 86400000;
+ocDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
+  .run('msg_prev_1', 'ses_prev_1', prevTs, prevTs, JSON.stringify({
+    role: 'assistant',
+    modelID: 'deepseek-v4.1-flash-free',
+    providerID: 'opencode',
+    cost: 0.012,
+    finish: 'stop',
+    time: { created: prevTs, completed: prevTs + 500 },
+    tokens: { input: 200, output: 30, reasoning: 10, cache: { read: 400, write: 50 } },
+  }));
+ocDb.close();
+
 const LOG = path.join(tmp, 'oc-calls.jsonl');
 const fakeOc = path.join(tmp, 'opencode.mjs');
 fs.writeFileSync(fakeOc, `
@@ -24,7 +50,7 @@ if (prompt.includes('FAILME')) {
 const sid = get('-s') || 'ses_NEW1234';
 console.log(JSON.stringify({ type: 'step_start', sessionID: sid, part: { type: 'step-start' } }));
 console.log(JSON.stringify({ type: 'text', sessionID: sid, part: { type: 'text', text: 'ECHO-OC model=' + get('-m') + ' resume=' + get('-s') } }));
-console.log(JSON.stringify({ type: 'step_finish', sessionID: sid, part: { type: 'step-finish', cost: 0, tokens: { input: 10, output: 3, reasoning: 1, cache: { read: 5, write: 0 } } } }));
+console.log(JSON.stringify({ type: 'step_finish', sessionID: sid, part: { type: 'step-finish', cost: 0, tokens: { input: 10, output: 3, reasoning: 1, cache: { read: 5, write: 12 } } } }));
 `);
 const fakeOcBin = path.join(tmp, 'opencode');
 fs.writeFileSync(fakeOcBin, '#!/bin/sh\nexec ' + process.execPath + ' ' + fakeOc + ' "$@"\n', { mode: 0o755 });
@@ -106,11 +132,14 @@ try {
   const err = await until(() => sent.find((m) => /Erro ao executar OpenCode/.test(m.text)));
   check('OpenCode error is reported to the user', Boolean(err), sent.map((m) => m.text).slice(-1));
 
-  // 8) usage is logged under the opencode provider
-  const usage = await api('GET', '/usage');
+  // 8) usage is logged under the opencode provider + opencode.db history + rate-limit detection
+  const usage = await api('GET', '/usage?days=14');
   check('usage endpoint responds', usage.status === 200, usage.status);
   check('usage log file records opencode runs', fs.existsSync(path.join(tmp, '.bridge', 'usage.jsonl')) ? fs.readFileSync(path.join(tmp, '.bridge', 'usage.jsonl'), 'utf8').includes('"provider":"opencode"') : false);
-  check('usage contract includes opencode in provider map', Boolean(usage.body.providers && usage.body.providers.opencode && usage.body.providers.opencode.runs >= 1), usage.body.providers);
+  check('usage contract includes opencode in provider map with cacheRead and DB history', Boolean(usage.body.providers && usage.body.providers.opencode && usage.body.providers.opencode.runs >= 2 && usage.body.providers.opencode.cacheRead >= 400 && usage.body.providers.opencode.tokens >= 290), usage.body.providers && usage.body.providers.opencode);
+  check('usage detects opencode rate limit after FreeUsageLimitError', Boolean(usage.body.opencode && usage.body.opencode.rateLimited === true && usage.body.opencode.error && usage.body.opencode.month && usage.body.opencode.month.tokens >= 290), usage.body.opencode);
+  const yest = usage.body.days && usage.body.days.at(-2);
+  check('usage includes yesterday opencode data from opencode.db', Boolean(yest && yest.opencode && yest.opencode.tokens >= 290 && yest.providers && yest.providers.opencode && yest.providers.opencode.cacheRead >= 400), yest);
   check('usage history includes providers map', usage.body.days.every((day) => day.providers && typeof day.providers === 'object'), usage.body.days.at(-1));
   for (const id of ['claude', 'antigravity', 'opencode', 'copilot', 'openai_compat']) {
     check('usage contract includes provider ' + id, Boolean(usage.body.providers[id]), usage.body.providers);
