@@ -373,10 +373,26 @@ try {
   await local('PATCH', '/tickets/' + tkTodo.id, { interrupted: true });
   const patchIntMsg = await until(() => waTexts().find((t) => t.includes('#' + tkTodo.id) && t.includes('Interrompida')));
   check('patching ticket interrupted false -> true notifies WhatsApp', Boolean(patchIntMsg), waTexts());
+  // Patch already-interrupted -> silent
   wahaCalls.length = 0;
   await local('PATCH', '/tickets/' + tkTodo.id, { interrupted: true, priority: 'urgent' });
   await wait(300);
   check('patching already-interrupted ticket does NOT renotify WhatsApp', waTexts().length === 0, waTexts());
+
+  // 10b) runTicket normal completion -> review notifies WhatsApp; runTicket failure -> blocked notifies WhatsApp
+  wahaCalls.length = 0;
+  const tkRunOk = (await local('POST', '/tickets', { title: 'Executar diagnóstico API', description: 'Checar endpoints', status: 'todo', priority: 'medium', bot: 'default' })).body;
+  await api('POST', '/tickets/' + tkRunOk.id + '/run');
+  const runOkMsg = await until(() => waTexts().find((t) => t.includes('#' + tkRunOk.id) && t.includes('Aguardando revisão')));
+  check('runTicket finishing into review notifies WhatsApp with board link', Boolean(runOkMsg && runOkMsg.includes(PANEL_URL + '/#/board')), waTexts());
+
+  wahaCalls.length = 0;
+  const tkRunFail = (await local('POST', '/tickets', { title: 'Job com erro TICKET_FAIL', description: 'TICKET_FAIL', status: 'todo', priority: 'high', bot: 'default' })).body;
+  await api('POST', '/tickets/' + tkRunFail.id + '/run');
+  const runFailMsg = await until(() => waTexts().find((t) => t.includes('#' + tkRunFail.id) && t.includes('Bloqueada')));
+  check('runTicket failing into blocked notifies WhatsApp with error detail and board link', Boolean(
+    runFailMsg && runFailMsg.includes('Erro:') && runFailMsg.includes(PANEL_URL + '/#/board')
+  ), waTexts());
 
   // 11) Multi-step workflow approval on Web chat -> single WhatsApp notification (no duplicate), resumed via WA!
   wahaCalls.length = 0;
@@ -406,13 +422,17 @@ try {
   const pgData = (await api('GET', '/pages/' + pg.id + '/data')).body;
   check('approving workflow via WhatsApp resumes and completes workflow', Boolean(wfCompleted && pgData.approvedViaWa === true), { wfCompleted, pgData });
 
-  // 11b) Owner WhatsApp @lid replies (numeric text + reaction) answer mirrored prompts and Goal @lid notify deduplicates
+  // 11b) Owner WhatsApp @lid replies (numeric text + reaction + clearing stale @lid menu) answer mirrored prompts and Goal @lid notify deduplicates
+  // Open a numbered /bot menu on @lid first, then mirror a Web prompt -> menu must be cleared so "1" answers the prompt!
+  wahaCalls.length = 0;
+  await waEvent('message', { id: 'm-lid-menu', from: W_LID, body: '/bot' });
+  await until(() => wahaCalls.some((c) => (c.url === '/api/sendText' || c.url === '/api/sendPoll') && c.body?.chatId === W_LID));
   wahaCalls.length = 0;
   const lidTextPromise = local('POST', '/prompts', { chatId: webChat.id, title: 'Confirmar via LID', question: 'Rodar job via LID?', options: ['Executar', 'Cancelar'], wait: 8 });
   await until(() => waTexts().find((t) => t.includes('Confirmar via LID')));
   await waEvent('message', { id: 'm-lid-text', from: W_LID, body: '1' });
   const lidTextRes = await lidTextPromise;
-  check('numeric WhatsApp reply from @lid answers mirrored Web prompt', lidTextRes.status === 200 && lidTextRes.body.status === 'answered' && lidTextRes.body.answer === 'Executar', lidTextRes.body);
+  check('numeric WhatsApp reply from @lid clears stale @lid menu and answers mirrored Web prompt', lidTextRes.status === 200 && lidTextRes.body.status === 'answered' && lidTextRes.body.answer === 'Executar', lidTextRes.body);
 
   wahaCalls.length = 0;
   const lidReactPromise = local('POST', '/prompts', { chatId: webChat.id, title: 'Reagir via LID', question: 'Confirmar com reação?', options: ['Sim', 'Não'], wait: 8 });

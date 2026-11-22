@@ -2964,10 +2964,18 @@ async function notifyDecisionWhatsApp(text, opts = {}) {
   return { sent };
 }
 
+function clearMenusForWa(chatId) {
+  if (!chatId) return;
+  menus.delete(chatId);
+  for (const k of [...menus.keys()]) {
+    if (k === chatId || sameWaNumber(k, chatId)) menus.delete(k);
+  }
+}
+
 async function sendPromptWhatsApp(p, targetChatId = p.chatId, opts = {}) {
   const to = targetChatId || p.chatId;
   if (!to || !String(env.WAHA_URL || '').trim()) return;
-  menus.delete(to);
+  clearMenusForWa(to);
   const mirrored = Boolean(opts.mirrored || (to !== p.chatId && !sameWaNumber(to, p.chatId)));
   const originLine = mirrored ? '\n_Origem: ' + promptOriginLabel(p.chatId) + '_' : '';
   const linkPath = isWeb(p.chatId) ? '/#/chat/' + String(p.chatId).slice(4) : '';
@@ -3232,7 +3240,7 @@ function isPromptActiveForWa(p, chatId, text, waNumber = '') {
   if (isPromptDirectForWa(p, chatId, waNumber)) return running.has(p.chatId) || Boolean(p.nudgeId) || Boolean(p.workflowRunId);
   if (isPromptMirroredTo(p, chatId, waNumber)) {
     if (text === null) return running.has(p.chatId) || Boolean(p.nudgeId) || Boolean(p.workflowRunId);
-    if (running.has(p.chatId)) return true;
+    if (p.kind !== 'secret' && running.has(p.chatId)) return true;
     const { withoutPin } = extractPinFromText(text);
     return matchPromptReply(p, withoutPin).matched;
   }
@@ -5815,7 +5823,7 @@ async function executeWorkflowFrom(run, startIdx) {
           return run;
         }
       } else if (step.type === 'approval') {
-        const targetChat = step.chatId || wf.chatId || Object.keys(chats).find((id) => isWeb(id)) || (ALLOWED[0] ? ALLOWED[0] + '@c.us' : '');
+        const targetChat = step.chatId || wf.chatId || Object.keys(chats).find((id) => isWeb(id)) || Object.keys(chats).find((id) => isWhatsApp(id) && !id.endsWith('@g.us')) || (ALLOWED[0] ? ALLOWED[0] + '@c.us' : '');
         if (!targetChat || !chats[targetChat]) throw new Error('nenhum chat válido para enviar cartão de aprovação');
         const p = startPrompt({
           chatId: targetChat,
