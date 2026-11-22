@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
+import vm from 'node:vm';
 
 const dir = path.dirname(new URL(import.meta.url).pathname);
 const tmp = path.join(dir, 'tmp-grokbot');
@@ -167,7 +168,62 @@ try {
   const cst = await api('GET', '/computer/status');
   check('computer status reports available tools', cst.status === 200 && cst.body.status === 'stopped' && cst.body.available.xvfb && cst.body.available.x11vnc && cst.body.available.websockify, cst.body);
   const viewerRes = await fetch(base + '/admin/computer/viewer', { headers: { Authorization: 'Bearer ' + TOKEN } });
-  check('computer viewer returns RFB HTML', viewerRes.status === 200 && (await viewerRes.text()).includes('RFB'));
+  const viewerHtml = await viewerRes.text();
+  check('computer viewer returns RFB HTML', viewerRes.status === 200 && viewerHtml.includes('RFB'));
+
+  const viewerScript = viewerHtml.match(/<script type="module">([\s\S]*?)<\/script>/)?.[1]?.replace(/^\s*import RFB from [^;]+;\s*/, '');
+  const viewerElements = new Map();
+  const element = (id) => {
+    if (!viewerElements.has(id)) {
+      const listeners = {};
+      viewerElements.set(id, {
+        hidden: false, value: '', style: {}, attributes: {}, listeners,
+        addEventListener(type, handler) { listeners[type] = handler; },
+        setAttribute(name, value) { this.attributes[name] = value; },
+        focus() { this.focused = true; },
+      });
+    }
+    return viewerElements.get(id);
+  };
+  const parentWindow = { sent: [], postMessage(message, origin) { this.sent.push({ message, origin }); } };
+  const viewerWindow = { listeners: {}, addEventListener(type, handler) { this.listeners[type] = handler; } };
+  let viewerRfb = null;
+  class TestRfb {
+    constructor() { this.listeners = {}; this.sentKeys = []; this.focusCount = 0; this.viewOnly = false; viewerRfb = this; }
+    addEventListener(type, handler) { this.listeners[type] = handler; }
+    focus() { this.focusCount++; }
+    sendKey(keysym) { this.sentKeys.push(keysym); }
+    clipboardPasteFrom(text) { this.clipboardText = text; }
+  }
+  const viewerLocation = { protocol: 'http:', host: 'localhost', origin: 'http://localhost' };
+  const viewerContext = {
+    document: { getElementById: element }, window: viewerWindow, parent: parentWindow,
+    location: viewerLocation, RFB: TestRfb, setTimeout() {},
+  };
+  if (viewerScript) vm.runInNewContext(viewerScript, viewerContext);
+  const viewerMessage = (data, source = parentWindow, origin = viewerLocation.origin) => viewerWindow.listeners.message({ data, source, origin });
+  check('computer viewer starts read-only with controls hidden', Boolean(viewerScript) && Boolean(viewerRfb) && viewerRfb.viewOnly && element('tools').hidden);
+  if (viewerRfb) {
+    viewerRfb.listeners.connect();
+    viewerMessage({ type: 'viewOnly', value: false }, parentWindow, 'https://untrusted.example');
+    const blockedExternalMessage = viewerRfb.viewOnly;
+    viewerMessage({ type: 'viewOnly', value: false });
+    const focusAfterControl = viewerRfb.focusCount;
+    element('screen').listeners.pointerdown();
+    element('keyboard-toggle').listeners.click();
+    element('text').value = '12é😀';
+    element('send-text').listeners.click();
+    const sentByMobileKeyboard = viewerRfb.sentKeys.slice();
+    const clearedInput = element('text').value === '';
+    viewerMessage({ type: 'computer-type', text: 'A\nB' });
+    viewerMessage({ type: 'clipboard', text: 'paste' });
+    viewerMessage({ type: 'viewOnly', value: true });
+    viewerMessage({ type: 'computer-type', text: 'blocked' });
+    check('viewer focuses RFB on human control and pointer input', blockedExternalMessage && focusAfterControl === 1 && viewerRfb.focusCount === 2);
+    check('viewer mobile text button sends Unicode keysyms and clears field', JSON.stringify(sentByMobileKeyboard) === JSON.stringify([49, 50, 0xe9, 0x0101f600]) && clearedInput);
+    check('viewer postMessage typing works only while writable', JSON.stringify(viewerRfb.sentKeys) === JSON.stringify([...sentByMobileKeyboard, 65, 0xff0d, 66]) && viewerRfb.viewOnly && element('tools').hidden);
+    check('viewer preserves clipboard message and same-origin connection notice', viewerRfb.clipboardText === 'paste' && parentWindow.sent.some((x) => x.message.type === 'computer-connected' && x.origin === viewerLocation.origin));
+  }
 
   const started = await api('POST', '/computer/start', {});
   check('computer starts cleanly', started.status === 200 && started.body.status === 'running', started.body);
