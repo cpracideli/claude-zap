@@ -33,7 +33,7 @@ const PORT = 3999, TOKEN = 'tok-123';
 const bridge = spawn(process.execPath, [path.join(dir, '..', 'bridge', 'bridge.mjs')], {
   env: { ...process.env, PORT: String(PORT), HOME: tmp, XDG_CONFIG_HOME: path.join(tmp, '.config'), CLAUDE_BIN: fakeClaude, AGY_BIN: path.join(tmp, 'no-agy'),
     COPILOT_BIN: path.join(tmp, 'no-copilot'), OPENCODE_BIN: path.join(tmp, 'no-opencode'), BRIDGE_ADMIN_TOKEN: TOKEN,
-    ALLOWED_NUMBERS: '5511999990000', WAHA_URL: 'http://127.0.0.1:1', STARTUP_NOTICE: 'false', AI_MEMORY: 'off' },
+    ALLOWED_NUMBERS: '5511999990000', WAHA_URL: 'http://127.0.0.1:1', STARTUP_NOTICE: 'false', BRIDGE_AUTO_TITLE: 'off', AI_MEMORY: 'off' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let logs = ''; bridge.stdout.on('data', (d) => { logs += d; }); bridge.stderr.on('data', (d) => { logs += d; });

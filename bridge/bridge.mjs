@@ -6489,11 +6489,51 @@ function promptWithFiles(text, files, transcript, engine) {
   return notes.join('\n') + '\n\n' + (text || (transcript ? 'Responda à mensagem de voz.' : 'Analise o conteúdo e responda.'));
 }
 
+// ---------- AI chat titles ----------
+// After the first exchange of a web chat still carrying the default title (first message cut to 60 chars), the
+// chat's provider writes a short descriptive title with its cheapest model. Runs in the background; any failure
+// keeps the current title. Titles edited by hand (titleManual) are never overwritten.
+const TITLE_MODELS = { claude: 'haiku', copilot: 'claude-haiku-4.5' };
+const titleBusy = new Set();
+async function autoTitleChat(chatId, userText, replyText) {
+  try {
+    const c = chats[chatId];
+    if (!c || c.titleManual || c.titleGenerated || !c.titleAuto || titleBusy.has(chatId) || settings.autoTitle === false || env.BRIDGE_AUTO_TITLE === 'off') return;
+    if (!String(userText || '').trim()) return;
+    titleBusy.add(chatId);
+    const provider = runConfig(c).provider;
+    const cid = 'title:' + crypto.randomBytes(4).toString('hex');
+    const prompt = 'Gere um título curto (3 a 7 palavras, no máximo 50 caracteres) em português do Brasil que descreva esta conversa, para o usuário encontrá-la depois. Responda SOMENTE com o título: sem aspas, sem ponto final, sem explicação, sem usar ferramentas.\n\nMensagem do usuário:\n'
+      + String(userText).slice(0, 600) + '\n\nResposta do assistente:\n' + String(replyText || '').slice(0, 600);
+    let r;
+    try {
+      r = await Promise.race([
+        runAgent(cid, prompt, { readOnly: true, noSteer: true, noFallback: true, noRouting: true, skipSemantic: true, providerOverride: provider, modelOverride: TITLE_MODELS[provider] || '' }),
+        new Promise((resolve) => setTimeout(() => resolve({ error: 'timeout' }), 60000)),
+      ]);
+    } finally { delete chats[cid]; }
+    if (!r || r.error || r.stopped) return;
+    let t = String(r.text || '').split('\n').map((x) => x.trim()).find(Boolean) || '';
+    const junk = /["'“”«»*#.\s]/;
+    t = t.replace(/^(t[ií]tulo\s*:\s*)/i, '').replace(/\s+/g, ' ');
+    while (t && junk.test(t[0])) t = t.slice(1);
+    while (t && junk.test(t[t.length - 1])) t = t.slice(0, -1);
+    t = t.slice(0, 60);
+    const cur = chats[chatId];
+    if (!t || t.length < 3 || !cur || cur.titleManual || !cur.titleAuto) return;
+    cur.title = t; cur.titleGenerated = true; delete cur.titleAuto;
+    save();
+    audit({ action: 'chat-title', chatId, provider });
+    webEmit(chatId, { type: 'title', title: t });
+  } catch (e) { log('auto title failed', e.message); }
+  finally { titleBusy.delete(chatId); }
+}
+
 function webSend(chatId, text, files = [], transcript = '') {
   const c = chat(chatId);
   const um = webAppend(chatId, { role: 'user', text, ...(files.length ? { files } : {}), ...(transcript ? { transcript } : {}) });
   let label = text || transcript || (files[0] && (files[0].voice ? 'Mensagem de voz' : files[0].name)) || '';
-  if (!c.title || c.title === 'Nova conversa') { c.title = label.replace(/\s+/g, ' ').slice(0, 60); save(); }
+  if (!c.title || c.title === 'Nova conversa') { c.title = label.replace(/\s+/g, ' ').slice(0, 60); c.titleAuto = true; save(); }
   // Support bridge slash commands directly in the web panel (/new, /status, /provider, /model, /effort, /bot, /stop, /council, /usage, /log, /schedules, /help)
   if (!files.length && text.startsWith('/')) {
     const firstCmd = text.trim().split(/\s+/)[0].toLowerCase();
@@ -6508,7 +6548,7 @@ function webSend(chatId, text, files = [], transcript = '') {
   if (transcribing) transcribing.then((tr) => {
     if (!tr) return webUpdate(chatId, um.id, { transcriptFailed: true });
     webUpdate(chatId, um.id, { transcript: tr.text, transcriptEngine: tr.engine });
-    if (c.title === 'Mensagem de voz') { c.title = tr.text.replace(/\s+/g, ' ').slice(0, 60); save(); }
+    if (c.title === 'Mensagem de voz') { c.title = tr.text.replace(/\s+/g, ' ').slice(0, 60); c.titleAuto = true; save(); }
   });
   let usedSkillSlug = '';
   const buildPrompt = (tr) => {
@@ -6571,6 +6611,7 @@ function webSend(chatId, text, files = [], transcript = '') {
         error: Boolean(r.error), stopped: Boolean(r.stopped),
         usage: { ms, cost: r.usage ? r.usage.cost : 0, turns: r.usage ? r.usage.turns : 0, ...(r.usage && r.usage.estimated ? { estimated: true } : {}) },
       });
+      if (!r.stopped && !r.error) autoTitleChat(chatId, label || (tr && tr.text) || '', parsedReply.text);
       if (r.stopped) break;
     }
     webEmit(chatId, { type: 'idle' });
@@ -8343,6 +8384,7 @@ async function handleAdmin(req, res, u, raw) {
       const c = chats[b];
       if ('provider' in body) { if (body.provider && !PROVIDERS[body.provider]) throw new Error('provedor inválido'); if (body.provider) c.provider = body.provider; else delete c.provider; }
       for (const k of ['model', 'effort', 'agyModel', 'agyEffort', 'title']) if (k in body) { if (body[k]) c[k] = String(body[k]); else delete c[k]; }
+      if ('title' in body) { delete c.titleAuto; if (body.title) c.titleManual = true; else { delete c.titleManual; delete c.titleGenerated; } } // manual edit is never overwritten
       if (c.effort && !EFFORTS.includes(c.effort)) { delete c.effort; throw new Error('esforço inválido'); }
       if ('members' in body) {
         if (Array.isArray(body.members) && body.members.length) c.members = body.members.filter((x) => bots[x]).slice(0, 20); else delete c.members;
