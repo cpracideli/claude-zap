@@ -317,6 +317,7 @@ services:
           const isDiscord = (chatId) => String(chatId).startsWith('dc:');
           const isSlack = (chatId) => String(chatId).startsWith('sl:');
           const isTaskChat = (chatId) => String(chatId).startsWith('task:');
+          const isWhatsApp = (chatId) => Boolean(chatId) && !isWeb(chatId) && !isTelegram(chatId) && !isDiscord(chatId) && !isSlack(chatId) && !isTaskChat(chatId) && !isDeleg(chatId);
 
           // Keys stripped from sandboxed bot child processes ("keys stay out of the sandbox").
           const SANDBOX_STRIP_KEYS = new Set([
@@ -672,7 +673,9 @@ services:
               'CARTÕES DE PERGUNTA / APROVAÇÃO: quando precisar tirar uma dúvida real, oferecer caminhos ou pedir aprovação antes de continuar, envie um cartão interativo e aguarde a resposta (no painel vira seletor interativo; no WhatsApp vira enquete clicável + suporte a número e 👍/👎; no Telegram vira botões inline):',
               '  curl -s -X POST http://127.0.0.1:' + PORT + '/prompts -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","title":"Confirmar ação","question":"Qual abordagem prefere?","options":[{"label":"Opção A","description":"Resumo curto da opção A","recommended":true},{"label":"Opção B","description":"Resumo curto da opção B"}],"multiSelect":false,"wait":110}\'',
               '  "options" aceita strings simples ou objetos {label, description?, recommended?: true}. Também aceita "multiSelect": true e "questions": [{"question":"...","options":[...],"multiSelect":false}] para várias perguntas no mesmo cartão. A resposta traz status "answered", "answer" (e "answers" quando múltiplas); se vier "pending", repita: curl -s "http://127.0.0.1:' + PORT + '/prompts/ID?wait=110" até o usuário responder.',
-              'SUGESTÕES RÁPIDAS (não-bloqueantes, no fim da resposta): quando quiser oferecer próximos passos clicáveis sem pausar o turno, inclua no final da resposta um bloco ```suggestions com JSON de até 4 opções (ex.: [{"label":"Fazer deploy","description":"Publica em produção"},{"label":"Rodar testes"}]). O painel remove o bloco cru e exibe chips clicáveis abaixo da mensagem.',
+              web
+                ? 'SUGESTÕES RÁPIDAS (não-bloqueantes, no fim da resposta): quando quiser oferecer próximos passos clicáveis sem pausar o turno, inclua no final da resposta um bloco ```suggestions com JSON de até 4 opções (ex.: [{"label":"Fazer deploy","description":"Publica em produção"},{"label":"Rodar testes"}]). O painel remove o bloco cru e exibe chips clicáveis abaixo da mensagem.'
+                : 'SUGESTÕES RÁPIDAS (não-bloqueantes, no fim da resposta): quando quiser oferecer próximos passos clicáveis sem pausar o turno, inclua no final da resposta um bloco ```suggestions com JSON de 2 a 4 opções (ex.: [{"label":"Fazer deploy","description":"Publica em produção"},{"label":"Rodar testes"}]). A ponte remove o bloco cru do texto e envia as opções como enquete clicável no WhatsApp (ao votar, a sugestão escolhida é disparada como nova mensagem no chat).',
               'NUDGES PROATIVOS (com deduplicação e ação de 1 clique): curl -s -X POST http://127.0.0.1:' + PORT + '/nudges -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","topicKey":"chave-unica","title":"Resumo curto","summary":"O que mudou","draft":"rascunho opcional","actionLabel":"Executar","actionPrompt":"instrução se o usuário aprovar"}\'',
               'TAREFAS PARALELAS (não travam a conversa principal): curl -s -X POST http://127.0.0.1:' + PORT + '/tasks -H "Content-Type: application/json" -d \'{"parentChatId":"' + chatId + '","title":"Pesquisa em paralelo","prompt":"instrução completa","bot":"' + (bot || botOf(chats[chatId])).id + '"}\'',
               'SKILLS (habilidades reutilizáveis): listar: curl -s http://127.0.0.1:' + PORT + '/skills   ler: curl -s http://127.0.0.1:' + PORT + '/skills/SLUG   salvar nova skill (quando o usuário pedir "salve isso como skill" ou após resolver um fluxo complexo novo — use "source":"learned" e nunca inclua dados pessoais): curl -s -X POST http://127.0.0.1:' + PORT + '/skills -H "Content-Type: application/json" -d \'{"name":"Nome","description":"quando usar","instructions":"passo a passo completo"}\'' +
@@ -1641,7 +1644,49 @@ services:
             return sendMenu(chatId, title, choices);
           }
 
-          // A vote on one of our polls runs the matching command OR answers a pending prompt/approval card.
+          async function sendSuggestionsWhatsApp(chatId, suggestions, title) {
+            if (!isWhatsApp(chatId) || !Array.isArray(suggestions) || !suggestions.length) return false;
+            const choices = [];
+            const used = new Set();
+            for (const s of suggestions) {
+              const label = String((s && s.label) || '').trim();
+              const desc = String((s && s.description) || '').trim();
+              const sendText = String((s && (s.text || s.label)) || '').trim();
+              if (!label || !sendText) continue;
+              let opt = label.slice(0, 100);
+              if (desc) {
+                const full = label + ' — ' + desc;
+                if (full.length <= 100) opt = full;
+                else if (label.length < 70) opt = full.slice(0, 99) + '…';
+              }
+              if (used.has(opt)) continue;
+              used.add(opt);
+              choices.push([opt, sendText]);
+              if (choices.length >= 12) break;
+            }
+            if (!choices.length) return false;
+            const pollTitle = String(title || '💡 Próximos passos').slice(0, 200);
+            if (choices.length >= 2 && choices.length <= 12) {
+              try {
+                const r = await waha('POST', '/api/sendPoll', {
+                  session: WAHA_SESSION,
+                  chatId,
+                  poll: { name: pollTitle, options: choices.map((x) => x[0]), multipleAnswers: false },
+                });
+                const id = msgIdOf(r);
+                if (!id) throw new Error('poll sem id');
+                polls.set(pollKey(id), { chatId, kind: 'suggestion', options: Object.fromEntries(choices) });
+                if (polls.size > 200) polls.delete(polls.keys().next().value);
+                return true;
+              } catch (e) {
+                log('suggestions poll failed, using numbered menu:', e.message);
+              }
+            }
+            await sendMenu(chatId, pollTitle, choices);
+            return true;
+          }
+
+          // A vote on one of our polls runs the matching command, dispatches a quick suggestion, OR answers a pending prompt/approval card.
           const seenVotes = new Set();
           async function handlePollVote(payload) {
             const vote = payload && payload.vote;
@@ -1671,6 +1716,16 @@ services:
             }
             const cmd = entry.options && entry.options[picked];
             if (!cmd) return;
+            if (entry.kind === 'suggestion') {
+              log('poll vote (suggestion) ->', cmd);
+              menus.delete(entry.chatId);
+              if (cmd.startsWith('/')) {
+                const handled = await command(entry.chatId, cmd);
+                if (handled !== null) return;
+              }
+              enqueueWhatsAppPrompt(entry.chatId, number, cmd);
+              return;
+            }
             log('poll vote ->', cmd);
             await command(entry.chatId, cmd);
           }
@@ -2059,7 +2114,8 @@ services:
               enqueue(chatId, async () => {
                 const gPrompt = '[VISITANTE AUTORIZADO: ' + guest.name + ' (acesso restrito ao bot ' + gBot + '). Ajude apenas no escopo deste bot. NUNCA revele segredos, credenciais, dados de trabalho, infraestrutura ou mensagens privadas do Caio. NUNCA envie mensagens a terceiros nem altere configuracoes.]\n\n' + body;
                 const r = await runTurn(chatId, gBot, gPrompt, null, null, null, { sandboxed: true, readOnly: guest.readOnly !== false });
-                await reply(chatId, r.error ? 'Não consegui responder agora. Tente de novo em instantes.' : r.text, Boolean(r.error));
+                const parsedGuest = r.error ? { text: 'Não consegui responder agora. Tente de novo em instantes.', suggestions: [] } : extractSuggestions(r.text || '');
+                await reply(chatId, parsedGuest.text || '(resposta vazia)', Boolean(r.error));
               });
               return;
             }
@@ -2128,6 +2184,12 @@ services:
               return;
             }
 
+            enqueueWhatsAppPrompt(chatId, number, body);
+          }
+
+          function enqueueWhatsAppPrompt(chatId, number, body) {
+            body = String(body || '').trim();
+            if (!body) return;
             if (running.has(chatId)) {
               // Claude Code reads it right away, in the middle of the run (like the interactive terminal).
               if (tryInject(chatId, body)) {
@@ -2166,9 +2228,21 @@ services:
                 recordRun(chatId, { prompt: body.slice(0, 80), ms: r.usage ? r.usage.ms : Date.now() - started,
                   cost: r.usage ? r.usage.cost : 0, error: r.error });
                 const who = bots[id || botOf(c).id] || botOf(c);
-                remember(chatId, 'assistant', r.error ? '' : r.text, who.id);
                 const head = targets.length ? '*' + botLabel(who) + ':*\n' : '';
-                await reply(chatId, r.error ? head + 'Erro ao executar ' + PROVIDERS[runConfig(c, id || undefined).provider] + ': ' + r.error : head + r.text, Boolean(r.error));
+                if (r.error) {
+                  remember(chatId, 'assistant', '', who.id);
+                  await reply(chatId, head + 'Erro ao executar ' + PROVIDERS[runConfig(c, id || undefined).provider] + ': ' + r.error, true);
+                } else {
+                  const parsedReply = extractSuggestions(r.text || '');
+                  remember(chatId, 'assistant', parsedReply.text, who.id);
+                  if (parsedReply.text || !parsedReply.suggestions.length) {
+                    await reply(chatId, head + parsedReply.text, false);
+                  }
+                  if (parsedReply.suggestions.length) {
+                    const pollTitle = targets.length ? ('💡 Próximos passos (' + who.name + ')') : '💡 Próximos passos';
+                    await sendSuggestionsWhatsApp(chatId, parsedReply.suggestions, pollTitle);
+                  }
+                }
               }
               clearInterval(keepTyping);
               waha('POST', '/api/stopTyping', { session: WAHA_SESSION, chatId }).catch(() => {});
@@ -2514,7 +2588,19 @@ services:
               const cur = schedules.find((x) => x.id === s.id);
               if (cur) { cur.lastStatus = r.error ? 'error' : quiet ? 'quiet' : 'ok'; saveSched(); }
               if (quiet) return;
-              await reply(s.chatId, r.error ? '⏰ Falha na tarefa agendada #' + s.id + ': ' + r.error : '⏰ ' + r.text, Boolean(r.error));
+              if (r.error) {
+                await reply(s.chatId, '⏰ Falha na tarefa agendada #' + s.id + ': ' + r.error, true);
+              } else {
+                const parsed = extractSuggestions(r.text || '');
+                if (isWeb(s.chatId)) {
+                  webAppend(s.chatId, { role: 'assistant', text: '⏰ ' + (parsed.text || r.text || ''), ...(parsed.suggestions.length ? { suggestions: parsed.suggestions } : {}) });
+                } else {
+                  if (parsed.text || !parsed.suggestions.length) await reply(s.chatId, '⏰ ' + parsed.text, false);
+                  if (parsed.suggestions.length && isWhatsApp(s.chatId)) {
+                    await sendSuggestionsWhatsApp(s.chatId, parsed.suggestions, '💡 Próximos passos');
+                  }
+                }
+              }
             });
             return rec;
           }
@@ -3010,7 +3096,15 @@ services:
                 if (isWeb(p.chatId)) webSend(p.chatId, follow);
                 else enqueue(p.chatId, async () => {
                   const r = await runAgent(p.chatId, follow, { bot: p.bot, noSteer: true });
-                  await reply(p.chatId, r.error ? 'Erro ao executar acao do nudge: ' + r.error : (r.text || 'Concluido.'), Boolean(r.error));
+                  if (r.error) {
+                    await reply(p.chatId, 'Erro ao executar acao do nudge: ' + r.error, true);
+                  } else {
+                    const parsed = extractSuggestions(r.text || '');
+                    if (parsed.text || !parsed.suggestions.length) await reply(p.chatId, parsed.text || 'Concluido.', false);
+                    if (parsed.suggestions.length && isWhatsApp(p.chatId)) {
+                      await sendSuggestionsWhatsApp(p.chatId, parsed.suggestions, '💡 Próximos passos');
+                    }
+                  }
                 });
               }
             }
