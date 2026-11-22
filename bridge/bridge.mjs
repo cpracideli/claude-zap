@@ -581,6 +581,8 @@ function systemPrompt(chatId, bot, providerHint = 'claude') {
   const deleg = isDeleg(chatId);
   const isClaude = providerHint === 'claude';
   const isAgy = providerHint === 'antigravity';
+  const isCopilot = providerHint === 'copilot';
+  const isOpencode = providerHint === 'opencode';
   return [
     deleg ? 'IMPORTANTE: agora você atende um PEDIDO DE OUTRO BOT (delegação), não o usuário diretamente. Sua resposta final volta para o bot que pediu. Não mande mensagens nem arquivos a ninguém, não crie agendamentos e não use /send; só faça o trabalho pedido e responda.' : '',
     web
@@ -601,7 +603,11 @@ function systemPrompt(chatId, bot, providerHint = 'claude') {
       ? 'Ao instalar servidores MCP, use sempre o escopo de usuário (claude mcp add -s user ...) para que fiquem disponíveis em todas as conversas. Cada mensagem do WhatsApp abre um processo novo do Claude Code, então MCPs novos ou reconfigurados já valem na PRÓXIMA mensagem: não é preciso reiniciar nada; avise o usuário para mandar a próxima mensagem.'
       : isAgy
         ? 'Ao instalar servidores MCP neste agente (Antigravity), use sempre: agy mcp add -- <nome> <comando> (ou a URL, para servidores HTTP). Não use o comando claude mcp.'
-        : '',
+        : isCopilot
+          ? 'Ao instalar servidores MCP neste agente (GitHub Copilot), use sempre: copilot mcp add <nome> -- <comando> [args...] (ou copilot mcp add --transport http <nome> <url>, salvo em ~/.copilot/mcp-config.json). Não use o comando claude mcp.'
+          : isOpencode
+            ? 'Ao instalar servidores MCP neste agente (OpenCode), configure na chave "mcp.servers" de ~/.config/opencode/opencode.json (ou use a aba MCP do painel). Não use o comando claude mcp.'
+            : '',
     'Você roda como o usuário node, mas tem sudo SEM senha: pode instalar o que precisar sem pedir permissão (sudo apt-get install -y ..., pip, npm, npx). O sistema de arquivos fora de /home/node é recriado em redeploys: para um pacote apt sobreviver, acrescente o nome dele (um por linha) em /home/node/.apt-packages; tudo em /home/node (inclusive ~/.cache/ms-playwright) já é persistente.',
     isClaude
       ? 'Navegador: para Playwright, instale com "npx playwright install --with-deps chromium" e configure o MCP com o Chromium (ex.: claude mcp add -s user playwright -- npx @playwright/mcp@latest --browser chromium --headless --no-sandbox). Não há tela: use sempre headless.'
@@ -918,6 +924,14 @@ async function runCopilot(chatId, prompt, opts, onActivity, onEvent) {
     if (opts.model && opts.model !== 'auto') args.push('--model', opts.model);
     if (opts.effort) args.push('--reasoning-effort', opts.effort);
     if (opts.resume) args.push('--resume', opts.resume);
+    if (opts.bot && Array.isArray(opts.bot.mcp)) {
+      const cpCfg = copilotMcpConfig();
+      const configured = Object.keys({ ...cpCfg.workspace, ...cpCfg.user });
+      for (const n of configured) {
+        if (!opts.bot.mcp.includes(n)) args.push('--disable-mcp-server', n);
+      }
+      if (!opts.bot.mcp.includes('github') && !opts.bot.mcp.includes('github-mcp-server')) args.push('--disable-builtin-mcps');
+    }
     const isScript = COPILOT_BIN.endsWith('.mjs') || COPILOT_BIN.endsWith('.js');
     const started = Date.now();
     const extraEnv = { WA_CHAT_ID: chatId, WA_BOT_ID: opts.botId || DEFAULT_BOT, WA_READONLY: opts.readOnly ? '1' : '0' };
@@ -1367,7 +1381,7 @@ async function invokeProviderOnce(provider, chatId, actualPrompt, cfg, opts, onA
   if (provider === 'copilot') {
     const text = !opts.resume ? antigravityPrompt(chatId, effectiveBot, 'copilot') + '\n\n---\n\n' + actualPrompt : actualPrompt;
     const model = opts.modelOverride || (cfg.cp && cfg.cp.cpModel) || settings.copilotModel || COPILOT_DEFAULT_MODEL;
-    return runCopilot(chatId, text, { model, effort: cfg.effort, resume: opts.resume, botId: effectiveBot.id, sandboxed: isSandboxed, readOnly: opts.readOnly }, onActivity, onEvent);
+    return runCopilot(chatId, text, { model, effort: cfg.effort, resume: opts.resume, botId: effectiveBot.id, bot: effectiveBot, sandboxed: isSandboxed, readOnly: opts.readOnly }, onActivity, onEvent);
   }
   if (provider === 'openai_compat') {
     const model = opts.modelOverride || cfg.model;
@@ -6623,11 +6637,61 @@ function agyMcpConfig() {
 function redactMcp(cfg) {
   const mask = (o) => Object.fromEntries(Object.keys(o || {}).map((k) => [k, '***']));
   const out = { ...cfg };
-  if (cfg.headers) out.headers = mask(cfg.headers);
-  if (cfg.env) out.env = mask(cfg.env);
+  if (cfg.headers && typeof cfg.headers === 'object') out.headers = mask(cfg.headers);
+  if (cfg.env && typeof cfg.env === 'object') out.env = mask(cfg.env);
+  if (cfg.environment && typeof cfg.environment === 'object') out.environment = mask(cfg.environment);
+  if (cfg.oauth && typeof cfg.oauth === 'object') {
+    out.oauth = { ...cfg.oauth };
+    if (out.oauth.client_secret) out.oauth.client_secret = '***';
+    if (out.oauth.clientSecret) out.oauth.clientSecret = '***';
+  }
   return out;
 }
 const redactServers = (servers) => Object.fromEntries(Object.entries(servers || {}).map(([n, c]) => [n, redactMcp(c || {})]));
+
+function stripJsonComments(text) {
+  let out = '', i = 0, n = text.length, inStr = false, esc = false;
+  while (i < n) {
+    const ch = text[i], nx = text[i + 1];
+    if (inStr) {
+      out += ch;
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
+      else if (ch === '"') inStr = false;
+      i++;
+    } else if (ch === '"') {
+      inStr = true; out += ch; i++;
+    } else if (ch === '/' && nx === '/') {
+      i += 2;
+      while (i < n && text[i] !== '\n') i++;
+    } else if (ch === '/' && nx === '*') {
+      i += 2;
+      while (i < n && !(text[i] === '*' && text[i + 1] === '/')) i++;
+      i += 2;
+    } else {
+      out += ch; i++;
+    }
+  }
+  return out.replace(/,(\s*[}\]])/g, (_, tail) => tail);
+}
+function readJsoncFile(filePath) {
+  try { return JSON.parse(stripJsonComments(fs.readFileSync(filePath, 'utf8'))); } catch { return null; }
+}
+function writeJsonAtomic(filePath, obj, mode = 0o600) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmp = filePath + '.tmp.' + process.pid + '.' + Date.now() + '.' + Math.random().toString(36).slice(2, 8);
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n', { mode });
+  fs.renameSync(tmp, filePath);
+}
+async function isCliBinInstalled(bin, cacheKey) {
+  if (!bin) return false;
+  if (bin.includes('/') || bin.includes('\\')) return fs.existsSync(bin);
+  if (cacheKey && versionCache[cacheKey]) return true;
+  const r = await execCmd(bin, ['--version'], 10000);
+  if (r.code === 0 && cacheKey) versionCache[cacheKey] = r.out.split('\n')[0].trim() || 'ok';
+  return r.code === 0;
+}
+
 async function agyMcp() {
   if (!fs.existsSync(AGY_BIN)) return { installed: false };
   const r = await execCmd(AGY_BIN, ['mcp', 'list'], 30000);
@@ -6636,8 +6700,98 @@ async function agyMcp() {
   return { installed: true, list: (r.out + (r.code ? '\n' + r.err : '')).trim(), config: config ? { ...config, mcpServers: servers } : null, configPath, servers };
 }
 
-// agy has no health check (`agy mcp list` only says enabled/disabled), so the bridge does the MCP
-// handshake itself: spawn the stdio command (or POST to the URL) and wait for the initialize answer.
+// GitHub Copilot CLI MCP servers: user scope in ~/.copilot/mcp-config.json; workspace in .mcp.json or .github/mcp.json.
+function copilotMcpPath() {
+  return path.join(env.HOME || '/tmp', '.copilot', 'mcp-config.json');
+}
+function copilotMcpConfig() {
+  const configPath = copilotMcpPath();
+  const config = readJsoncFile(configPath);
+  const user = (config && config.mcpServers && typeof config.mcpServers === 'object') ? config.mcpServers : {};
+  const workspace = {};
+  for (const rel of ['.mcp.json', path.join('.github', 'mcp.json')]) {
+    const j = readJsoncFile(path.join(WORKDIR, rel));
+    if (j && j.mcpServers && typeof j.mcpServers === 'object') Object.assign(workspace, j.mcpServers);
+  }
+  return { config, configPath, user, workspace };
+}
+async function copilotMcp() {
+  const installed = await isCliBinInstalled(COPILOT_BIN, 'cp');
+  const { config, configPath, user, workspace } = copilotMcpConfig();
+  const servers = redactServers(user);
+  const wsRedacted = redactServers(workspace);
+  const redactedConfig = config ? { ...config, mcpServers: servers } : null;
+  if (!installed) return { installed: false, configPath, config: redactedConfig, servers, workspace: wsRedacted };
+  return { installed: true, configPath, config: redactedConfig, servers, workspace: wsRedacted };
+}
+
+// OpenCode MCP servers: ~/.config/opencode/opencode.json (+ opencode.jsonc), under mcp.servers (current) or legacy mcp.<name>.
+function opencodeConfigDir() {
+  return path.join(env.XDG_CONFIG_HOME || path.join(env.HOME || '/tmp', '.config'), 'opencode');
+}
+function isOpencodeMcpEntry(v) {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  return v.type === 'local' || v.type === 'remote' || Array.isArray(v.command) || typeof v.url === 'string' || typeof v.enabled === 'boolean' || typeof v.disabled === 'boolean';
+}
+function opencodeMcpExtract(obj) {
+  const out = {};
+  const m = obj && obj.mcp;
+  if (!m || typeof m !== 'object') return out;
+  for (const [k, v] of Object.entries(m)) {
+    if (k === 'servers' || k === 'timeout') continue;
+    if (isOpencodeMcpEntry(v)) out[k] = v;
+  }
+  if (m.servers && typeof m.servers === 'object') {
+    for (const [k, v] of Object.entries(m.servers)) {
+      if (isOpencodeMcpEntry(v)) out[k] = v;
+    }
+  }
+  return out;
+}
+function redactOpencodeConfig(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  const clone = { ...obj };
+  if (clone.mcp && typeof clone.mcp === 'object') {
+    const m = { ...clone.mcp };
+    for (const [k, v] of Object.entries(m)) {
+      if (k === 'servers' && v && typeof v === 'object') {
+        m.servers = redactServers(v);
+      } else if (k !== 'timeout' && isOpencodeMcpEntry(v)) {
+        m[k] = redactMcp(v);
+      }
+    }
+    clone.mcp = m;
+  }
+  return clone;
+}
+function opencodeMcpConfig() {
+  const dir = opencodeConfigDir();
+  const jsonPath = path.join(dir, 'opencode.json');
+  const jsoncPath = path.join(dir, 'opencode.jsonc');
+  const jsonObj = readJsoncFile(jsonPath);
+  const jsoncObj = readJsoncFile(jsoncPath);
+  const servers = { ...opencodeMcpExtract(jsonObj), ...opencodeMcpExtract(jsoncObj) };
+  const project = {};
+  for (const name of ['opencode.json', 'opencode.jsonc']) {
+    const pj = readJsoncFile(path.join(WORKDIR, name));
+    if (pj) Object.assign(project, opencodeMcpExtract(pj));
+  }
+  const configPath = fs.existsSync(jsonPath) || !fs.existsSync(jsoncPath) ? jsonPath : jsoncPath;
+  const config = configPath === jsonPath ? jsonObj : jsoncObj;
+  return { config, configPath, jsonPath, jsoncPath, servers, project };
+}
+async function opencodeMcp() {
+  const installed = await isCliBinInstalled(OPENCODE_BIN, 'oc');
+  const { config, configPath, servers, project } = opencodeMcpConfig();
+  const redactedServers = redactServers(servers);
+  const redactedProject = redactServers(project);
+  const redactedConfig = redactOpencodeConfig(config);
+  if (!installed) return { installed: false, configPath, config: redactedConfig, servers: redactedServers, project: redactedProject };
+  return { installed: true, configPath, config: redactedConfig, servers: redactedServers, project: redactedProject };
+}
+
+// agy, copilot and opencode health check via MCP JSON-RPC initialize handshake:
+// spawn the stdio command (or POST to the URL) and wait for the initialize answer.
 const MCP_INIT = { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'agent-control', version: '1' } } };
 function probeStdio(cfg, ms) {
   return new Promise((resolve) => {
@@ -6694,15 +6848,96 @@ async function agyMcpStatus() {
   }).join('\n');
   return { output: output || '(nenhum MCP configurado no Antigravity)', code: 0, servers };
 }
+async function copilotMcpStatus() {
+  if (!(await isCliBinInstalled(COPILOT_BIN, 'cp'))) return { output: 'copilot não está instalado', code: 1, servers: {} };
+  const { user, workspace } = copilotMcpConfig();
+  const all = { ...workspace, ...user };
+  const entries = Object.entries(all);
+  const results = await Promise.all(entries.map(async ([n, cfg]) => {
+    if (cfg.disabled === true || cfg.enabled === false) return [n, { ok: false, disabled: true, status: 'Disabled' }];
+    const r = cfg.command ? await probeStdio(cfg, 45000) : await probeHttp(cfg, 20000);
+    return [n, { ...r, status: r.ok ? '✔ Connected' : '✗ Failed: ' + r.error }];
+  }));
+  const servers = Object.fromEntries(results);
+  const output = results.map(([n, r]) => {
+    const cfg = all[n];
+    return n + ': ' + (cfg.command ? [cfg.command, ...(cfg.args || [])].join(' ') : (cfg.url || cfg.serverUrl || '') + ' (HTTP)') + ' - ' + r.status;
+  }).join('\n');
+  return { output: output || '(nenhum MCP configurado no GitHub Copilot)', code: 0, servers };
+}
+async function opencodeMcpStatus() {
+  if (!(await isCliBinInstalled(OPENCODE_BIN, 'oc'))) return { output: 'opencode não está instalado', code: 1, servers: {} };
+  const { servers: userServers, project } = opencodeMcpConfig();
+  const all = { ...project, ...userServers };
+  const entries = Object.entries(all);
+  const results = await Promise.all(entries.map(async ([n, cfg]) => {
+    if (cfg.disabled === true || cfg.enabled === false) return [n, { ok: false, disabled: true, status: 'Disabled' }];
+    let r;
+    if (Array.isArray(cfg.command) && cfg.command.length) {
+      r = await probeStdio({ command: cfg.command[0], args: cfg.command.slice(1), env: cfg.environment || cfg.env || {} }, 45000);
+    } else if (typeof cfg.command === 'string' && cfg.command) {
+      r = await probeStdio({ command: cfg.command, args: cfg.args || [], env: cfg.environment || cfg.env || {} }, 45000);
+    } else if (cfg.url || cfg.serverUrl) {
+      r = await probeHttp({ url: cfg.url || cfg.serverUrl, headers: cfg.headers || {} }, 20000);
+    } else {
+      r = { ok: false, error: 'configuração incompleta' };
+    }
+    return [n, { ...r, status: r.ok ? '✔ Connected' : '✗ Failed: ' + r.error }];
+  }));
+  const servers = Object.fromEntries(results);
+  const output = results.map(([n, r]) => {
+    const cfg = all[n];
+    const desc = Array.isArray(cfg.command) ? cfg.command.join(' ') : (cfg.command ? [cfg.command, ...(cfg.args || [])].join(' ') : (cfg.url || cfg.serverUrl || '') + ' (HTTP)');
+    return n + ': ' + desc + ' - ' + r.status;
+  }).join('\n');
+  return { output: output || '(nenhum MCP configurado no OpenCode)', code: 0, servers };
+}
 
 const validName = (n) => /^[A-Za-z0-9_.-]{1,64}(?![\s\S])/.test(String(n || ''));
+const SCHEMA_KEY = String.fromCharCode(36) + 'schema';
 async function addMcp(b) {
   if (!validName(b.name)) throw new Error('nome inválido (use letras, números, _ . -)');
+  const provider = b.provider || 'claude';
+  if (!['claude', 'antigravity', 'copilot', 'opencode'].includes(provider)) throw new Error('provedor MCP inválido');
   const transport = b.transport || (b.url ? 'http' : 'stdio');
   if (transport === 'stdio' && !b.command) throw new Error('informe o comando');
   if (transport !== 'stdio' && !b.url) throw new Error('informe a URL');
+  if (provider === 'copilot') {
+    if (!(await isCliBinInstalled(COPILOT_BIN, 'cp'))) throw new Error('copilot não está instalado');
+    const cfgPath = copilotMcpPath();
+    const existing = readJsoncFile(cfgPath);
+    const root = existing && typeof existing === 'object' && !Array.isArray(existing) ? existing : {};
+    const mcpServers = root.mcpServers && typeof root.mcpServers === 'object' ? { ...root.mcpServers } : {};
+    const entry = transport === 'stdio'
+      ? { type: 'local', command: b.command, args: Array.isArray(b.args) ? b.args : [], tools: ['*'], ...(b.env && Object.keys(b.env).length ? { env: b.env } : {}) }
+      : { type: transport === 'sse' ? 'sse' : 'http', url: b.url, tools: ['*'], ...(b.headers && Object.keys(b.headers).length ? { headers: b.headers } : {}) };
+    mcpServers[b.name] = entry;
+    writeJsonAtomic(cfgPath, { ...root, mcpServers }, 0o600);
+    audit({ action: 'mcp-add', provider, name: b.name, transport, ok: true });
+    return { ok: true, output: 'Adicionado em ' + cfgPath };
+  }
+  if (provider === 'opencode') {
+    if (!(await isCliBinInstalled(OPENCODE_BIN, 'oc'))) throw new Error('opencode não está instalado');
+    const { jsonPath } = opencodeMcpConfig();
+    const existing = readJsoncFile(jsonPath);
+    const root = existing && typeof existing === 'object' && !Array.isArray(existing)
+      ? { ...existing }
+      : { [SCHEMA_KEY]: 'https://opencode.ai/config.json' };
+    const mcpObj = root.mcp && typeof root.mcp === 'object' && !Array.isArray(root.mcp) ? { ...root.mcp } : {};
+    const servers = mcpObj.servers && typeof mcpObj.servers === 'object' && !Array.isArray(mcpObj.servers) ? { ...mcpObj.servers } : {};
+    if (b.name !== 'servers' && b.name !== 'timeout' && Object.prototype.hasOwnProperty.call(mcpObj, b.name)) delete mcpObj[b.name];
+    const entry = transport === 'stdio'
+      ? { type: 'local', command: [b.command, ...(Array.isArray(b.args) ? b.args : [])], ...(b.env && Object.keys(b.env).length ? { environment: b.env } : {}) }
+      : { type: 'remote', url: b.url, ...(b.headers && Object.keys(b.headers).length ? { headers: b.headers } : {}) };
+    servers[b.name] = entry;
+    mcpObj.servers = servers;
+    root.mcp = mcpObj;
+    writeJsonAtomic(jsonPath, root, 0o600);
+    audit({ action: 'mcp-add', provider, name: b.name, transport, ok: true });
+    return { ok: true, output: 'Adicionado em ' + jsonPath };
+  }
   let r;
-  if ((b.provider || 'claude') === 'claude') {
+  if (provider === 'claude') {
     const cfg = transport === 'stdio'
       ? { type: 'stdio', command: b.command, args: b.args || [], env: b.env || {} }
       : { type: transport, url: b.url, headers: b.headers || {} };
@@ -6715,12 +6950,56 @@ async function addMcp(b) {
     else for (const [k, v] of Object.entries(b.headers || {})) flags.push('--header', k + ': ' + v);
     r = await execCmd(AGY_BIN, transport === 'stdio' ? ['mcp', 'add', ...flags, '--', b.name, b.command, ...(b.args || [])] : ['mcp', 'add', ...flags, '--', b.name, b.url], 60000);
   }
-  audit({ action: 'mcp-add', provider: b.provider || 'claude', name: b.name, transport, ok: r.code === 0 });
+  audit({ action: 'mcp-add', provider, name: b.name, transport, ok: r.code === 0 });
   if (r.code !== 0) throw new Error((r.err || r.out || 'falhou com código ' + r.code).trim().slice(0, 800));
   return { ok: true, output: (r.out + r.err).trim() };
 }
 async function removeMcp(provider, name, scope) {
   if (!validName(name)) throw new Error('nome inválido');
+  if (!['claude', 'antigravity', 'copilot', 'opencode'].includes(provider)) throw new Error('provedor MCP inválido');
+  if (provider === 'copilot') {
+    const cfgPath = copilotMcpPath();
+    const existing = readJsoncFile(cfgPath);
+    if (!existing || !existing.mcpServers || !Object.prototype.hasOwnProperty.call(existing.mcpServers, name)) {
+      audit({ action: 'mcp-remove', provider, name, ok: false });
+      throw new Error('MCP "' + name + '" não encontrado em ' + cfgPath);
+    }
+    const mcpServers = { ...existing.mcpServers };
+    delete mcpServers[name];
+    writeJsonAtomic(cfgPath, { ...existing, mcpServers }, 0o600);
+    audit({ action: 'mcp-remove', provider, name, ok: true });
+    return { ok: true, output: 'Removido de ' + cfgPath };
+  }
+  if (provider === 'opencode') {
+    const { jsonPath, jsoncPath } = opencodeMcpConfig();
+    const removedFrom = [];
+    for (const p of [jsonPath, jsoncPath]) {
+      const obj = readJsoncFile(p);
+      if (!obj || !obj.mcp || typeof obj.mcp !== 'object') continue;
+      let changed = false;
+      const mcpObj = { ...obj.mcp };
+      if (mcpObj.servers && typeof mcpObj.servers === 'object' && Object.prototype.hasOwnProperty.call(mcpObj.servers, name)) {
+        const servers = { ...mcpObj.servers };
+        delete servers[name];
+        mcpObj.servers = servers;
+        changed = true;
+      }
+      if (name !== 'servers' && name !== 'timeout' && Object.prototype.hasOwnProperty.call(mcpObj, name)) {
+        delete mcpObj[name];
+        changed = true;
+      }
+      if (changed) {
+        writeJsonAtomic(p, { ...obj, mcp: mcpObj }, 0o600);
+        removedFrom.push(p);
+      }
+    }
+    if (!removedFrom.length) {
+      audit({ action: 'mcp-remove', provider, name, ok: false });
+      throw new Error('MCP "' + name + '" não encontrado na configuração do OpenCode');
+    }
+    audit({ action: 'mcp-remove', provider, name, ok: true });
+    return { ok: true, output: 'Removido de ' + removedFrom.join(', ') };
+  }
   const r = provider === 'antigravity'
     ? await execCmd(AGY_BIN, ['mcp', 'remove', name], 60000)
     : await execCmd(CLAUDE_BIN, ['mcp', 'remove', '-s', scope || 'user', name], 60000);
@@ -7205,12 +7484,20 @@ async function handleAdmin(req, res, u, raw) {
       }
     }
     if (a === 'mcp' && !b && m === 'GET') {
-      const agy = await agyMcp();
+      const [agy, cp, oc] = await Promise.all([agyMcp(), copilotMcp(), opencodeMcp()]);
       const cl = claudeMcpConfig();
-      return send(200, { claude: { user: redactServers(cl.user), local: redactServers(cl.local), project: redactServers(cl.project) }, antigravity: agy });
+      return send(200, {
+        claude: { user: redactServers(cl.user), local: redactServers(cl.local), project: redactServers(cl.project) },
+        antigravity: agy,
+        copilot: cp,
+        opencode: oc,
+      });
     }
     if (a === 'mcp' && b === 'status' && m === 'GET') {
-      if (u.searchParams.get('provider') === 'antigravity') return send(200, await agyMcpStatus());
+      const prov = u.searchParams.get('provider') || 'claude';
+      if (prov === 'antigravity') return send(200, await agyMcpStatus());
+      if (prov === 'copilot') return send(200, await copilotMcpStatus());
+      if (prov === 'opencode') return send(200, await opencodeMcpStatus());
       const r = await execCmd(CLAUDE_BIN, ['mcp', 'list'], 90000);
       return send(200, { output: (r.out + (r.code ? '\n' + r.err : '')).trim(), code: r.code });
     }

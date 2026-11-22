@@ -31,7 +31,8 @@ setTimeout(() => ev({ type: 'result', result: 'ECHO:' + p + ' |web=' + sys.inclu
 
 const PORT = 3999, TOKEN = 'tok-123';
 const bridge = spawn(process.execPath, [path.join(dir, '..', 'bridge', 'bridge.mjs')], {
-  env: { ...process.env, PORT: String(PORT), HOME: tmp, CLAUDE_BIN: fakeClaude, AGY_BIN: path.join(tmp, 'no-agy'), BRIDGE_ADMIN_TOKEN: TOKEN,
+  env: { ...process.env, PORT: String(PORT), HOME: tmp, XDG_CONFIG_HOME: path.join(tmp, '.config'), CLAUDE_BIN: fakeClaude, AGY_BIN: path.join(tmp, 'no-agy'),
+    COPILOT_BIN: path.join(tmp, 'no-copilot'), OPENCODE_BIN: path.join(tmp, 'no-opencode'), BRIDGE_ADMIN_TOKEN: TOKEN,
     ALLOWED_NUMBERS: '5511999990000', WAHA_URL: 'http://127.0.0.1:1', STARTUP_NOTICE: 'false', AI_MEMORY: 'off' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
@@ -157,8 +158,55 @@ try {
     && agyStatus.servers.off.disabled && /good: .* - ✔ Connected/.test(agyStatus.output) && !agyStatus.output.includes('sekret'), agyStatus);
   const agyAdd = await api('POST', '/mcp', { provider: 'antigravity', name: 'api', transport: 'http', url: 'https://example.com/mcp', headers: { Authorization: 'Bearer t' } });
   check('agy mcp add passes headers', agyAdd.status === 200 && fs.readFileSync(path.join(tmp, 'agy-add-args'), 'utf8').trim() === 'mcp add --header Authorization: Bearer t -- api https://example.com/mcp', agyAdd);
-  stub.close();
   fs.rmSync(fakeAgy);
+
+  // GitHub Copilot MCP: add/list/redaction/status/remove preserving other keys in ~/.copilot/mcp-config.json
+  const fakeCopilot = path.join(tmp, 'no-copilot');
+  fs.writeFileSync(fakeCopilot, '#!/bin/sh\necho "GitHub Copilot CLI 1.0.114."\n', { mode: 0o755 });
+  const cpCfgFile = path.join(tmp, '.copilot', 'mcp-config.json');
+  fs.mkdirSync(path.dirname(cpCfgFile), { recursive: true });
+  fs.writeFileSync(cpCfgFile, JSON.stringify({ customMeta: 'keep-me', mcpServers: { offcp: { type: 'local', command: 'x', enabled: false } } }));
+  const cpAddStdio = await api('POST', '/mcp', { provider: 'copilot', name: 'goodcp', transport: 'stdio', command: process.execPath, args: [goodMcp], env: { CP_SECRET: 'cp-val-123' } });
+  const cpAddHttp = await api('POST', '/mcp', { provider: 'copilot', name: 'remotecp', transport: 'http', url: stubUrl, headers: { Authorization: 'Bearer sekret' } });
+  const cpAddNoAuth = await api('POST', '/mcp', { provider: 'copilot', name: 'noauthcp', transport: 'http', url: stubUrl });
+  check('copilot mcp add stdio + http', cpAddStdio.status === 200 && cpAddHttp.status === 200 && cpAddNoAuth.status === 200, { cpAddStdio, cpAddHttp, cpAddNoAuth });
+  const cpRaw = JSON.parse(fs.readFileSync(cpCfgFile, 'utf8'));
+  check('copilot mcp preserves other config keys', cpRaw.customMeta === 'keep-me' && cpRaw.mcpServers.goodcp.type === 'local' && cpRaw.mcpServers.remotecp.type === 'http', cpRaw);
+  const cpList = await api('GET', '/mcp');
+  check('copilot mcp list + redaction', cpList.body.copilot.installed === true && cpList.body.copilot.configPath === cpCfgFile
+    && cpList.body.copilot.servers.goodcp.env.CP_SECRET === '***' && cpList.body.copilot.servers.remotecp.headers.Authorization === '***'
+    && !JSON.stringify(cpList.body.copilot).includes('cp-val-123') && !JSON.stringify(cpList.body.copilot).includes('sekret'), cpList.body.copilot);
+  const cpStatus = (await api('GET', '/mcp/status?provider=copilot')).body;
+  check('copilot mcp status handshake', cpStatus.servers.goodcp.ok && cpStatus.servers.remotecp.ok && !cpStatus.servers.noauthcp.ok && cpStatus.servers.offcp.disabled && !cpStatus.output.includes('sekret'), cpStatus);
+  const cpDel = await api('DELETE', '/mcp/copilot/noauthcp');
+  check('copilot mcp remove', cpDel.status === 200 && !(await api('GET', '/mcp')).body.copilot.servers.noauthcp && (await api('DELETE', '/mcp/copilot/noauthcp')).status === 400, cpDel);
+  fs.rmSync(fakeCopilot);
+
+  // OpenCode MCP: add/list/redaction/status/remove preserving $schema and model in opencode.json
+  const fakeOc = path.join(tmp, 'no-opencode');
+  fs.writeFileSync(fakeOc, '#!/bin/sh\necho "1.19.6"\n', { mode: 0o755 });
+  const ocCfgFile = path.join(tmp, '.config', 'opencode', 'opencode.json');
+  fs.mkdirSync(path.dirname(ocCfgFile), { recursive: true });
+  fs.writeFileSync(ocCfgFile, JSON.stringify({ $schema: 'https://opencode.ai/config.json', model: 'opencode/nemotron-3.5-lightning-free', mcp: { offoc: { type: 'local', command: ['x'], enabled: false } } }, null, 2));
+  const ocAddStdio = await api('POST', '/mcp', { provider: 'opencode', name: 'goodoc', transport: 'stdio', command: process.execPath, args: [goodMcp], env: { OC_SECRET: 'oc-val-456' } });
+  const ocAddHttp = await api('POST', '/mcp', { provider: 'opencode', name: 'remoteoc', transport: 'http', url: stubUrl, headers: { Authorization: 'Bearer sekret' } });
+  const ocAddNoAuth = await api('POST', '/mcp', { provider: 'opencode', name: 'noauthoc', transport: 'http', url: stubUrl });
+  check('opencode mcp add stdio + remote', ocAddStdio.status === 200 && ocAddHttp.status === 200 && ocAddNoAuth.status === 200, { ocAddStdio, ocAddHttp, ocAddNoAuth });
+  const ocRaw = JSON.parse(fs.readFileSync(ocCfgFile, 'utf8'));
+  check('opencode mcp preserves model + schema + uses mcp.servers', ocRaw.model === 'opencode/nemotron-3.5-lightning-free' && ocRaw.$schema === 'https://opencode.ai/config.json'
+    && Array.isArray(ocRaw.mcp.servers.goodoc.command) && ocRaw.mcp.servers.goodoc.environment.OC_SECRET === 'oc-val-456' && ocRaw.mcp.servers.remoteoc.type === 'remote', ocRaw);
+  const ocList = await api('GET', '/mcp');
+  check('opencode mcp list + redaction', ocList.body.opencode.installed === true && ocList.body.opencode.configPath === ocCfgFile
+    && ocList.body.opencode.servers.goodoc.environment.OC_SECRET === '***' && ocList.body.opencode.servers.remoteoc.headers.Authorization === '***'
+    && !JSON.stringify(ocList.body.opencode).includes('oc-val-456') && !JSON.stringify(ocList.body.opencode).includes('sekret'), ocList.body.opencode);
+  const ocStatus = (await api('GET', '/mcp/status?provider=opencode')).body;
+  check('opencode mcp status handshake', ocStatus.servers.goodoc.ok && ocStatus.servers.remoteoc.ok && !ocStatus.servers.noauthoc.ok && ocStatus.servers.offoc.disabled && !ocStatus.output.includes('sekret'), ocStatus);
+  const ocDel = await api('DELETE', '/mcp/opencode/noauthoc');
+  const ocDelLegacy = await api('DELETE', '/mcp/opencode/offoc');
+  check('opencode mcp remove (new + legacy)', ocDel.status === 200 && ocDelLegacy.status === 200 && !(await api('GET', '/mcp')).body.opencode.servers.noauthoc && (await api('DELETE', '/mcp/opencode/noauthoc')).status === 400, { ocDel, ocDelLegacy });
+  fs.rmSync(fakeOc);
+
+  stub.close();
 
   const del = await api('DELETE', '/chats/' + encodeURIComponent('web:' + id));
   check('delete web chat', del.status === 200 && !(await api('GET', '/schedules')).body.length);
