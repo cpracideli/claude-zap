@@ -30,6 +30,7 @@ const WAHA_PORT = 4095;
 const TOKEN = 'tok-decisions-wa';
 const OWNER_NUM = '5511999990000';
 const W = OWNER_NUM + '@c.us';
+const W_LID = '198765432109876@lid';
 const PANEL_URL = 'https://panel.decisions.test';
 
 // Pre-seed two in_progress tickets to verify boot recovery notification (recoverPendingJobs)
@@ -39,6 +40,7 @@ fs.writeFileSync(path.join(tmp, '.bridge', 'tickets.json'), JSON.stringify([
 ], null, 2));
 fs.writeFileSync(path.join(tmp, '.bridge', 'chats.json'), JSON.stringify({
   [W]: {},
+  [W_LID]: {},
   'deleg:dec123': { title: 'Delegação Backend', bot: 'default' },
 }, null, 2));
 fs.writeFileSync(path.join(tmp, '.bridge', 'settings.json'), JSON.stringify({
@@ -111,6 +113,11 @@ const waha = http.createServer((req, res) => {
       const u = new URL(req.url, 'http://local');
       const phone = u.searchParams.get('phone');
       return res.end(JSON.stringify({ numberExists: true, chatId: phone + '@c.us' }));
+    }
+    if (req.url.startsWith('/api/S/lids/')) {
+      const lid = decodeURIComponent(req.url.slice('/api/S/lids/'.length));
+      if (lid === W_LID) return res.end(JSON.stringify({ lid: W_LID, pn: OWNER_NUM + '@c.us' }));
+      return res.end(JSON.stringify({}));
     }
     if (req.url === '/api/sendText' && failRecipient && j && j.chatId === failRecipient) {
       res.writeHead(500);
@@ -398,6 +405,37 @@ try {
   });
   const pgData = (await api('GET', '/pages/' + pg.id + '/data')).body;
   check('approving workflow via WhatsApp resumes and completes workflow', Boolean(wfCompleted && pgData.approvedViaWa === true), { wfCompleted, pgData });
+
+  // 11b) Owner WhatsApp @lid replies (numeric text + reaction) answer mirrored prompts and Goal @lid notify deduplicates
+  wahaCalls.length = 0;
+  const lidTextPromise = local('POST', '/prompts', { chatId: webChat.id, title: 'Confirmar via LID', question: 'Rodar job via LID?', options: ['Executar', 'Cancelar'], wait: 8 });
+  await until(() => waTexts().find((t) => t.includes('Confirmar via LID')));
+  await waEvent('message', { id: 'm-lid-text', from: W_LID, body: '1' });
+  const lidTextRes = await lidTextPromise;
+  check('numeric WhatsApp reply from @lid answers mirrored Web prompt', lidTextRes.status === 200 && lidTextRes.body.status === 'answered' && lidTextRes.body.answer === 'Executar', lidTextRes.body);
+
+  wahaCalls.length = 0;
+  const lidReactPromise = local('POST', '/prompts', { chatId: webChat.id, title: 'Reagir via LID', question: 'Confirmar com reação?', options: ['Sim', 'Não'], wait: 8 });
+  await until(() => waTexts().find((t) => t.includes('Reagir via LID')));
+  await waEvent('message.reaction', { from: W_LID, reaction: { text: '👍', messageId: 'true_' + W_LID + '_lidreact1' } });
+  const lidReactRes = await lidReactPromise;
+  check('WhatsApp 👍 reaction from @lid answers mirrored 2-option Web prompt', lidReactRes.status === 200 && lidReactRes.body.status === 'answered' && lidReactRes.body.answer === 'Sim', lidReactRes.body);
+
+  // Goal ticket with notifyChatId = W_LID finishing into review must send ONLY the goal notification (no duplicate decision notice)
+  wahaCalls.length = 0;
+  const tkGoalLid = (await local('POST', '/tickets', {
+    title: 'Objetivo LID sem duplicar', description: 'Executar tarefa simples',
+    status: 'todo', priority: 'medium', bot: 'default', goal: true, notifyChatId: W_LID,
+  })).body;
+  await api('POST', '/tickets/' + tkGoalLid.id + '/run');
+  await until(async () => {
+    const list = (await api('GET', '/tickets')).body;
+    const found = (Array.isArray(list) ? list : list.tickets || []).find((x) => x.id === tkGoalLid.id);
+    return found && found.status === 'review' ? found : null;
+  });
+  await wait(350);
+  const goalLidCalls = wahaCalls.filter((c) => c.url === '/api/sendText' && (c.body?.chatId === W || c.body?.chatId === W_LID) && String(c.body.text || '').includes('#' + tkGoalLid.id));
+  check('goal ticket with @lid notifyChatId sends single WhatsApp notice on review (no duplicate)', goalLidCalls.length === 1 && goalLidCalls[0].body.chatId === W_LID && String(goalLidCalls[0].body.text || '').includes('Objetivo #' + tkGoalLid.id), goalLidCalls);
 
   // 12) Safe no-op when ALLOWED_NUMBERS is empty and WAHA_URL is absent
   const tmpEmpty = path.join(dir, 'tmp-decisions-empty');

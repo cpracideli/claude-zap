@@ -1702,7 +1702,7 @@ async function handleReaction(payload) {
   if (!chatId || chatId.endsWith('@g.us')) return;
   const number = await senderNumber({ from: payload.from, participant: payload.participant, _data: payload._data });
   if (!ALLOWED.length || !ALLOWED.includes(number)) return;
-  const pp = pendingPromptFor(chatId);
+  const pp = pendingPromptFor(chatId, true, number);
   if (!pp || pp.kind === 'secret' || pp.options.length !== 2) return;
   if (pp.requirePin && settings.securityPinHash) {
     reply(chatId, '🔐 Esta aprovacao exige PIN de seguranca. Confirme no painel web.', true).catch(() => {});
@@ -1710,7 +1710,7 @@ async function handleReaction(payload) {
   }
   const chosen = pos ? pp.options[0] : pp.options[1];
   answerPrompt(pp.id, chosen, '', 'whatsapp-reaction');
-  if (pp.chatId === chatId) remember(chatId, 'user', chosen);
+  if (isPromptDirectForWa(pp, chatId, number)) remember(pp.chatId, 'user', chosen);
   log('reaction answered prompt ->', pp.id, chosen);
   reply(chatId, '✅ Resposta registrada (' + text + '): *' + chosen + '*', true).catch(() => {});
 }
@@ -2092,8 +2092,8 @@ async function handleMessage(msg) {
 
   const hadMedia = Boolean(msg.hasMedia);
   const rawUserText = body;
-  const ppEarly = pendingPromptFor(chatId);
-  if (ppEarly && isPromptActiveForWa(ppEarly, chatId, null) && hadMedia && !rawUserText) {
+  const ppEarly = pendingPromptFor(chatId, true, number);
+  if (ppEarly && isPromptActiveForWa(ppEarly, chatId, null, number) && hadMedia && !rawUserText) {
     reply(chatId, '⚠️ Áudios e anexos não valem como aprovação. Vote na enquete ou responda por texto/número.', true).catch(() => {});
     return;
   }
@@ -2115,9 +2115,9 @@ async function handleMessage(msg) {
   }
   if (!body) return;
 
-  const ppAny = pendingPromptFor(chatId);
+  const ppAny = pendingPromptFor(chatId, true, number);
   const cleanTextForPrompt = rawUserText || body;
-  if (ppAny && isPromptActiveForWa(ppAny, chatId, cleanTextForPrompt)) {
+  if (ppAny && isPromptActiveForWa(ppAny, chatId, cleanTextForPrompt, number)) {
     // Security rule (Nod): voice notes or attachments alone never count as approval.
     if (hadMedia && !rawUserText) {
       reply(chatId, '⚠️ Áudios e anexos não valem como aprovação. Vote na enquete ou responda por texto/número.', true).catch(() => {});
@@ -2128,7 +2128,7 @@ async function handleMessage(msg) {
     const ans = matched.answer;
     try {
       answerPrompt(ppAny.id, ans, '', 'whatsapp', '', pin);
-      if (ppAny.chatId === chatId) remember(chatId, 'user', ans);
+      if (isPromptDirectForWa(ppAny, chatId, number)) remember(ppAny.chatId, 'user', ans);
       reply(chatId, '✅ Resposta registrada: *' + ans + '*', true).catch(() => {});
     } catch (e) {
       reply(chatId, '🔐 ' + e.message, true).catch(() => {});
@@ -2899,6 +2899,10 @@ function emitPrompt(p) {
 function waDigitsOf(chatId) {
   const s = String(chatId || '');
   if (!isWhatsApp(s) || s.endsWith('@g.us')) return '';
+  if (s.endsWith('@lid')) {
+    const mapped = lidCache.get(s);
+    return mapped ? String(mapped).replace(/\D/g, '') : '';
+  }
   return s.split('@')[0].split(':')[0].replace(/\D/g, '');
 }
 function sameWaNumber(a, b) {
@@ -2939,13 +2943,17 @@ async function notifyDecisionWhatsApp(text, opts = {}) {
   const targets = ownerWhatsAppChats();
   if (!targets.length) return { sent: 0 };
   if (opts.respectQuietHours && inQuietHours()) return { sent: 0, skipped: 'quiet_hours' };
+  const excludeChatId = String(opts.excludeChatId || '');
+  if (excludeChatId && excludeChatId.endsWith('@lid') && !lidCache.has(excludeChatId)) {
+    await senderNumber({ from: excludeChatId }).catch(() => '');
+  }
   let finalText = body;
   if (opts.panelPath !== false && settings.panelUrl && !finalText.includes(settings.panelUrl)) {
     finalText += '\n🔗 ' + panelLink(opts.panelPath || '');
   }
   let sent = 0;
   for (const target of targets) {
-    if (opts.excludeChatId && (target === opts.excludeChatId || sameWaNumber(target, opts.excludeChatId))) continue;
+    if (excludeChatId && (target === excludeChatId || sameWaNumber(target, excludeChatId))) continue;
     try {
       await reply(target, finalText, opts.raw !== false);
       sent += 1;
@@ -3183,9 +3191,21 @@ function createNudge(b) {
   });
   return { deduplicated: false, prompt: promptView(p) };
 }
-function isPromptMirroredTo(p, chatId) {
-  if (!p || !chatId || p.chatId === chatId) return false;
-  return p.whatsappChatId === chatId || (Array.isArray(p.waMirrorChatIds) && p.waMirrorChatIds.includes(chatId));
+function isPromptDirectForWa(p, chatId, waNumber = '') {
+  if (!p || !chatId) return false;
+  if (p.chatId === chatId) return true;
+  if (!isWhatsApp(p.chatId)) return false;
+  const digits = String(waNumber || '').replace(/\D/g, '') || waDigitsOf(chatId);
+  return Boolean(digits && waDigitsOf(p.chatId) === digits);
+}
+function isPromptMirroredTo(p, chatId, waNumber = '') {
+  if (!p || !chatId || isPromptDirectForWa(p, chatId, waNumber)) return false;
+  if (p.whatsappChatId === chatId || (Array.isArray(p.waMirrorChatIds) && p.waMirrorChatIds.includes(chatId))) return true;
+  const digits = String(waNumber || '').replace(/\D/g, '') || waDigitsOf(chatId);
+  if (!digits) return false;
+  if (p.whatsappChatId && waDigitsOf(p.whatsappChatId) === digits) return true;
+  if (Array.isArray(p.waMirrorChatIds) && p.waMirrorChatIds.some((cid) => waDigitsOf(cid) === digits)) return true;
+  return false;
 }
 function extractPinFromText(text) {
   const s = String(text || '');
@@ -3207,10 +3227,10 @@ function matchPromptReply(p, withoutPin) {
   if (p.options.length === 2 && NEG_REACT.test(clean)) return { matched: true, answer: p.options[1] };
   return { matched: false, answer: clean };
 }
-function isPromptActiveForWa(p, chatId, text) {
+function isPromptActiveForWa(p, chatId, text, waNumber = '') {
   if (!p || p.status !== 'pending') return false;
-  if (p.chatId === chatId) return running.has(chatId) || Boolean(p.nudgeId) || Boolean(p.workflowRunId);
-  if (isPromptMirroredTo(p, chatId)) {
+  if (isPromptDirectForWa(p, chatId, waNumber)) return running.has(p.chatId) || Boolean(p.nudgeId) || Boolean(p.workflowRunId);
+  if (isPromptMirroredTo(p, chatId, waNumber)) {
     if (text === null) return running.has(p.chatId) || Boolean(p.nudgeId) || Boolean(p.workflowRunId);
     if (running.has(p.chatId)) return true;
     const { withoutPin } = extractPinFromText(text);
@@ -3218,13 +3238,13 @@ function isPromptActiveForWa(p, chatId, text) {
   }
   return false;
 }
-function pendingPromptFor(chatId, includeMirrored = true) {
+function pendingPromptFor(chatId, includeMirrored = true, waNumber = '') {
   let direct = null;
   let mirrored = null;
   for (const p of prompts.values()) {
     if (p.status !== 'pending') continue;
-    if (p.chatId === chatId) direct = p;
-    else if (includeMirrored && isPromptMirroredTo(p, chatId)) mirrored = p;
+    if (isPromptDirectForWa(p, chatId, waNumber)) direct = p;
+    else if (includeMirrored && isPromptMirroredTo(p, chatId, waNumber)) mirrored = p;
   }
   return direct || mirrored;
 }
