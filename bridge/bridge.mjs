@@ -7111,10 +7111,10 @@ function openCodeEstimate(events, rateLimited, now = Date.now()) {
     prev = h;
   }
   const cur = countIn(now - OC_EST_WINDOW_MS, now + 1);
-  if (!samples.length) return { estimated: true, windowHours: OC_EST_WINDOW_MS / 3600000, used: cur.n, tokens: cur.tok, limit: null, percent: rateLimited ? 100 : null, samples: 0 };
+  if (!samples.length) return { estimated: true, windowHours: OC_EST_WINDOW_MS / 3600000, used: cur.n, tokens: cur.tok, limit: null, percent: rateLimited && cur.n > 0 ? 100 : null, samples: 0 };
   samples.sort((a, b) => a - b);
   const limit = samples[Math.floor(samples.length / 2)];
-  const percent = rateLimited ? 100 : Math.min(100, Math.round((cur.n / limit) * 100));
+  const percent = (rateLimited && cur.n > 0) ? 100 : Math.min(100, Math.round((cur.n / limit) * 100));
   const oldest = events.filter(([t]) => t >= now - OC_EST_WINDOW_MS).reduce((a, [t]) => Math.min(a, t), Infinity);
   return { estimated: true, windowHours: OC_EST_WINDOW_MS / 3600000, used: cur.n, tokens: cur.tok, limit, percent, samples: samples.length,
     freesAt: Number.isFinite(oldest) && cur.n > 0 ? new Date(oldest + OC_EST_WINDOW_MS).toISOString() : null };
