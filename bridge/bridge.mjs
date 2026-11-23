@@ -900,6 +900,12 @@ function runClaude(chatId, prompt, opts, onActivity, onEvent) {
       if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
       if (!results.length) return done({ error: 'claude saiu com código ' + code + ': ' + (err || out).slice(-500) });
       const last = results[results.length - 1];
+      // Lost session (e.g. after a provider failover): retry once fresh instead of returning an empty answer.
+      if (opts.resume && !opts._staleRetry && /No conversation found with session ID/i.test(err + out) && results.every((x) => !x.num_turns)) {
+        clearTimeout(timer); inputOpen = false; if (running.get(chatId) === entry) running.delete(chatId);
+        audit({ action: 'stale-session-reset', chatId, session: opts.resume });
+        return resolve(runClaude(chatId, prompt, { ...opts, resume: undefined, _staleRetry: true }, onActivity, onEvent));
+      }
       const sum = (k) => results.reduce((a, x) => a + (Number(x[k]) || 0), 0);
       done({ text: results.map((x) => x.result || '').filter((x) => x.trim()).join('\n\n'), sessionId: last.session_id,
         isError: results.some((x) => x.is_error), usage: { cost: sum('total_cost_usd'), ms: sum('duration_ms'), turns: sum('num_turns') } });
