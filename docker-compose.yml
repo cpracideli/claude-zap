@@ -6999,40 +6999,82 @@ services:
             return v;
           }
 
+          // `agy -p /usage` é comando local (não gasta turno de modelo) e traz as DUAS janelas por grupo.
+          // Cada linha: "Grupo<TAB>Métrica<TAB>NN%<TAB>ISO", com NN = percentual RESTANTE.
+          function parseAgyUsage(text) {
+            const out = [];
+            for (const raw of String(text || '').split('\n')) {
+              const m = raw.trim().match(/^(.+?)\t(.+?)\t(\d+(?:\.\d+)?)%\t(\S+)/);
+              if (!m) continue;
+              const [, grp, metric, pct, resetsAt] = m;
+              if (!/limit/i.test(metric)) continue;
+              const window = /five\s*hour/i.test(metric) ? '5h' : 'weekly';
+              const name = grp.replace(/\s+models?\b/i, '').trim();
+              if (!name) continue;
+              out.push({ name, window, remaining: Number(pct), resetsAt });
+            }
+            return out;
+          }
+
+          async function agyCliWindows(apiGroups) {
+            if (!fs.existsSync(AGY_BIN)) return null;
+            const r = await execCmd(AGY_BIN, ['-p', '/usage'], 30000);
+            const lines = parseAgyUsage(r.out);
+            if (!lines.length) return null;
+            const famOf = (s) => ['gemini', 'claude', 'gpt'].filter((f) => String(s).toLowerCase().includes(f));
+            return lines.map((l) => {
+              const fams = famOf(l.name);
+              const models = [...new Set(apiGroups.flatMap((g) => g.models).filter((m) => fams.some((f) => m.toLowerCase().includes(f))))].sort();
+              return { label: l.name + ' · ' + (l.window === '5h' ? '5 h' : 'semanal'), window: l.window,
+                percent: Math.round((100 - l.remaining) * 10) / 10, resetsAt: l.resetsAt, models };
+            });
+          }
+
           async function agyLimits() {
             const c = usageCache.agy;
             if (c && Date.now() - c.t < 60000) return c.v;
             let v;
             try {
-              const tok = readJson(path.join(HOME_DIR, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'))?.token?.access_token;
-              if (!tok) throw new Error('Antigravity sem login');
-              const call = async (method, body) => {
-                const r = await fetch('https://daily-cloudcode-pa.googleapis.com/v1internal:' + method, { method: 'POST', signal: AbortSignal.timeout(20000),
-                  headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json', 'User-Agent': 'antigravity' }, body: JSON.stringify(body) });
-                if (!r.ok) throw new Error(method + ': HTTP ' + r.status + (r.status === 401 ? ' (token vencido: renova na próxima execução do agy)' : ''));
-                return r.json();
-              };
-              if (!usageCache.agyProject) {
-                const la = await call('loadCodeAssist', { metadata: { ideType: 'ANTIGRAVITY' } });
-                usageCache.agyProject = { id: la.cloudaicompanionProject, tier: la.paidTier?.name || la.currentTier?.name || null };
-              }
-              const fm = await call('fetchAvailableModels', usageCache.agyProject.id ? { project: usageCache.agyProject.id } : {});
-              // Models share quota pools: group them by (remaining, reset time).
-              const groups = new Map();
-              for (const [id, m] of Object.entries(fm.models || {})) {
-                const q = m.quotaInfo;
-                if (!q || !q.resetTime || /^(tab_|chat_)/.test(id)) continue;
-                const key = (q.remainingFraction ?? 1) + '|' + q.resetTime;
-                if (!groups.has(key)) groups.set(key, { remaining: q.remainingFraction ?? 1, resetsAt: q.resetTime, models: [] });
-                groups.get(key).models.push(m.displayName || id);
-              }
-              const label = (g) => {
-                const t = g.models.join(' ').toLowerCase();
-                const fam = ['gemini', 'claude', 'gpt'].filter((f) => t.includes(f));
-                return fam.map((f) => (f === 'gpt' ? 'GPT' : f[0].toUpperCase() + f.slice(1))).join(' + ') || 'Modelos';
-              };
-              v = { tier: usageCache.agyProject.tier, fetchedAt: new Date().toISOString(), groups: [...groups.values()].map((g) => ({ label: label(g), percent: Math.round((1 - g.remaining) * 1000) / 10, resetsAt: g.resetsAt, models: [...new Set(g.models)].sort() }))
-                .sort((a, b) => a.label.localeCompare(b.label)) };
+              let tier = usageCache.agyProject?.tier || null;
+              let apiGroups = [];
+              let apiErr = null;
+              try {
+                const tok = readJson(path.join(HOME_DIR, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'))?.token?.access_token;
+                if (!tok) throw new Error('Antigravity sem login');
+                const call = async (method, body) => {
+                  const r = await fetch('https://daily-cloudcode-pa.googleapis.com/v1internal:' + method, { method: 'POST', signal: AbortSignal.timeout(20000),
+                    headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json', 'User-Agent': 'antigravity' }, body: JSON.stringify(body) });
+                  if (!r.ok) throw new Error(method + ': HTTP ' + r.status + (r.status === 401 ? ' (token vencido: renova na próxima execução do agy)' : ''));
+                  return r.json();
+                };
+                if (!usageCache.agyProject) {
+                  const la = await call('loadCodeAssist', { metadata: { ideType: 'ANTIGRAVITY' } });
+                  usageCache.agyProject = { id: la.cloudaicompanionProject, tier: la.paidTier?.name || la.currentTier?.name || null };
+                }
+                tier = usageCache.agyProject.tier;
+                const fm = await call('fetchAvailableModels', usageCache.agyProject.id ? { project: usageCache.agyProject.id } : {});
+                // Models share quota pools: group them by (remaining, reset time). Só a janela semanal aparece aqui.
+                const groups = new Map();
+                for (const [id, m] of Object.entries(fm.models || {})) {
+                  const q = m.quotaInfo;
+                  if (!q || !q.resetTime || /^(tab_|chat_)/.test(id)) continue;
+                  const key = (q.remainingFraction ?? 1) + '|' + q.resetTime;
+                  if (!groups.has(key)) groups.set(key, { remaining: q.remainingFraction ?? 1, resetsAt: q.resetTime, models: [] });
+                  groups.get(key).models.push(m.displayName || id);
+                }
+                const label = (g) => {
+                  const t = g.models.join(' ').toLowerCase();
+                  const fam = ['gemini', 'claude', 'gpt'].filter((f) => t.includes(f));
+                  return fam.map((f) => (f === 'gpt' ? 'GPT' : f[0].toUpperCase() + f.slice(1))).join(' + ') || 'Modelos';
+                };
+                apiGroups = [...groups.values()].map((g) => ({ label: label(g) + ' · semanal', window: 'weekly', percent: Math.round((1 - g.remaining) * 1000) / 10, resetsAt: g.resetsAt, models: [...new Set(g.models)].sort() }));
+              } catch (e) { apiErr = e; }
+              // Preferido: o próprio agy, que informa a janela de 5 h e a semanal de cada grupo.
+              let cli = null;
+              try { cli = await agyCliWindows(apiGroups); } catch (e) { log('agy /usage falhou', e.message); }
+              if (!cli && apiErr) throw apiErr;
+              const groups = cli || apiGroups;
+              v = { tier, fetchedAt: new Date().toISOString(), groups: groups.sort((a, b) => a.label.localeCompare(b.label)) };
             } catch (e) {
               v = { ...(c?.v?.groups ? c.v : {}), error: e.message, stale: Boolean(c?.v?.groups) };
             }

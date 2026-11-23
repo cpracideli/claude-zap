@@ -6937,12 +6937,12 @@ async function claudeLimits() {
 function parseAgyUsage(text) {
   const out = [];
   for (const raw of String(text || '').split('\n')) {
-    const m = raw.trim().match(/^(.+?)\t(.+?)\t(\d+(?:\.\d+)?)%\t(\S+)$/);
+    const m = raw.trim().match(/^(.+?)\t(.+?)\t(\d+(?:\.\d+)?)%\t(\S+)/);
     if (!m) continue;
     const [, grp, metric, pct, resetsAt] = m;
     if (!/limit/i.test(metric)) continue;
     const window = /five\s*hour/i.test(metric) ? '5h' : 'weekly';
-    const name = grp.replace(/\s+models?$/i, '').trim();
+    const name = grp.replace(/\s+models?\b/i, '').trim();
     if (!name) continue;
     out.push({ name, window, remaining: Number(pct), resetsAt });
   }
