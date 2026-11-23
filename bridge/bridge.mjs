@@ -33,7 +33,7 @@ const COPILOT_MODELS = [
   { id: 'gemini-3-pro-preview', label: 'Gemini 3 Pro' },
   { id: 'mai-code-2-flash', label: 'MAI Code 2 Flash' },
 ];
-const PROVIDERS = { claude: 'Claude Code', antigravity: 'Antigravity', opencode: 'OpenCode', copilot: 'GitHub Copilot', openai_compat: 'API Direta (BYOM)', ollama: 'Ollama Cloud' };
+const PROVIDERS = { claude: 'Claude Code', antigravity: 'Antigravity', opencode: 'OpenCode', copilot: 'GitHub Copilot', openai_compat: 'API Direta (DeepSeek)', ollama: 'Ollama Cloud' };
 // Ollama Cloud runs through the Claude Code binary, pointed at the local Ollama daemon (signed in with
 // `ollama signin`, which offloads "-cloud" models to Ollama's servers). Env vars are per child process only,
 // so the regular Claude provider is never touched.
@@ -1910,8 +1910,9 @@ async function command(chatId, body) {
     case '/provider': {
       const cur = PROVIDERS[providerOf(c)];
       if (!arg) return sendChoice(chatId, 'Provedor atual: ' + cur + '. Escolha:', PROVIDER_CHOICES);
-      const a = arg.toLowerCase(); const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : (a === 'ollama' || a === 'cloud') ? 'ollama' : a;
-      if (!PROVIDERS[want] || want === 'openai_compat') return reply(chatId, 'Provedor inválido. Opções: claude, antigravity, copilot, opencode, ollama.', true);
+      const a = arg.toLowerCase(); const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : (a === 'ollama' || a === 'cloud') ? 'ollama' : (a === 'deepseek' || a === 'ds' || a === 'byom' || a === 'compat' || a === 'openai_compat') ? 'openai_compat' : a;
+      if (!PROVIDERS[want]) return reply(chatId, 'Provedor inválido. Opções: claude, antigravity, copilot, opencode, ollama, deepseek.', true);
+      if (want === 'openai_compat' && !isProviderAvailable('openai_compat')) return reply(chatId, 'API Direta (DeepSeek) não está configurada.', true);
       c.provider = want; save();
       return reply(chatId, 'Provedor desta conversa: ' + PROVIDERS[want] + '. Vale a partir da próxima mensagem. Use /new para começar do zero no novo provedor.', true);
     }
@@ -2080,7 +2081,7 @@ async function handleWebCommand(chatId, body) {
     case '/provider': {
       if (!arg) return out('Provedor atual: **' + PROVIDERS[providerOf(c)] + '**. Use `/provider claude`, `/provider antigravity`, `/provider copilot`, `/provider opencode`, `/provider ollama` ou `/provider openai_compat`.');
       const a = arg.toLowerCase();
-      const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : (a === 'ollama' || a === 'cloud') ? 'ollama' : (a === 'byom' || a === 'compat' || a === 'openai_compat') ? 'openai_compat' : a;
+      const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : (a === 'ollama' || a === 'cloud') ? 'ollama' : (a === 'deepseek' || a === 'ds' || a === 'byom' || a === 'compat' || a === 'openai_compat') ? 'openai_compat' : a;
       if (!PROVIDERS[want]) return out('Provedor inválido. Opções: `claude`, `antigravity`, `copilot`, `opencode`, `ollama`, `openai_compat`.');
       c.provider = want; save();
       return out('Provedor desta conversa alterado para **' + PROVIDERS[want] + '** (vale a partir da próxima mensagem).');
