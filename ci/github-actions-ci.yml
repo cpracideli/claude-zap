@@ -13,11 +13,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Syntax check
-        run: node --check bridge/bridge.mjs
+      - name: Syntax check & no dollar signs in bridge.mjs
+        run: |
+          node --check bridge/bridge.mjs
+          if grep -Fq '$' bridge/bridge.mjs; then
+            echo "ERROR: bridge.mjs contains '$'"
+            exit 1
+          fi
+      - name: Verify compose generation
+        run: node build-compose.mjs
       - name: Run bridge test suites
         run: |
-          for t in test/send-test.mjs test/run-test.mjs test/admin-test.mjs test/bots-test.mjs test/group-test.mjs test/pages-prompts-test.mjs test/grokbot-parity-test.mjs test/nod-dots-parity-test.mjs test/phase2-advanced-test.mjs test/tasks-batch-test.mjs test/next-level-features-test.mjs; do
+          for t in test/send-test.mjs test/run-test.mjs test/admin-test.mjs test/bots-test.mjs test/group-test.mjs test/pages-prompts-test.mjs test/grokbot-parity-test.mjs test/nod-dots-parity-test.mjs test/phase2-advanced-test.mjs test/tasks-batch-test.mjs test/opencode-test.mjs test/copilot-test.mjs test/auto-title-test.mjs test/next-level-features-test.mjs test/portability-test.mjs; do
             if [ -f "$t" ]; then
               echo "=== Running $t ==="
               node "$t"

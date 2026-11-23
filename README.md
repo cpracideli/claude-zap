@@ -1,21 +1,22 @@
 # claude-zap
 
-Talk to **Claude Code** from WhatsApp. You send a message to a WhatsApp number, Claude Code runs on your own server, does the work (research, files, scripts, installs), and replies in the same chat. It can also message other people for you and run scheduled tasks ("every day at 8am send me the weather").
+Talk to **Claude Code** (and Antigravity, Copilot, OpenCode, Ollama or any OpenAI-compatible API) from **Agent Control** (web/PWA panel), **WhatsApp (WAHA)**, **Telegram**, **Discord** or **Slack**.
 
-It runs on [Coolify](https://coolify.io), uses [WAHA](https://waha.devlike.pro) as the WhatsApp gateway, and uses your **Claude subscription** (no per-token API billing).
+Runs on your own [Coolify](https://coolify.io) server using your **Claude subscription** (`claude setup-token`, no per-token API billing) and persists your workspace, sessions, bots, routines, Mini-Apps, encrypted vault, and live browser profile in a Docker volume.
 
 ```
- Your WhatsApp ──► WAHA (WhatsApp gateway) ──webhook──► claude-zap bridge ──► Claude Code
-        ▲                                                       │
-        └──────────────────── reply via WAHA ◄──────────────────┘
+  Web Panel (Agent Control) ──┐
+  WhatsApp (WAHA) ────────────┼──► claude-zap bridge ──► Claude Code / Providers
+  Telegram / Discord / Slack ─┘          │
+                                    Live Computer (noVNC + Chromium)
 ```
 
 ---
 
 ## Contents
 
-1. [What you need](#what-you-need)
-2. [Setup, step by step](#setup-step-by-step)
+1. [Quick Start: All-in-One Stack on Coolify (`docker-compose.stack.yml`)](#quick-start-all-in-one-stack-on-coolify)
+2. [Standalone Bridge + WAHA Setup](#standalone-bridge--waha-setup)
 3. [Using it](#using-it)
 4. [Configuration reference](#configuration-reference)
 5. [Security model](#security-model-read-this)
@@ -26,97 +27,83 @@ It runs on [Coolify](https://coolify.io), uses [WAHA](https://waha.devlike.pro) 
 
 ---
 
-## What you need
+## Quick Start: All-in-One Stack on Coolify
+
+The easiest way for a new user to run **Bridge + Agent Control Web Panel** in a **single Coolify resource** (with Live Computer `noVNC`/`Xvfb`, `ffmpeg`, `espeak-ng`, Chromium, and Claude Code installed automatically on first boot):
+
+### What you need
 
 | Requirement | Notes |
 |---|---|
-| A server running **Coolify v4** | Tested on Coolify 4.7. 2 vCPU / 4 GB RAM is comfortable. ARM64 and x86_64 both work. |
-| A **WAHA** instance in the same Coolify | Logged in to the WhatsApp number the bot will use. Any edition works for text; downloading received media may need WAHA Plus. |
-| A **Claude subscription** (Pro or Max) | Used through `claude setup-token`. |
-| A WhatsApp number for the bot | Ideally a separate number used only by the bot. |
-| Your own WhatsApp number | The number you will talk to the bot from. |
+| A server running **Coolify v4** | Tested on Coolify 4.7+. 2 vCPU / 4 GB RAM is comfortable. ARM64 and x86_64 both work. |
+| A **Claude subscription** (Pro or Max) | Used through `claude setup-token` (or `ANTHROPIC_API_KEY`). |
+| **Optional:** WAHA, Telegram, Discord, Slack, Gemini/Groq/OpenAI keys | WhatsApp is completely optional — the web panel works out of the box without WAHA. |
 
----
+### 1. Get your Claude subscription token
 
-## Setup, step by step
-
-### Step 1. Deploy WAHA (skip if you already have it)
-
-1. In Coolify, open your project and click **+ New Resource**. Pick the **WAHA** service template (or deploy the `devlikeapro/waha` image).
-2. Set `WAHA_API_KEY` to a long random value and keep it somewhere safe.
-3. Give WAHA a domain (Coolify can generate one) and deploy.
-4. Open `https://<your-waha-domain>/dashboard`, start a session and scan the QR code with the **bot's** WhatsApp.
-5. Write down the **exact session name** (for example `default` or `Business`) and wait until the status is `WORKING`.
-
-### Step 2. Get a Claude subscription token
-
-On any computer where Claude Code is installed and logged in to your subscription:
+On any machine with Claude Code signed in:
 
 ```bash
 claude setup-token
 ```
 
-Copy the token it prints (it starts with `sk-ant-oat01-`). Treat it like a password: never paste it in a chat or commit it.
+Copy the printed token (`sk-ant-oat01-...`). Never share or commit it.
 
-### Step 3. Create the bridge from this repository
+### 2. Create the stack resource in Coolify
 
-1. In Coolify, open the **same project and environment** as WAHA (or any environment on the same server) and click **+ New Resource**.
-2. Choose **Public Git Repository**.
-3. Repository URL: `https://github.com/cpracideli/claude-zap` (or your fork). Click **Check Repository**.
-4. Coolify detects **Docker Compose** and `docker-compose.yml`. Keep branch `main`, base directory `/`. Click **Continue**.
-5. **Do not deploy yet.**
+1. In Coolify, open your project/environment and click **+ New Resource** → **Public Git Repository**.
+2. Repository URL: `https://github.com/cpracideli/claude-zap` (or your fork). Click **Check Repository**.
+3. Build Pack: **Docker Compose**, Docker Compose Location: **`/docker-compose.stack.yml`**, branch `main`.
+4. Under **Domains**, assign a domain to the **`agent-control`** service (e.g. `https://agent.yourdomain.com:3001` or Coolify's generated `sslip.io` domain). Do **not** expose `claude-bridge` publicly unless you need external webhooks.
 
-### Step 4. Set the environment variables
+### 3. Set the 4 required Environment Variables
 
-Open the new resource → **Environment Variables** and fill in:
+| Variable | Value |
+|---|---|
+| `ADMIN_PASSWORD` | Strong password to log in to the web panel |
+| `BRIDGE_ADMIN_TOKEN` | Long random secret shared between bridge and panel |
+| `CLAUDE_CODE_OAUTH_TOKEN` | Token from `claude setup-token` (or set `ANTHROPIC_API_KEY`) |
+| `TZ` | Your timezone, e.g. `America/Sao_Paulo` |
 
-| Variable | What to put | Required |
-|---|---|---|
-| `WAHA_URL` | Your WAHA URL, e.g. `https://waha.example.com` | yes |
-| `WAHA_API_KEY` | The key from step 1 | yes |
-| `WAHA_SESSION` | The **exact** session name from step 1 (case-sensitive). If it does not match, every message is silently ignored. | yes |
-| `ALLOWED_NUMBERS` | **Your own** number (not the bot's), digits with country code, e.g. `5511999998888`. Several numbers: separate with commas. | yes |
-| `CLAUDE_CODE_OAUTH_TOKEN` | The token from step 2 | yes |
-| `TZ` | Your timezone, e.g. `America/Sao_Paulo` (used for schedules) | recommended |
-| `CLAUDE_PERMISSION_MODE` | `bypassPermissions` (default) | optional |
+Optional extras you can set anytime in Coolify:
+- `OWNER_NAME` (your first name for greetings/briefings)
+- `PUBLIC_URL` (`https://agent.yourdomain.com` for OAuth, Web Push, webhooks, Mini-Apps)
+- `COOLIFY_URL`, `COOLIFY_TOKEN`, `COOLIFY_APP_UUID` (unlocks Coolify Envs, Logs, Restart/Deploy inside the panel)
+- `WAHA_URL`, `WAHA_API_KEY`, `WAHA_SESSION`, `ALLOWED_NUMBERS` (connects WhatsApp)
+- `GROQ_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY` (native voice transcription & TTS; falls back offline to `espeak-ng`)
+- `AGENTMAIL_API_KEY`, `AGENTMAIL_INBOX` (sending e-mail drafts)
 
-Leave the other variables empty to use their defaults. Leave `ANTHROPIC_API_KEY` empty when you use the subscription token. See `.env.example` for the full list.
+### 4. Deploy & open Agent Control
 
-### Step 5. Give the bridge a stable network name
+Click **Deploy**. First boot installs system packages (`ffmpeg`, `xvfb`, `x11vnc`, `novnc`, `espeak-ng`, `chromium`, Claude Code) and builds the panel frontend (~2–4 minutes). Open your domain and sign in with `ADMIN_PASSWORD`!
 
-WAHA calls the bridge over Coolify's internal `coolify` Docker network. By default Coolify adds a timestamp to the container name on **every** deploy, which would break the webhook. Fix both things once:
+---
 
-1. Open the resource → **Advanced**.
-2. **Docker compose → Predefined network:** select **Connect to predefined network**.
-3. **Container → Container naming:** select **Consistent name (no rolling updates)**.
-4. **Custom container name:** type `claude-zap` and press Enter.
+## Standalone Bridge + WAHA Setup
 
-The container will now always be called **`claude-bridge-claude-zap`**.
+If you prefer running `claude-zap` alone (`docker-compose.yml`, single `claude-bridge` service) or wiring it manually to WAHA:
 
-### Step 6. Deploy
+### Step 1. Deploy WAHA (skip if you already have it or use web-only)
 
-Click **Deploy**. The first start takes a few minutes: it installs `sudo`, basic tools and Claude Code. When it is ready the status turns **Running (healthy)**.
+1. In Coolify, click **+ New Resource** → **WAHA** (or `devlikeapro/waha`).
+2. Set `WAHA_API_KEY` to a random secret and deploy.
+3. Open `https://<your-waha-domain>/dashboard`, start a session, scan the QR code with the **bot's** WhatsApp, and note the exact session name (`WORKING`).
 
-Optional check: open Coolify's **Terminal**, pick the server (`localhost`) and run:
+### Step 2. Create the bridge resource
 
-```bash
-docker run --rm --network coolify node:22-bookworm-slim node -e "fetch('http://claude-bridge-claude-zap:3000/health').then(r=>r.text()).then(console.log).catch(e=>console.log('ERROR', e.cause && e.cause.code))"
-```
+1. **+ New Resource** → **Public Git Repository** → `https://github.com/cpracideli/claude-zap` (`docker-compose.yml`).
+2. Fill in `CLAUDE_CODE_OAUTH_TOKEN`, `BRIDGE_ADMIN_TOKEN`, `WAHA_URL`, `WAHA_API_KEY`, `WAHA_SESSION`, `ALLOWED_NUMBERS`, `TZ`.
+3. Under **Advanced**:
+   - Enable **Connect to predefined network** (`coolify`).
+   - Enable **Consistent container name** and set **Custom container name** to `claude-zap` (container becomes `claude-bridge-claude-zap`).
+4. Deploy and wait for **Running (healthy)**.
 
-Expected: `{"ok":true,"allowed":1,"running":0}`. (`curl` is not in this image, so the check uses Node.)
+### Step 3. Point the WAHA webhook at the bridge
 
-### Step 7. Point the WAHA webhook at the bridge
-
-1. Open the WAHA dashboard → **Sessions** → click the gear icon of **your bot's session**.
-2. Scroll to **Webhooks** and add (or edit) one:
+1. WAHA dashboard → **Sessions** → gear icon → **Webhooks**:
    - **URL:** `http://claude-bridge-claude-zap:3000/webhook`
-   - **Events:** `message` and `poll.vote` (the second one lets `/model` and `/effort` be answered by tapping a poll option)
-   - Leave HMAC and custom headers empty.
-3. Click **Update**. WAHA restarts the session; wait until it is `WORKING` again.
-
-### Step 8. Test
-
-From **your own** WhatsApp (a number in `ALLOWED_NUMBERS`), send `/help` to the **bot's** number. You should get the command list. Then ask anything, for example "What's the weather in São Paulo today?".
+   - **Events:** `message`, `poll.vote`, `message.reaction`
+2. Send `/help` from your own number (`ALLOWED_NUMBERS`) to the bot's WhatsApp.
 
 ---
 
@@ -124,116 +111,92 @@ From **your own** WhatsApp (a number in `ALLOWED_NUMBERS`), send `/help` to the 
 
 | You send | What happens |
 |---|---|
-| Any text | Goes to Claude Code. The conversation context is kept between messages. |
-| An image, audio or document | Saved to the inbox; Claude gets the file path and can analyse it. |
-| `/new` | Starts a fresh conversation (keeps the model and effort). |
-| `/model opus` (`sonnet`, `haiku`, `padrao`) | Changes the model for this chat. Saved. |
-| `/effort high` (`low` … `max`, `padrao`) | Changes the effort level for this chat. Saved. |
-| `/status` | Session, model, what is running, queue, totals. |
-| `/usage` | Total runs, errors, time and estimated cost for this chat. |
-| `/log [n]` | Last *n* runs (default 5, max 20) with time, duration, cost and errors. |
-| `/stop` | Interrupts the current task. The conversation continues. |
-| `/send +55 11 99999-8888 hello` | Sends a WhatsApp message to another number, directly from the bridge. |
-| `/schedules` | Lists scheduled tasks. |
-| `/pause <id>` / `/resume <id>` | Pauses (toggles) or resumes a scheduled task. |
-| `/cancel <id>` | Deletes a scheduled task. |
-| `/help` | Shows a numbered menu of the common commands (reply with the number) and the full command list. |
+| Any text | Goes to the active provider/bot. Conversation context is preserved. |
+| Image, audio or document | Saved to `workspace/inbox`; audio is auto-transcribed if Groq/OpenAI or `~/bin/transcrever` is configured. |
+| `/new` | Starts a fresh conversation (keeps model & effort). |
+| `/provider` / `/model` / `/effort` | Changes provider, model or effort for this chat. |
+| `/status` / `/usage` / `/log [n]` | Shows running tasks, usage/cost and recent runs. |
+| `/stop` | Interrupts the current task. |
+| `/send +55 11 99999-8888 hello` | Sends a WhatsApp message to another number. |
+| `/schedules`, `/pause <id>`, `/resume <id>`, `/cancel <id>` | Manage scheduled tasks and routines. |
+| `/bot [name]` | Switches persona/bot for the chat. |
+| `/council <question>` | Runs multiple models in parallel and synthesizes the best answer. |
+| `/help` | Interactive command menu. |
 
-Commands are in English. The old Portuguese names (`/enviar`, `/agenda`, `/pausar`, `/cancelar`, `/esforco`, ...) were removed.
-
-The bot answers in Brazilian Portuguese by default (see `systemPrompt()` in `bridge/bridge.mjs` to change it).
-
-**Scheduling** works in plain language: "every day at 8am send me the top AI news" or "remind me tomorrow at 3pm to call John". Claude creates the schedule through the bridge; results arrive prefixed with ⏰.
-
-**Bots (personas):** create bots in the Agent Control panel (Bots tab), each with its own name, icon, instructions, provider/model/effort, its own memory file (`~/.bridge/bots/<id>/MEMORY.md`) and, optionally, a limited set of Claude Code MCP servers (`--strict-mcp-config`). Switch the bot of a WhatsApp chat with `/bot <name>` (or `/bot` for a menu); switching starts a new session. Chats that never picked a bot use the `default` bot, which adds nothing to the prompt, so older setups behave exactly as before. A bot can rewrite its own instructions when you ask (local `PATCH /bots/<id>`); every previous version is kept and can be restored in the panel.
-
-**Routines:** schedules can also run as another bot (`"bot"`), be fired by a **webhook** (`"webhook": true` gives `POST <panel>/hooks/<id>/<token>`; the body is passed to the agent as data), **watch** a shell command (`"watch": {"command": "...", "every": 30}` runs it every N minutes and fires only when the output changes) and be **quiet** (`"quiet": true`: nothing is sent when the answer is `NADA_A_RELATAR`). The last 30 runs of each routine (trigger, status, duration, output) are in the panel.
-
-**Messaging others:** ask Claude ("tell +55 11 98888-7777 I'm 10 minutes late") or use `/send`. Messages go out from the bot's number. Replies from that person do not reach Claude.
-
-**Installing tools:** ask Claude to install anything ("install the Playwright MCP"). It has passwordless `sudo`. New MCP servers are available from the next message.
+- **Bots & Engineering Team:** create custom personas with isolated memory, scoped MCPs, Kanban Board tickets, parallel tasks, and delegation.
+- **Routines:** cron, one-shot `at`, **webhooks** (`POST <panel>/hooks/<id>/<token>`), **watch** commands, and `quiet` mode (`NADA_A_RELATAR`).
+- **Mini-Apps / Pages:** HTML dashboards with persistent JSON storage (`window.PageData`) and optional public links (`/p/:id/:token`).
+- **Live Computer:** server-side Chromium inside Xvfb + noVNC where you can take over for logins/2FA/CAPTCHA, plus encrypted AES-GCM credential autofill.
+- **Voice:** native `POST /send-voice` (WhatsApp PTT) and web TTS playback using `~/bin/falar`, Gemini TTS, OpenAI TTS, or offline `espeak-ng`.
 
 ---
 
 ## Configuration reference
 
+See [`.env.example`](.env.example) for the complete annotated template.
+
 | Variable | Default | Purpose |
 |---|---|---|
-| `WAHA_URL` | (required) | WAHA base URL |
-| `WAHA_API_KEY` | (required) | WAHA API key |
-| `WAHA_SESSION` | `default` | WAHA session name; must match exactly |
-| `ALLOWED_NUMBERS` | (required) | Numbers allowed to use the bot |
-| `CLAUDE_CODE_OAUTH_TOKEN` | (empty) | Subscription token (recommended) |
-| `ANTHROPIC_API_KEY` | (empty) | Alternative: API key instead of the subscription |
+| `CLAUDE_CODE_OAUTH_TOKEN` | (empty) | Claude subscription token (`claude setup-token`) |
+| `ANTHROPIC_API_KEY` | (empty) | Alternative Anthropic API key |
+| `BRIDGE_ADMIN_TOKEN` | (empty) | Enables `/admin/*` API for Agent Control (required when using the panel) |
+| `OWNER_NAME` | (empty) | Owner display name used in memory prompts, reminders & briefings |
+| `WAHA_URL` | (empty) | WAHA base URL (leave empty to run without WhatsApp) |
+| `WAHA_API_KEY` | (empty) | WAHA API key |
+| `WAHA_SESSION` | `default` | WAHA session name (case-sensitive) |
+| `ALLOWED_NUMBERS` | (empty) | Comma-separated phone numbers allowed on WhatsApp |
+| `TZ` | `America/Sao_Paulo` | Timezone for schedules and prompts |
 | `CLAUDE_PERMISSION_MODE` | `bypassPermissions` | Claude Code permission mode |
-| `CLAUDE_ALLOWED_TOOLS` | `Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,TodoWrite` | Only used when the mode is not `bypassPermissions` |
-| `CLAUDE_MODEL` | account default | Default model |
-| `CLAUDE_EFFORT` | account default | Default effort |
-| `CLAUDE_TIMEOUT_SECONDS` | `1800` | Maximum duration of one task |
-| `TZ` | `America/Sao_Paulo` | Timezone for schedules and the prompt |
-| `AI_MEMORY` | `on` | Set to `off` to stop the bridge from supervising the [ai-memory](https://github.com/akitaonrails/ai-memory) server |
-| `AI_MEMORY_SERVER_URL` | `http://127.0.0.1:49374` | Where the bridge checks `/healthz` before starting `ai-memory serve` |
-| `BRIDGE_ADMIN_TOKEN` | (empty) | Turns on the `/admin` API used by the [Agent Control](https://github.com/cpracideli/agent-control-panel) web panel (web chat, MCP, providers, schedules). Empty = API off |
-
-### Web panel (Agent Control)
-
-With `BRIDGE_ADMIN_TOKEN` set, the bridge serves `/admin/*` on the internal network (Bearer token required). The [agent-control-panel](https://github.com/cpracideli/agent-control-panel) uses it to chat with the agent from the browser (conversations `web:<id>`, streamed live), manage MCP servers (`claude mcp add-json/remove`, `agy mcp`), pick the provider/model/effort per conversation and globally, manage schedules, send WhatsApp messages and read the audit log. Set the same token on the panel.
+| `CLAUDE_ALLOWED_TOOLS` | `Read,Write,Edit,Glob,Grep,WebSearch,WebFetch,TodoWrite` | Allowed tools when mode is not `bypassPermissions` |
+| `CLAUDE_MODEL` / `CLAUDE_EFFORT` | account default | Default model and effort |
+| `CLAUDE_TIMEOUT_SECONDS` | `1800` | Max duration per task |
+| `GROQ_API_KEY` | (empty) | Enables native Whisper voice transcription (STT) |
+| `GEMINI_API_KEY` / `OPENAI_API_KEY` | (empty) | Enables native TTS/STT fallback (`espeak-ng` works offline without keys) |
+| `AGENTMAIL_API_KEY` / `AGENTMAIL_INBOX` | (empty) | Enables sending email drafts via AgentMail API |
+| `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` / `SLACK_BOT_TOKEN` | (empty) | Optional chat channels (can also be configured in the panel) |
+| `AI_MEMORY` / `AI_MEMORY_SERVER_URL` | `on` / `http://127.0.0.1:49374` | Supervises `ai-memory serve` when installed |
+| `WEBHOOK_HMAC_KEY` | (empty) | HMAC verification when `/webhook` is exposed publicly |
+| `VAULT_KEY` | `BRIDGE_ADMIN_TOKEN` | Encryption key for AES-GCM secrets vault |
 
 ---
 
 ## Security model (read this)
 
-- **The bot has full control of its own container.** Claude runs with `bypassPermissions` and passwordless `sudo`, so it can install anything. It cannot reach the host or the Coolify API, but it can read everything inside its container, including its environment variables. Don't give the container secrets you would not give the assistant.
-- **Access control is the number allowlist.** Messages from numbers not in `ALLOWED_NUMBERS`, from groups, channels and statuses are ignored. Whoever controls an allowed number controls the bot.
-- **The webhook is internal.** It is reached over the private `coolify` Docker network. Do not add a public domain to the bridge unless you also set `WEBHOOK_HMAC_KEY` (in the bridge's environment and as the HMAC key in WAHA).
-- **Internal endpoints** (`/send`, `/send-file`, `/schedules`) only accept connections from `127.0.0.1`, so only processes inside the container can use them.
-- **Audit log:** every outgoing message, file sent, and schedule created or deleted is appended to `~/.bridge/audit.log` (JSON lines, in the `claude-home` volume). It records what was sent and to whom, not a full copy of files.
-- **Secrets live only in Coolify**, never in the repository. Rotate any token that was ever pasted in a chat or a log: run `claude setup-token` again, change the WAHA API key, and regenerate Coolify API tokens.
+- **Container scope:** the agent runs with `bypassPermissions` and passwordless `sudo` inside its container so it can install tools and automate tasks. Keep secrets out of the container unless the assistant should use them.
+- **Access control:** WhatsApp access is restricted to `ALLOWED_NUMBERS` (plus optional scoped guests); Telegram/Discord/Slack use their own user/channel allowlists; `/admin/*` requires `BRIDGE_ADMIN_TOKEN`.
+- **Internal endpoints:** `/send`, `/send-file`, `/send-voice`, `/schedules`, `/tickets`, `/pages`, `/prompts`, `/secrets` (local route) accept connections only from `127.0.0.1`.
+- **Audit log:** actions are logged to `~/.bridge/audit.log` inside the `claude-home` volume.
 
 ---
 
 ## Updating
 
-The bridge code lives in this repository. `docker-compose.yml` embeds `bridge/bridge.mjs`, so it must be regenerated after any code change:
+`docker-compose.yml` and `docker-compose.stack.yml` embed `bridge/bridge.mjs`, so regenerate them after any edit to the bridge:
 
 1. Edit `bridge/bridge.mjs`.
-2. Run `node build-compose.mjs` (it also refuses code that contains a `$`, which Docker Compose would try to interpolate).
-3. Run the tests (see below), commit and push.
-4. In Coolify, update the file mount, then redeploy. **Coolify does not rewrite `content:` file mounts on redeploy**: it keeps the copy it stored the first time, so a plain redeploy keeps running the old bridge. Either open the resource → **Persistent Storage** → `/app/bridge.mjs` and paste the new `bridge/bridge.mjs`, or use the API:
+2. Run `node build-compose.mjs` (verifies zero `$` in `bridge/bridge.mjs` and writes both compose files).
+3. Run tests, commit, and push.
+4. In Coolify, update the `/app/bridge.mjs` file storage mount (or patch via Coolify API) before redeploying, because Coolify preserves initial `content:` file mounts across redeploys. Check `GET /health` → `version` afterwards.
 
-   ```bash
-   # find the file storage uuid
-   curl -s -H "Authorization: Bearer TOKEN" https://COOLIFY/api/v1/applications/APP_UUID/storages
-   # replace its content (JSON body: {"uuid": "...", "type": "file", "content": "<bridge.mjs>"})
-   curl -s -X PATCH -H "Authorization: Bearer TOKEN" -H "Content-Type: application/json" \
-     https://COOLIFY/api/v1/applications/APP_UUID/storages --data @storage.json
-   ```
-
-   Then click **Redeploy**. Check `GET /health`: its `version` is a hash of the running `bridge.mjs` and must change after the update.
-
-Data (sessions, chat settings, schedules, installed tools, MCP config) lives in the `claude-home` volume and survives redeploys. Thanks to the consistent container name, the webhook keeps working.
+All state lives in the `claude-home` volume (`/home/node`) and survives redeploys.
 
 ---
 
 ## Backup and migration
 
-Everything the bot remembers is in the volume `<resource-uuid>_claude-home` (mounted at `/home/node`). On the server:
-
 ```bash
 # find the volume
 docker volume ls | grep claude-home
 
-# back it up (stop the bridge first for a fully consistent copy)
+# back it up
 mkdir -p /root/backups
 docker run --rm -v <volume>:/data -v /root/backups:/backup node:22-bookworm-slim \
   tar czf /backup/claude-home.tgz -C /data .
 
-# restore into another volume (with the target bridge stopped)
+# restore into another volume (with target bridge stopped)
 docker run --rm -v <new-volume>:/data -v /root/backups:/backup node:22-bookworm-slim \
   sh -c "cd /data && tar xzf /backup/claude-home.tgz"
 ```
-
-To move to a new Coolify resource: create it (steps 3 to 5), deploy once so the volume exists, stop it, restore the backup into the new volume, start it again, then update the WAHA webhook (step 7).
 
 ---
 
@@ -241,31 +204,23 @@ To move to a new Coolify resource: create it (steps 3 to 5), deploy once so the 
 
 | Symptom | Likely cause and fix |
 |---|---|
-| No reply at all | Check, in order: the bridge is **Running (healthy)**; the WAHA session is `WORKING`; the webhook URL is `http://claude-bridge-claude-zap:3000/webhook` with event `message`; `WAHA_SESSION` matches the session name **exactly**; you are writing **from** a number in `ALLOWED_NUMBERS` **to** the bot's number. |
-| Health check from the `coolify` network says `EAI_AGAIN` | The name does not resolve: redo step 5 (predefined network + consistent name) and redeploy. |
-| Antigravity `/model` shows no models | The menu comes live from `agy models`. Check that `agy` is signed in; the boot log line `agy models raw:` shows what it returned. |
-| ai-memory stopped after a redeploy | Its installer uses a systemd user service, which containers lack. The bridge now starts `ai-memory serve` itself when `~/.local/bin/ai-memory` exists and restarts it if it dies. See `/health` → `aiMemory` and `~/.bridge/ai-memory.log`. |
-| A redeploy did not change the bot's behaviour | Coolify kept the old `/app/bridge.mjs` file mount. Update it as described in [Updating](#updating) and compare the `version` in `/health`. |
-| It broke after a redeploy | Container naming went back to "Generated name". Redo step 5 and keep the webhook URL from step 7. |
-| `/help` works but questions fail | Claude is not authenticated: check `CLAUDE_CODE_OAUTH_TOKEN`, or generate a new one with `claude setup-token`. |
-| Media is not received | Your WAHA edition may not download media (needs WAHA Plus). |
-| Schedules do not fire | Check `TZ`; send `/schedules` to confirm the schedule exists; look for `running schedule` in the logs. |
-| Playwright or Chromium missing | Ask the bot to install it; `sudo` works and browser files persist in `/home/node`. |
-
-The bridge logs (Coolify → resource → **Logs**) show rejected and ignored messages.
+| No reply on WhatsApp | Check bridge **Running (healthy)**, WAHA session `WORKING`, webhook URL + `WAHA_SESSION` exact match, and sender number in `ALLOWED_NUMBERS`. |
+| Panel shows Coolify "opcional · não configurado" | Normal if you didn't set `COOLIFY_URL`/`COOLIFY_TOKEN`/`COOLIFY_APP_UUID`. Set all 3 to manage envs/logs/restart from the panel. |
+| Redeploy did not change bridge behavior | Coolify kept the cached `/app/bridge.mjs` storage mount. Update the storage content and check `/health` → `version`. |
+| Voice TTS error | Set `GEMINI_API_KEY` or `OPENAI_API_KEY`, or ensure `espeak-ng` and `ffmpeg` are installed. |
 
 ---
 
 ## Development and tests
 
-No dependencies: plain Node.js 22.
+Zero npm dependencies for the bridge (plain Node.js 22):
 
 ```bash
-node test/run-test.mjs     # fake WAHA + fake Claude: commands, queue, media, schedules
-node test/cron-test.mjs    # waits for a minute boundary and checks cron matching
-node test/send-test.mjs    # sending to other numbers, /send, files
-node test/bots-test.mjs    # bots (personas), routine webhooks, watch, quiet runs, run history
-node build-compose.mjs     # regenerate docker-compose.yml from bridge/bridge.mjs
+node --check bridge/bridge.mjs
+node build-compose.mjs
+node test/portability-test.mjs
+node test/run-test.mjs
+node test/admin-test.mjs
 ```
 
 ## License

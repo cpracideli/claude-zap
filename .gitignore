@@ -3,5 +3,6 @@ node_modules/
 coolify.env
 *.env
 docker-compose.local.yml
+compose.b64
 test/tmp*/
 test/tmp*

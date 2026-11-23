@@ -65,6 +65,7 @@ const ENV_MODEL = env.CLAUDE_MODEL || '';
 const ENV_EFFORT = env.CLAUDE_EFFORT || '';
 const TIMEOUT_MS = Number(env.CLAUDE_TIMEOUT_SECONDS || 1800) * 1000;
 const TZ = env.TZ || 'America/Sao_Paulo';
+const OWNER_NAME = String(env.OWNER_NAME || '').trim();
 const MAX_CHUNK = 3500;
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 // Short hash of this file: shows in /health and in the startup log, so you can tell which code is really running.
@@ -72,6 +73,21 @@ const VERSION = crypto.createHash('sha256').update(fs.readFileSync(new URL(impor
 
 fs.mkdirSync(INBOX, { recursive: true });
 fs.mkdirSync(DATA_DIR, { recursive: true });
+
+function diskInfo() {
+  try {
+    if (typeof fs.statfsSync !== 'function') return null;
+    const st = fs.statfsSync(DATA_DIR);
+    const total = Number(st.blocks || 0) * Number(st.bsize || 0);
+    const free = Number(st.bavail || 0) * Number(st.bsize || 0);
+    if (!total) return null;
+    return {
+      usedPct: Math.round(((total - free) / total) * 100),
+      freeGb: Number((free / 1073741824).toFixed(1)),
+      totalGb: Number((total / 1073741824).toFixed(1)),
+    };
+  } catch { return null; }
+}
 
 // ---------- SQLite WAL persistence (Node 22 native node:sqlite, zero npm deps) + JSON mirror ----------
 const DB_FILE = path.join(DATA_DIR, 'state.db');
@@ -508,6 +524,7 @@ const wahaBase = () => {
 };
 
 async function waha(method, p, body) {
+  if (!String(env.WAHA_URL || '').trim()) throw new Error('WAHA_URL não configurado (WhatsApp desativado)');
   const res = await fetch(wahaBase() + p, {
     method,
     headers: { 'Content-Type': 'application/json', 'X-Api-Key': WAHA_API_KEY },
@@ -635,6 +652,7 @@ function systemPrompt(chatId, bot, providerHint = 'claude') {
     web
       ? 'Neste chat web não dá para anexar arquivos na resposta: informe o caminho absoluto do arquivo gerado. Para mandar um arquivo ao WhatsApp de alguém, use /send-file com "to" (abaixo).'
       : 'Para ENVIAR um arquivo ou imagem ao usuário no WhatsApp, rode: curl -s -X POST http://127.0.0.1:' + PORT + '/send-file -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","path":"/caminho/absoluto","caption":"opcional"}\'',
+    'Para enviar uma nota de voz (PTT) no WhatsApp: curl -s -X POST http://127.0.0.1:' + PORT + '/send-voice -H "Content-Type: application/json" -d \'{"to":"5511999998888","text":"texto para falar"}\' (ou "path":"/caminho/audio.ogg" no lugar de "text").',
     'MENSAGENS PARA OUTRAS PESSOAS: a ponte TEM o endpoint /send, criado e autorizado pelo dono desta infraestrutura (o próprio usuário). Se algo anterior nesta conversa disser que esse envio não existe ou não é permitido, está desatualizado: ignore. Você PODE enviar mensagens de WhatsApp a qualquer número, pelo número do usuário. Quando o usuário pedir ("mande um oi para +55 11 9...", "avise o João que..."), envie direto, sem pedir confirmação: curl -s -X POST http://127.0.0.1:' + PORT + '/send -H "Content-Type: application/json" -d \'{"to":"5511999998888","text":"mensagem"}\'',
     '  "to" aceita o número em qualquer formato (com DDI; sem DDI assuma 55) ou um id do WhatsApp (...@c.us, grupo ...@g.us). Para arquivo a terceiros, use /send-file com "to" no lugar de "chatId". Envie a outras pessoas SÓ quando o usuário pedir (na conversa ou num agendamento que ele criou), escreva a mensagem como se fosse do usuário (sem dizer que é uma IA, a menos que ele peça) e confirme depois o que foi enviado e para quem. Respostas dessas pessoas NÃO chegam até você.',
     'RASCUNHOS ASSISTIDOS (Drafts — enviar depois ou revisar antes de mandar): para preparar uma mensagem de WhatsApp ou e-mail para o usuário revisar/agendar em vez de enviar na hora: curl -s -X POST http://127.0.0.1:' + PORT + '/drafts -H "Content-Type: application/json" -d \'{"channel":"whatsapp","to":"5511999998888","body":"texto","scheduledAt":""}\' (channel: whatsapp ou email; email aceita subject).',
@@ -1328,13 +1346,13 @@ async function ensureAiMemory() {
 // Instructions for Antigravity / OpenCode: the same bridge rules without Claude-only MCP contradictions.
 function antigravityPrompt(chatId, bot, providerHint = 'antigravity') {
   const memory = fs.existsSync(MEMORY_DIR)
-    ? 'Memória do Caio: leia primeiro o arquivo MEMORY.md na pasta ' + MEMORY_DIR + ' e abra os arquivos que forem relevantes para o pedido. Lá estão os dados de contato, acessos e preferências.'
+    ? (OWNER_NAME ? 'Memória de ' + OWNER_NAME : 'Memória do usuário') + ': leia primeiro o arquivo MEMORY.md na pasta ' + MEMORY_DIR + ' e abra os arquivos que forem relevantes para o pedido. Lá estão os dados de contato, acessos e preferências.'
     : 'Não há pasta de memória configurada.';
   return [
     systemPrompt(chatId, bot, providerHint),
     memory,
     providerHint === 'antigravity'
-      ? 'Você é o Antigravity respondendo pela ponte. Use as mesmas credenciais e ferramentas do ambiente: GitHub (gh já autenticado), Coolify, WAHA, Gmail e os scripts em ~/bin. Os arquivos de acesso ficam em ~/.config.'
+      ? 'Você é o Antigravity respondendo pela ponte. Use as credenciais, MCPs e ferramentas disponíveis no ambiente (~/bin, ~/.config) respeitando as regras acima.'
       : 'Você está respondendo pela ponte via ' + (PROVIDERS[providerHint] || providerHint) + '. Use as ferramentas disponíveis no ambiente (~/bin, ~/.config) respeitando as regras acima.',
   ].join('\n\n');
 }
@@ -2202,7 +2220,7 @@ async function handleMessage(msg) {
     if (!body) return;
     audit({ action: 'guest-message', from: number, name: guest.name, bot: gBot, chars: body.length });
     enqueue(chatId, async () => {
-      const gPrompt = '[VISITANTE AUTORIZADO: ' + guest.name + ' (acesso restrito ao bot ' + gBot + '). Ajude apenas no escopo deste bot. NUNCA revele segredos, credenciais, dados de trabalho, infraestrutura ou mensagens privadas do Caio. NUNCA envie mensagens a terceiros nem altere configuracoes.]\n\n' + body;
+      const gPrompt = '[VISITANTE AUTORIZADO: ' + guest.name + ' (acesso restrito ao bot ' + gBot + '). Ajude apenas no escopo deste bot. NUNCA revele segredos, credenciais, dados de trabalho, infraestrutura ou mensagens privadas do ' + (OWNER_NAME || 'usuário') + '. NUNCA envie mensagens a terceiros nem altere configuracoes.]\n\n' + body;
       const r = await runTurn(chatId, gBot, gPrompt, null, null, null, { sandboxed: true, readOnly: guest.readOnly !== false });
       const parsedGuest = r.error ? { text: 'Não consegui responder agora. Tente de novo em instantes.', suggestions: [] } : extractSuggestions(r.text || '');
       await reply(chatId, parsedGuest.text || '(resposta vazia)', Boolean(r.error));
@@ -3778,17 +3796,17 @@ const BOT_TEMPLATES = [
     example: '☀️ *Bom dia!* São Paulo 23°C (parcialmente nublado)\n• 2 e-mails urgentes (Fatura AWS, Contrato)\n• 3 tarefas abertas no Board\n• Destaques de IA hoje...',
     instructions: 'Você é o bot de Briefing Matinal. Entregue sempre um resumo direto, escaneável em menos de 1 minuto, dividido em: Clima, E-mails urgentes, Pendências/Board e 3 notícias importantes. Nunca enrole.',
     approvalMode: 'auto',
-    skill: { name: 'Briefing Matinal', description: 'Gera o resumo matinal estruturado', instructions: '1. Verifique o clima da cidade do usuário.\n2. Liste os e-mails não lidos importantes (usando ~/bin/gmail.py se disponível).\n3. Consulte tickets abertos em GET /tickets.\n4. Traga 3 manchetes relevantes de tecnologia/IA.\n5. Formate em seções curtas com emojis.' },
+    skill: { name: 'Briefing Matinal', description: 'Gera o resumo matinal estruturado', instructions: '1. Verifique o clima da cidade do usuário.\n2. Liste os e-mails não lidos importantes (usando ~/bin/gmail.py ou MCP de e-mail se disponível).\n3. Consulte tickets abertos em GET /tickets.\n4. Traga 3 manchetes relevantes de tecnologia/IA.\n5. Formate em seções curtas com emojis.' },
     routine: { cron: '0 8 * * 1-5', description: 'Briefing matinal (seg-sex 8h)', prompt: 'Execute o briefing matinal completo com clima, e-mails importantes, tarefas abertas e 3 destaques do dia.', paused: true },
   },
   {
     id: 'triagem-gmail', name: 'Triagem de Gmail', emoji: '📬', color: '#0a84ff',
     description: 'Analisa a caixa de entrada, destaca urgências, detecta assinaturas esquecidas e rascunha respostas.',
-    example: '📬 *Triagem (14 não lidos)*\n🔴 Urgente: Confirmação de voo\n🟡 Responder hoje: Lucas sobre projeto\n🟢 11 newsletters (resumo em 3 linhas)',
-    instructions: 'Você faz triagem de e-mails usando ~/bin/gmail.py. Classifique em Urgente, Responder hoje e Informativos. NUNCA apague e-mails nem envie respostas sem aprovação via cartão (/prompts).',
+    example: '📬 *Triagem (14 não lidos)*\n🔴 Urgente: Confirmação de voo\n🟡 Responder hoje: Equipe sobre projeto\n🟢 11 newsletters (resumo em 3 linhas)',
+    instructions: 'Você faz triagem de e-mails (usando ~/bin/gmail.py ou MCP de e-mail se disponível). Classifique em Urgente, Responder hoje e Informativos. NUNCA apague e-mails nem envie respostas sem aprovação via cartão (/prompts).',
     approvalMode: 'ask',
     blockRules: 'Nunca excluir e-mails de serviços, casa, carro, bens duráveis ou notas fiscais. Nunca enviar e-mail sem aprovação explícita.',
-    skill: { name: 'Triagem Gmail', description: 'Classifica e-mails não lidos por prioridade', instructions: '1. Leia os últimos 20 e-mails não lidos via ~/bin/gmail.py.\n2. Separe em: Urgentes, Ação necessária, Notas/Faturas e Newsletters.\n3. Sugira rascunhos curtos para os que pedem resposta.' },
+    skill: { name: 'Triagem Gmail', description: 'Classifica e-mails não lidos por prioridade', instructions: '1. Leia os últimos 20 e-mails não lidos (usando ~/bin/gmail.py ou MCP de e-mail se disponível).\n2. Separe em: Urgentes, Ação necessária, Notas/Faturas e Newsletters.\n3. Sugira rascunhos curtos para os que pedem resposta.' },
     routine: { cron: '30 8 * * 1-5', description: 'Triagem diária de e-mails', prompt: 'Faça a triagem dos e-mails não lidos das últimas 24h e envie um resumo priorizado.', paused: true },
   },
   {
@@ -5471,11 +5489,30 @@ async function sendDraft(id, via = 'panel') {
       await sendMessage({ to: d.to, text: d.body });
     } else {
       const bin = d.from === 'gmail' ? path.join(env.HOME || '/tmp', 'bin', 'gmail.py') : path.join(env.HOME || '/tmp', 'bin', 'agentmail');
-      const args = d.from === 'gmail'
-        ? ['send', '--to', d.to, '--subject', d.subject || '(sem assunto)', '--body', d.body]
-        : ['send', '--to', d.to, '--subject', d.subject || '(sem assunto)', '--text', d.body];
-      const r = await execCmd(bin, args, 30000);
-      if (r.code !== 0) throw new Error((r.err || r.out || 'falha ao enviar e-mail').slice(0, 300));
+      if (fs.existsSync(bin)) {
+        const args = d.from === 'gmail'
+          ? ['send', '--to', d.to, '--subject', d.subject || '(sem assunto)', '--body', d.body]
+          : ['send', '--to', d.to, '--subject', d.subject || '(sem assunto)', '--text', d.body];
+        const r = await execCmd(bin, args, 30000);
+        if (r.code !== 0) throw new Error((r.err || r.out || 'falha ao enviar e-mail').slice(0, 300));
+      } else {
+        const amKey = env.AGENTMAIL_API_KEY || (secrets.agentmail_api_key && secrets.agentmail_api_key.value) || '';
+        const amInbox = env.AGENTMAIL_INBOX || (secrets.agentmail_inbox && secrets.agentmail_inbox.value) || '';
+        if (d.from !== 'gmail' && amKey && amInbox) {
+          const r = await fetch('https://api.agentmail.to/v0/inboxes/' + encodeURIComponent(amInbox) + '/messages/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + amKey },
+            body: JSON.stringify({ to: [d.to], subject: d.subject || '(sem assunto)', text: d.body }),
+            signal: AbortSignal.timeout(30000),
+          });
+          if (!r.ok) {
+            const errTxt = await r.text().catch(() => '');
+            throw new Error('AgentMail HTTP ' + r.status + (errTxt ? ': ' + errTxt.slice(0, 200) : ''));
+          }
+        } else {
+          throw new Error('Envio de e-mail não configurado (configure AGENTMAIL_API_KEY + AGENTMAIL_INBOX ou instale ~/bin/gmail.py)');
+        }
+      }
     }
     d.status = 'sent';
     d.sentAt = new Date().toISOString();
@@ -5713,7 +5750,7 @@ async function handleShortcutIngest(b) {
     const atIso = b.at ? new Date(b.at).toISOString() : new Date(Date.now() + mins * 60000).toISOString();
     const targetChat = b.chatId || (ALLOWED[0] ? ALLOWED[0] + '@c.us' : Object.keys(chats).find((id) => !isWeb(id) && !isDeleg(id)) || '');
     if (!targetChat) throw new Error('nenhum chat de destino disponível para lembrete');
-    const sc = addSchedule({ chatId: targetChat, at: atIso, description: (title || text).slice(0, 80), prompt: 'Lembre o Caio de forma curta e direta: ' + combined });
+    const sc = addSchedule({ chatId: targetChat, at: atIso, description: (title || text).slice(0, 80), prompt: 'Lembre ' + (OWNER_NAME || 'o usuário') + ' de forma curta e direta: ' + combined });
     return { ok: true, action, id: sc.id, at: atIso, spoken: 'Lembrete agendado: ' + sc.description };
   }
 
@@ -6138,12 +6175,12 @@ function createMorningBriefingPreset(b = {}) {
     html: pageHtml, bot: DEFAULT_BOT, chatId, public: false,
   }, 'preset');
   const existing = schedules.find((s) => s.description && s.description.includes('Briefing Diário'));
-  const prompt = 'Monte o Briefing Diário do Caio (curto, direto e útil):\n' +
+  const prompt = 'Monte o Briefing Diário' + (OWNER_NAME ? ' de ' + OWNER_NAME : '') + ' (curto, direto e útil):\n' +
     '1. Liste tickets abertos/em review em http://127.0.0.1:' + PORT + '/tickets e rascunhos/pendências em http://127.0.0.1:' + PORT + '/drafts.\n' +
-    '2. Verifique saúde rápida do servidor (~/bin/health-watchdog --verbose) e e-mails recentes importantes.\n' +
+    '2. Verifique saúde rápida do servidor (GET http://127.0.0.1:' + PORT + '/health ou ~/bin/health-watchdog --verbose se existir) e e-mails recentes importantes.\n' +
     '3. Se relevante, inclua 2-3 destaques rápidos de IA/tech.\n' +
     '4. Atualize a Página Viva do briefing via PUT http://127.0.0.1:' + PORT + '/pages/briefing-diario/data com JSON {"date":"<hoje>","summary":"...","cards":[{"title":"Tarefas","body":"..."},{"title":"Infra & E-mails","body":"..."},{"title":"Radar","body":"..."}]}.\n' +
-    (withAudio ? '5. Gere um resumo falado de ~1 minuto com ~/bin/falar e envie via ~/bin/enviar-voz ao Caio no WhatsApp.\n' : '') +
+    (withAudio ? '5. Gere um resumo falado de ~1 minuto e envie como nota de voz no WhatsApp (via POST http://127.0.0.1:' + PORT + '/send-voice ou ~/bin/falar + ~/bin/enviar-voz se configurados).\n' : '') +
     '6. Responda com um resumo enxuto (sem tabelas se for WhatsApp).';
   const sched = existing || addSchedule({ chatId: chatId || 'web:briefing', cron, bot: DEFAULT_BOT, description: '☀️ Briefing Diário (Página Viva' + (withAudio ? ' + Áudio' : '') + ')', prompt });
   return { page, schedule: sched };
@@ -6337,6 +6374,47 @@ async function sendFile(reqBody) {
   return result;
 }
 
+async function sendVoice(reqBody) {
+  const { to, path: p, text } = reqBody || {};
+  if (reqBody && reqBody.chatId && readOnlyRuns.has(String(reqBody.chatId))) throw new Error('bloqueado pelo modo proativo somente leitura (read-only)');
+  let chatId = reqBody && reqBody.chatId;
+  if (to) chatId = await resolveTo(to);
+  else if (!chatId || !chats[chatId]) throw new Error('chatId ou to obrigatório');
+  let oggPath = '';
+  let cleanup = false;
+  let engine = '';
+  try {
+    if (p) {
+      const abs = path.resolve(WORKDIR, p);
+      if (!fs.existsSync(abs)) throw new Error('arquivo não encontrado: ' + abs);
+      if (path.extname(abs).toLowerCase() === '.ogg') {
+        oggPath = abs;
+        engine = 'arquivo';
+      } else {
+        if (!binExists('ffmpeg')) throw new Error('ffmpeg não encontrado para converter áudio em .ogg');
+        oggPath = path.join(INBOX, 'voice-tmp-' + crypto.randomBytes(4).toString('hex') + '.ogg');
+        cleanup = true;
+        const conv = await execCmd('ffmpeg', ['-y', '-loglevel', 'error', '-i', abs, '-ac', '1', '-ar', '24000', '-c:a', 'libopus', '-b:a', '40k', oggPath], 120000);
+        if (conv.code !== 0 || !fs.existsSync(oggPath)) throw new Error('conversão para opus falhou: ' + (conv.err || '').slice(0, 200));
+        engine = 'ffmpeg';
+      }
+    } else if (text && String(text).trim()) {
+      oggPath = path.join(INBOX, 'voice-tmp-' + crypto.randomBytes(4).toString('hex') + '.ogg');
+      cleanup = true;
+      const tts = await synthesizeSpeech(String(text).trim(), oggPath);
+      engine = tts.engine;
+    } else {
+      throw new Error('informe "text" ou "path"');
+    }
+    const data = fs.readFileSync(oggPath).toString('base64');
+    await waha('POST', '/api/sendVoice', { session: WAHA_SESSION, chatId, file: { mimetype: 'audio/ogg; codecs=opus', filename: 'voz.ogg', data }, convert: false });
+    audit({ action: 'send-voice', to: chatId, engine });
+    return { sent: true, chatId, engine };
+  } finally {
+    if (cleanup && oggPath) { try { fs.unlinkSync(oggPath); } catch {} }
+  }
+}
+
 // ---------- web chat (conversations started from the Agent Control panel) ----------
 const WEB_DIR = path.join(DATA_DIR, 'web');
 fs.mkdirSync(WEB_DIR, { recursive: true });
@@ -6427,12 +6505,114 @@ const HOME_BIN = (n) => path.join(env.HOME || '/tmp', 'bin', n);
 // Voice notes from the panel are transcribed by the bridge (~/bin/transcrever: Groq, local Whisper as fallback),
 // shown under the voice note and handed to the agent, so it doesn't transcribe again.
 async function transcribeFile(file) {
-  if (!fs.existsSync(HOME_BIN('transcrever'))) return null;
-  const r = await execCmd(HOME_BIN('transcrever'), [file], 180000);
-  const mt = /^\[([^\]]+)\]\s*([\s\S]*)(?![\s\S])/.exec((r.out || '').trim());
-  return r.code === 0 && mt && mt[2].trim() ? { engine: mt[1].trim(), text: mt[2].trim() } : null;
+  if (fs.existsSync(HOME_BIN('transcrever'))) {
+    const r = await execCmd(HOME_BIN('transcrever'), [file], 180000);
+    const mt = /^\[([^\]]+)\]\s*([\s\S]*)(?![\s\S])/.exec((r.out || '').trim());
+    return r.code === 0 && mt && mt[2].trim() ? { engine: mt[1].trim(), text: mt[2].trim() } : null;
+  }
+  const groqKey = env.GROQ_API_KEY || (secrets.groq_api_key && secrets.groq_api_key.value) || '';
+  if (groqKey) {
+    try {
+      const fd = new FormData();
+      fd.append('file', new Blob([fs.readFileSync(file)]), path.basename(file));
+      fd.append('model', env.STT_MODEL || 'whisper-large-v3-turbo');
+      fd.append('language', env.STT_LANGUAGE || 'pt');
+      fd.append('response_format', 'text');
+      const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + groqKey }, body: fd, signal: AbortSignal.timeout(45000),
+      });
+      const txt = (await r.text()).trim();
+      if (r.ok && txt) return { engine: 'Groq Whisper', text: txt };
+    } catch {}
+  }
+  const openaiKey = env.OPENAI_API_KEY || (secrets.openai_api_key && secrets.openai_api_key.value) || '';
+  if (openaiKey) {
+    try {
+      const fd = new FormData();
+      fd.append('file', new Blob([fs.readFileSync(file)]), path.basename(file));
+      fd.append('model', 'whisper-1');
+      fd.append('language', env.STT_LANGUAGE || 'pt');
+      fd.append('response_format', 'text');
+      const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + openaiKey }, body: fd, signal: AbortSignal.timeout(45000),
+      });
+      const txt = (await r.text()).trim();
+      if (r.ok && txt) return { engine: 'OpenAI Whisper', text: txt };
+    } catch {}
+  }
+  return null;
 }
-// Spoken replies for the panel: ~/bin/falar (Gemini TTS, Piper fallback) to Opus, then AAC/M4A so Safari plays it.
+// Spoken replies for the panel: ~/bin/falar (Gemini TTS, Piper fallback) or native Gemini/OpenAI/espeak-ng -> Opus, then AAC/M4A so Safari plays it.
+async function synthesizeSpeech(text, outOgg) {
+  if (fs.existsSync(HOME_BIN('falar'))) {
+    const r = await execCmd(HOME_BIN('falar'), [text, outOgg], 240000);
+    if (!fs.existsSync(outOgg)) throw new Error('falar falhou: ' + (r.err || r.out).slice(-300));
+    const engine = (/^\[([^\]]+)\]/m.exec(r.out || '') || [])[1] || 'falar';
+    return { file: outOgg, engine };
+  }
+  const geminiKey = env.GEMINI_API_KEY || (secrets.gemini_api_key && secrets.gemini_api_key.value) || '';
+  if (geminiKey && binExists('ffmpeg')) {
+    try {
+      const model = String(env.TTS_MODEL || 'gemini-2.5-flash-preview-tts').trim();
+      const voiceName = String(env.TTS_VOICE || 'Kore').trim();
+      const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text }] }],
+          generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } } },
+        }),
+        signal: AbortSignal.timeout(120000),
+      });
+      if (r.ok) {
+        const j = await r.json();
+        const parts = (j && j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
+        const inline = parts.find((p) => p && p.inlineData && p.inlineData.data);
+        if (inline) {
+          const pcm = outOgg + '.pcm';
+          try {
+            fs.writeFileSync(pcm, Buffer.from(inline.inlineData.data, 'base64'));
+            const c = await execCmd('ffmpeg', ['-y', '-loglevel', 'error', '-f', 's16le', '-ar', '24000', '-ac', '1', '-i', pcm, '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11', '-c:a', 'libopus', '-b:a', '40k', outOgg], 120000);
+            if (c.code === 0 && fs.existsSync(outOgg)) return { file: outOgg, engine: 'Gemini TTS' };
+          } finally {
+            try { fs.unlinkSync(pcm); } catch {}
+          }
+        }
+      }
+    } catch {}
+  }
+  const openaiKey = env.OPENAI_API_KEY || (secrets.openai_api_key && secrets.openai_api_key.value) || '';
+  if (openaiKey) {
+    try {
+      const r = await fetch('https://api.openai.com/v1/audio/speech', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + openaiKey },
+        body: JSON.stringify({ model: env.OPENAI_TTS_MODEL || 'tts-1', voice: env.OPENAI_TTS_VOICE || 'nova', input: text, response_format: 'opus' }),
+        signal: AbortSignal.timeout(120000),
+      });
+      if (r.ok) {
+        const buf = Buffer.from(await r.arrayBuffer());
+        if (buf.length) {
+          fs.writeFileSync(outOgg, buf);
+          return { file: outOgg, engine: 'OpenAI TTS' };
+        }
+      }
+    } catch {}
+  }
+  if (binExists('espeak-ng') && binExists('ffmpeg')) {
+    const wav = outOgg + '.wav';
+    try {
+      const sp = await execCmd('espeak-ng', ['-v', env.ESPEAK_VOICE || 'pt-br', '-w', wav, text], 60000);
+      if (sp.code === 0 && fs.existsSync(wav)) {
+        const c = await execCmd('ffmpeg', ['-y', '-loglevel', 'error', '-i', wav, '-af', 'highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=11', '-ac', '1', '-ar', '24000', '-c:a', 'libopus', '-b:a', '40k', outOgg], 120000);
+        if (c.code === 0 && fs.existsSync(outOgg)) return { file: outOgg, engine: 'Local espeak-ng' };
+      }
+    } finally {
+      try { fs.unlinkSync(wav); } catch {}
+    }
+  }
+  throw new Error('TTS não configurado: defina GEMINI_API_KEY ou OPENAI_API_KEY, ou instale espeak-ng + ffmpeg');
+}
 function speakableText(md) {
   return String(md || '').replace(/```[\s\S]*?```/g, ' ').replace(/`([^`]+)`/g, (_, a) => a).replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
     .replace(/\[([^\]]+)\]\([^)]*\)/g, (_, a) => a).replace(/https?:\/\/\S+/g, ' ').replace(/^\s*[-*+]\s+/gm, '').replace(/^\s*#+\s*/gm, '')
@@ -6452,9 +6632,8 @@ function webTts(chatId, msgId) {
     if (text.length > 3000) text = text.slice(0, 3000).replace(/[^.!?]*(?![\s\S])/, '') || text.slice(0, 3000);
     const name = 'web-tts-' + String(chatId).slice(4).replace(/[^a-f0-9]/g, '') + '-' + msgId.replace(/[^a-f0-9]/g, '');
     const ogg = path.join(INBOX, name + '.ogg'), m4a = path.join(INBOX, name + '.m4a');
-    const r = await execCmd(HOME_BIN('falar'), [text, ogg], 240000);
-    if (!fs.existsSync(ogg)) throw new Error('falar falhou: ' + (r.err || r.out).slice(-300));
-    const engine = (/^\[([^\]]+)\]/m.exec(r.out || '') || [])[1] || '';
+    const tts = await synthesizeSpeech(text, ogg);
+    const engine = tts.engine || '';
     const c = await execCmd('ffmpeg', ['-y', '-loglevel', 'error', '-i', ogg, '-c:a', 'aac', '-b:a', '64k', '-movflags', '+faststart', m4a], 120000);
     try { fs.unlinkSync(ogg); } catch {}
     if (c.code !== 0 || !fs.existsSync(m4a)) throw new Error('conversão falhou: ' + c.err.slice(-300));
@@ -6519,7 +6698,7 @@ function promptWithFiles(text, files, transcript, engine) {
     return '[O usuário enviou ' + kind + ' (' + f.type + ', ' + f.name + ') salvo em ' + path.join(INBOX, f.file) + ']';
   });
   if (transcript) notes.push(engine
-    ? '[Transcrição automática da mensagem de voz, já feita pela ponte com ~/bin/transcrever (motor: ' + engine + '). Não transcreva de novo; ao citar o motor, use este: ' + transcript + ']'
+    ? '[Transcrição automática da mensagem de voz, já feita pela ponte (motor: ' + engine + '). Não transcreva de novo; ao citar o motor, use este: ' + transcript + ']'
     : '[Transcrição automática da mensagem de voz, feita no navegador: ' + transcript + ']');
   return notes.join('\n') + '\n\n' + (text || (transcript ? 'Responda à mensagem de voz.' : 'Analise o conteúdo e responda.'));
 }
@@ -8241,6 +8420,7 @@ async function handleAdmin(req, res, u, raw) {
       const sl = slConfig();
       return send(200, { version: VERSION, tz: TZ, permissionMode: PERMISSION_MODE, workdir: WORKDIR, uptime: Math.round(process.uptime()),
         storage: { engine: storageEngine, pendingJobs: listPendingJobs().length },
+        disk: diskInfo(),
         aiMemory: { status: aiMemory.status, restarts: aiMemory.restarts }, allowed: ALLOWED.length,
         settings: safeSettingsView(),
         running: [...running.entries()].map(([id, r]) => ({ chatId: id, started: r.started, prompt: r.prompt, bot: r.bot || (chats[id] && chats[id].bot) || DEFAULT_BOT })),
@@ -8932,6 +9112,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, version: VERSION, allowed: ALLOWED.length, running: running.size,
+      disk: diskInfo(),
       aiMemory: { status: aiMemory.status, restarts: aiMemory.restarts, supervised: Boolean(aiMemory.child) } }));
   }
   const bufs = [];
@@ -9218,6 +9399,15 @@ const server = http.createServer((req, res) => {
         res.writeHead(500); return res.end('erro: ' + e.message);
       }
     }
+    if (req.method === 'POST' && req.url === '/send-voice') {
+      if (!isLocal(req)) { res.writeHead(403); return res.end(); }
+      try {
+        const out = await sendVoice(JSON.parse(raw.toString('utf8') || '{}'));
+        res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(out));
+      } catch (e) {
+        res.writeHead(400); return res.end('erro: ' + e.message);
+      }
+    }
     if (req.method !== 'POST' || !req.url.startsWith('/webhook')) { res.writeHead(404); return res.end(); }
     if (WEBHOOK_HMAC_KEY) {
       const got = String(req.headers['x-webhook-hmac'] || '');
@@ -9239,6 +9429,7 @@ const server = http.createServer((req, res) => {
 
 // Tell each allowed number that the service is up. Retries, because WAHA may not be ready right after boot.
 async function notifyStartup() {
+  if (!String(env.WAHA_URL || '').trim() || !ALLOWED.length) { log('startup notice skipped (WAHA_URL/ALLOWED_NUMBERS unset)'); return; }
   if (settings.startupNotify === false) { log('startup notice skipped (startupNotify=false)'); return; }
   if (inQuietHours()) { log('startup notice suppressed (quiet hours active)'); return; }
   // Natural, varied wording. Only sent to ALLOWED_NUMBERS, never to anyone else.

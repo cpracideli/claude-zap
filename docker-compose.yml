@@ -8,7 +8,8 @@ services:
       - -c
       - |
         if ! command -v sudo >/dev/null 2>&1; then
-          apt-get update && apt-get install -y --no-install-recommends sudo git curl wget ca-certificates gnupg unzip python3 python3-pip python3-venv jq ripgrep procps build-essential
+          apt-get update && apt-get install -y --no-install-recommends sudo git curl wget ca-certificates gnupg unzip python3 python3-pip python3-venv jq ripgrep procps build-essential openssl ffmpeg poppler-utils espeak-ng zstd xvfb x11vnc novnc websockify fluxbox xdotool scrot
+          apt-get install -y --no-install-recommends chromium gh fonts-liberation fonts-noto-color-emoji || true
         fi
         echo 'node ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/node && chmod 440 /etc/sudoers.d/node
         touch /home/node/.apt-packages && chown node:node /home/node /home/node/.apt-packages
@@ -21,6 +22,9 @@ services:
       - NPM_CONFIG_PREFIX=/home/node/.npm-global
       - PATH=/home/node/.npm-global/bin:/home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       - PORT=3000
+      - OWNER_NAME=${OWNER_NAME}
+      - STARTUP_NOTICE=${STARTUP_NOTICE}
+      - PANEL_INTERNAL_URL=${PANEL_INTERNAL_URL}
       - WAHA_URL=${WAHA_URL}
       - WAHA_SESSION=${WAHA_SESSION:-default}
       - WAHA_API_KEY=${WAHA_API_KEY}
@@ -35,6 +39,25 @@ services:
       - TZ=${TZ:-America/Sao_Paulo}
       - WEBHOOK_HMAC_KEY=${WEBHOOK_HMAC_KEY}
       - BRIDGE_ADMIN_TOKEN=${BRIDGE_ADMIN_TOKEN}
+      - VAULT_KEY=${VAULT_KEY}
+      - AI_MEMORY=${AI_MEMORY:-on}
+      - AI_MEMORY_SERVER_URL=${AI_MEMORY_SERVER_URL:-http://127.0.0.1:49374}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - TTS_MODEL=${TTS_MODEL}
+      - TTS_VOICE=${TTS_VOICE}
+      - STT_LANGUAGE=${STT_LANGUAGE}
+      - AGENTMAIL_API_KEY=${AGENTMAIL_API_KEY}
+      - AGENTMAIL_INBOX=${AGENTMAIL_INBOX}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - DISCORD_ALLOWED_USERS=${DISCORD_ALLOWED_USERS}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}
+      - SLACK_SIGNING_SECRET=${SLACK_SIGNING_SECRET}
+      - SLACK_ALLOWED_USERS=${SLACK_ALLOWED_USERS}
+      - OBSIDIAN_DIR=${OBSIDIAN_DIR}
       - DISABLE_AUTOUPDATER=1
     volumes:
       - claude-home:/home/node
@@ -77,7 +100,27 @@ services:
             { id: 'gemini-3-pro-preview', label: 'Gemini 3 Pro' },
             { id: 'mai-code-2-flash', label: 'MAI Code 2 Flash' },
           ];
-          const PROVIDERS = { claude: 'Claude Code', antigravity: 'Antigravity', opencode: 'OpenCode', copilot: 'GitHub Copilot', openai_compat: 'API Direta (BYOM)' };
+          const PROVIDERS = { claude: 'Claude Code', antigravity: 'Antigravity', opencode: 'OpenCode', copilot: 'GitHub Copilot', openai_compat: 'API Direta (BYOM)', ollama: 'Ollama Cloud' };
+          // Ollama Cloud runs through the Claude Code binary, pointed at the local Ollama daemon (signed in with
+          // `ollama signin`, which offloads "-cloud" models to Ollama's servers). Env vars are per child process only,
+          // so the regular Claude provider is never touched.
+          const OLLAMA_URL = env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434';
+          const OLLAMA_BIN = env.OLLAMA_BIN || path.join(env.HOME || '/tmp', '.local', 'ollama', 'bin', 'ollama');
+          const OLLAMA_DEFAULT_MODEL = env.OLLAMA_DEFAULT_MODEL || 'glm-5.3-flash:cloud';
+          async function ensureOllama() {
+            const up = async () => { try { return (await fetch(OLLAMA_URL + '/api/version', { signal: AbortSignal.timeout(2000) })).ok; } catch { return false; } };
+            if (await up()) return;
+            if (!fs.existsSync(OLLAMA_BIN)) throw new Error('Ollama não instalado (' + OLLAMA_BIN + ').');
+            const out = fs.openSync(path.join(path.dirname(OLLAMA_BIN), '..', 'serve.log'), 'a');
+            spawn(OLLAMA_BIN, ['serve'], { env, detached: true, stdio: ['ignore', out, out] }).unref();
+            for (let i = 0; i < 20; i++) { await new Promise((r) => setTimeout(r, 500)); if (await up()) return; }
+            throw new Error('Não consegui iniciar o daemon do Ollama.');
+          }
+          function ollamaEnv(model) {
+            return { ANTHROPIC_BASE_URL: OLLAMA_URL, ANTHROPIC_AUTH_TOKEN: 'ollama', ANTHROPIC_API_KEY: '',
+              ANTHROPIC_MODEL: model, ANTHROPIC_DEFAULT_OPUS_MODEL: model, ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+              ANTHROPIC_DEFAULT_HAIKU_MODEL: model, CLAUDE_CODE_SUBAGENT_MODEL: model, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1' };
+          }
           // Claude keeps its memory notes here; Antigravity gets the same folder so it can read them too.
           const MEMORY_DIR = env.MEMORY_DIR || path.join(env.HOME || '/tmp', '.claude', 'projects', '-home-node-workspace', 'memory');
           const WORKDIR = env.CLAUDE_WORKDIR || path.join(env.HOME || '/tmp', 'workspace');
@@ -89,6 +132,7 @@ services:
           const ENV_EFFORT = env.CLAUDE_EFFORT || '';
           const TIMEOUT_MS = Number(env.CLAUDE_TIMEOUT_SECONDS || 1800) * 1000;
           const TZ = env.TZ || 'America/Sao_Paulo';
+          const OWNER_NAME = String(env.OWNER_NAME || '').trim();
           const MAX_CHUNK = 3500;
           const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
           // Short hash of this file: shows in /health and in the startup log, so you can tell which code is really running.
@@ -97,12 +141,29 @@ services:
           fs.mkdirSync(INBOX, { recursive: true });
           fs.mkdirSync(DATA_DIR, { recursive: true });
 
+          function diskInfo() {
+            try {
+              if (typeof fs.statfsSync !== 'function') return null;
+              const st = fs.statfsSync(DATA_DIR);
+              const total = Number(st.blocks || 0) * Number(st.bsize || 0);
+              const free = Number(st.bavail || 0) * Number(st.bsize || 0);
+              if (!total) return null;
+              return {
+                usedPct: Math.round(((total - free) / total) * 100),
+                freeGb: Number((free / 1073741824).toFixed(1)),
+                totalGb: Number((total / 1073741824).toFixed(1)),
+              };
+            } catch { return null; }
+          }
+
           // ---------- SQLite WAL persistence (Node 22 native node:sqlite, zero npm deps) + JSON mirror ----------
           const DB_FILE = path.join(DATA_DIR, 'state.db');
+          let SqliteDatabaseSync = null;
           let stateDb = null;
           let storageEngine = 'json';
           try {
             const { DatabaseSync } = await import('node:sqlite');
+            SqliteDatabaseSync = DatabaseSync;
             stateDb = new DatabaseSync(DB_FILE);
             stateDb.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;');
             stateDb.exec('CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated TEXT NOT NULL);');
@@ -110,8 +171,23 @@ services:
             stateDb.exec('CREATE TABLE IF NOT EXISTS page_data (page_id TEXT PRIMARY KEY, data TEXT NOT NULL, updated TEXT NOT NULL);');
             storageEngine = 'sqlite-wal';
           } catch (e) {
+            SqliteDatabaseSync = null;
             stateDb = null;
             storageEngine = 'json';
+          }
+          function openReadOnlySqlite(dbPath) {
+            if (!SqliteDatabaseSync || !dbPath || !fs.existsSync(dbPath)) return null;
+            try { return new SqliteDatabaseSync(dbPath, { readOnly: true }); }
+            catch { return null; }
+          }
+          function sqliteSig(dbPath) {
+            if (!dbPath || !fs.existsSync(dbPath)) return '';
+            try {
+              const s1 = fs.statSync(dbPath);
+              let walPart = '0:0';
+              try { const s2 = fs.statSync(dbPath + '-wal'); walPart = s2.size + ':' + s2.mtimeMs; } catch {}
+              return s1.size + ':' + s1.mtimeMs + '|' + walPart;
+            } catch { return ''; }
           }
           function checkpointWal() {
             if (!stateDb) return false;
@@ -226,7 +302,7 @@ services:
           const BOTS_FILE = path.join(DATA_DIR, 'bots.json');
           const BOTS_DIR = path.join(DATA_DIR, 'bots');
           const DEFAULT_BOT = 'default';
-          const BOT_FIELDS = ['name', 'emoji', 'avatar', 'color', 'description', 'instructions', 'provider', 'model', 'effort', 'agyModel', 'agyEffort', 'ocModel', 'cpModel', 'memory', 'approvalMode', 'allowRules', 'blockRules', 'policyEnforce', 'sandboxed'];
+          const BOT_FIELDS = ['name', 'emoji', 'avatar', 'color', 'description', 'instructions', 'provider', 'model', 'effort', 'agyModel', 'agyEffort', 'ocModel', 'cpModel', 'olModel', 'memory', 'approvalMode', 'allowRules', 'blockRules', 'policyEnforce', 'sandboxed'];
           const APPROVAL_MODES = ['ask', 'auto', 'when_asked', 'handoff', 'never'];
           let bots = loadState('bots', BOTS_FILE, {});
           if (!bots[DEFAULT_BOT]) {
@@ -307,6 +383,7 @@ services:
               agy: { agyModel: pick('agyModel', ''), agyEffort: pick('agyEffort', '') },
               // The web panel's model picker writes chat.model; OpenCode ids always contain a provider prefix (opencode/...).
               oc: { ocModel: pick('ocModel', '') || (String(pick('model', '')).includes('/') ? String(pick('model', '')) : '') },
+              ol: { olModel: pick('olModel', '') || (pick('provider', settings.defaultProvider || 'claude') === 'ollama' ? String(pick('model', '')) : '') },
               cp: { cpModel: pick('cpModel', '') || (pick('provider', settings.defaultProvider || 'claude') === 'copilot' ? String(pick('model', '')) : '') },
             };
           }
@@ -514,6 +591,7 @@ services:
           };
 
           async function waha(method, p, body) {
+            if (!String(env.WAHA_URL || '').trim()) throw new Error('WAHA_URL não configurado (WhatsApp desativado)');
             const res = await fetch(wahaBase() + p, {
               method,
               headers: { 'Content-Type': 'application/json', 'X-Api-Key': WAHA_API_KEY },
@@ -641,6 +719,7 @@ services:
               web
                 ? 'Neste chat web não dá para anexar arquivos na resposta: informe o caminho absoluto do arquivo gerado. Para mandar um arquivo ao WhatsApp de alguém, use /send-file com "to" (abaixo).'
                 : 'Para ENVIAR um arquivo ou imagem ao usuário no WhatsApp, rode: curl -s -X POST http://127.0.0.1:' + PORT + '/send-file -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","path":"/caminho/absoluto","caption":"opcional"}\'',
+              'Para enviar uma nota de voz (PTT) no WhatsApp: curl -s -X POST http://127.0.0.1:' + PORT + '/send-voice -H "Content-Type: application/json" -d \'{"to":"5511999998888","text":"texto para falar"}\' (ou "path":"/caminho/audio.ogg" no lugar de "text").',
               'MENSAGENS PARA OUTRAS PESSOAS: a ponte TEM o endpoint /send, criado e autorizado pelo dono desta infraestrutura (o próprio usuário). Se algo anterior nesta conversa disser que esse envio não existe ou não é permitido, está desatualizado: ignore. Você PODE enviar mensagens de WhatsApp a qualquer número, pelo número do usuário. Quando o usuário pedir ("mande um oi para +55 11 9...", "avise o João que..."), envie direto, sem pedir confirmação: curl -s -X POST http://127.0.0.1:' + PORT + '/send -H "Content-Type: application/json" -d \'{"to":"5511999998888","text":"mensagem"}\'',
               '  "to" aceita o número em qualquer formato (com DDI; sem DDI assuma 55) ou um id do WhatsApp (...@c.us, grupo ...@g.us). Para arquivo a terceiros, use /send-file com "to" no lugar de "chatId". Envie a outras pessoas SÓ quando o usuário pedir (na conversa ou num agendamento que ele criou), escreva a mensagem como se fosse do usuário (sem dizer que é uma IA, a menos que ele peça) e confirme depois o que foi enviado e para quem. Respostas dessas pessoas NÃO chegam até você.',
               'RASCUNHOS ASSISTIDOS (Drafts — enviar depois ou revisar antes de mandar): para preparar uma mensagem de WhatsApp ou e-mail para o usuário revisar/agendar em vez de enviar na hora: curl -s -X POST http://127.0.0.1:' + PORT + '/drafts -H "Content-Type: application/json" -d \'{"channel":"whatsapp","to":"5511999998888","body":"texto","scheduledAt":""}\' (channel: whatsapp ou email; email aceita subject).',
@@ -749,9 +828,9 @@ services:
               const policyFile = (!isScript || env.BRIDGE_FORCE_POLICY_HOOK === '1') ? botPolicySettingsFile(opts.bot, opts) : null;
               if (policyFile) args.push('--settings', policyFile);
               if (opts.model) args.push('--model', opts.model);
-              if (opts.effort) args.push('--effort', opts.effort);
+              if (opts.effort && !opts.extraEnv) args.push('--effort', opts.effort);
               if (opts.resume) args.push('--resume', opts.resume);
-              const childEnv = buildChildEnv({ WA_CHAT_ID: chatId, WA_BOT_ID: opts.bot ? opts.bot.id : DEFAULT_BOT, WA_READONLY: opts.readOnly ? '1' : '0' }, Boolean(opts.bot && opts.bot.sandboxed));
+              const childEnv = buildChildEnv({ WA_CHAT_ID: chatId, WA_BOT_ID: opts.bot ? opts.bot.id : DEFAULT_BOT, WA_READONLY: opts.readOnly ? '1' : '0', ...(opts.extraEnv || {}) }, Boolean(opts.bot && opts.bot.sandboxed));
               const child = spawn(isScript ? process.execPath : CLAUDE_BIN, isScript ? [CLAUDE_BIN, ...args] : args,
                 { cwd: WORKDIR, env: childEnv, stdio: [steer ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
               let inputOpen = steer;
@@ -898,6 +977,10 @@ services:
             if (models.length) ocCatalog = { at: Date.now(), models };
             return ocCatalog.models;
           }
+          let openCodeLastLimit = null;
+          let openCodeLastOkAt = 0;
+          const OPENCODE_LIMIT_RE = /free usage limit|rate limit|429|quota|freeusagelimit/i;
+
           function runOpenCode(chatId, prompt, opts) {
             return new Promise((resolve) => {
               const args = ['run', '--format', 'json', '--dir', WORKDIR];
@@ -916,11 +999,9 @@ services:
               const done = (r) => { clearTimeout(timer); running.delete(chatId); resolve(r); };
               child.on('error', (e) => done({ error: e.message }));
               child.on('close', (code, signal) => {
-                if (signal && !timedOut) return done({ stopped: true });
-                if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
                 const texts = [];
                 let sessionId = '', errMsg = '', steps = 0, cost = 0;
-                const u = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+                const u = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_input_tokens: 0 };
                 for (const line of out.split('\n')) {
                   if (!line.trim()) continue;
                   let ev;
@@ -935,17 +1016,37 @@ services:
                     u.input_tokens += Number(t.input) || 0;
                     u.output_tokens += (Number(t.output) || 0) + (Number(t.reasoning) || 0);
                     u.cache_read_tokens += Number(t.cache && t.cache.read) || 0;
+                    u.cache_creation_input_tokens += Number(t.cache && t.cache.write) || 0;
                   }
-                  if (ev.type === 'error') errMsg = (ev.error && (ev.error.data?.message || ev.error.message || ev.error.name)) || JSON.stringify(ev).slice(0, 300);
+                  if (ev.type === 'error') {
+                    errMsg = (ev.error && (ev.error.data?.message || ev.error.message || ev.error.name)) || JSON.stringify(ev).slice(0, 300);
+                    if (OPENCODE_LIMIT_RE.test(errMsg + ' ' + ((ev.error && ev.error.name) || ''))) {
+                      openCodeLastLimit = { at: new Date().toISOString(), model: opts.model || '', message: errMsg };
+                    }
+                  }
                 }
-                const text = texts.join('\n\n');
-                if (!text && (errMsg || code !== 0)) {
-                  return done({ error: 'OpenCode: ' + (errMsg || (err || out).slice(-500) || 'saiu com código ' + code), sessionId: sessionId || undefined });
+                if (!errMsg && err && OPENCODE_LIMIT_RE.test(err)) {
+                  openCodeLastLimit = { at: new Date().toISOString(), model: opts.model || '', message: err.trim().slice(-300) };
                 }
                 const ms = Date.now() - started;
                 const costUsd = Math.round(cost * 1000000) / 1000000;
+                const hasUsage = steps > 0 || u.input_tokens > 0 || u.output_tokens > 0 || u.cache_creation_input_tokens > 0 || u.cache_read_tokens > 0;
+                if (signal && !timedOut) {
+                  if (hasUsage) logUsage('opencode', chatId, costUsd, ms, u, opts.model);
+                  return done({ stopped: true });
+                }
+                if (timedOut) {
+                  if (hasUsage) logUsage('opencode', chatId, costUsd, ms, u, opts.model);
+                  return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
+                }
+                const text = texts.join('\n\n');
+                if (!text && (errMsg || code !== 0)) {
+                  if (hasUsage) logUsage('opencode', chatId, costUsd, ms, u, opts.model);
+                  return done({ error: 'OpenCode: ' + (errMsg || (err || out).slice(-500) || 'saiu com código ' + code), sessionId: sessionId || undefined });
+                }
+                if (!errMsg && code === 0 && (steps > 0 || text)) openCodeLastOkAt = Date.now();
                 logUsage('opencode', chatId, costUsd, ms, u, opts.model);
-                done({ text, sessionId, provider: 'opencode', usage: { cost: costUsd, ms, turns: steps, in: u.input_tokens, out: u.output_tokens, cacheRead: u.cache_read_tokens } });
+                done({ text, sessionId, provider: 'opencode', usage: { cost: costUsd, ms, turns: steps, in: u.input_tokens + u.cache_creation_input_tokens, out: u.output_tokens, cacheRead: u.cache_read_tokens } });
               });
             });
           }
@@ -990,7 +1091,34 @@ services:
               let out = '', err = '', buf = '', timedOut = false;
               const texts = [];
               let sessionId = '', modelUsed = opts.model || '', turns = 0, premiumRequests = 0, durationMs = 0, exitCode = 0;
-              const u = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 };
+              let nanoAiu = 0, hasSnapshotTokens = false;
+              let stepUncachedIn = 0, stepCacheWrite = 0, stepCacheRead = 0, stepOut = 0, stepReasoning = 0, stepDurationMs = 0, stepCalls = 0;
+              const u = { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_input_tokens: 0, thinking_tokens: 0 };
+              const applySnapshot = (snap, modelMetrics) => {
+                if (snap && typeof snap === 'object') {
+                  if (snap.currentModel) modelUsed = snap.currentModel;
+                  if (snap.totalPremiumRequestCost != null) premiumRequests = Number(snap.totalPremiumRequestCost) || premiumRequests;
+                  if (snap.totalNanoAiu != null) nanoAiu = Number(snap.totalNanoAiu) || nanoAiu;
+                  if (snap.totalApiDurationMs) durationMs = Number(snap.totalApiDurationMs) || durationMs;
+                  if (snap.tokenDetails) {
+                    u.input_tokens = Number(snap.tokenDetails.input && snap.tokenDetails.input.tokenCount) || 0;
+                    u.cache_creation_input_tokens = Number(snap.tokenDetails.cache_write && snap.tokenDetails.cache_write.tokenCount) || 0;
+                    u.output_tokens = Number(snap.tokenDetails.output && snap.tokenDetails.output.tokenCount) || 0;
+                    u.cache_read_tokens = Number(snap.tokenDetails.cache_read && snap.tokenDetails.cache_read.tokenCount) || 0;
+                    hasSnapshotTokens = true;
+                  }
+                }
+                if (modelMetrics && typeof modelMetrics === 'object') {
+                  let reas = 0;
+                  const keys = Object.keys(modelMetrics);
+                  for (const k of keys) {
+                    const mm = modelMetrics[k];
+                    if (mm && mm.usage) reas += Number(mm.usage.reasoningTokens) || 0;
+                  }
+                  if (reas > 0) u.thinking_tokens = reas;
+                  if ((!modelUsed || modelUsed === 'auto') && keys.length) modelUsed = keys[0];
+                }
+              };
               const handleLine = (line) => {
                 if (!line) return;
                 let ev;
@@ -1010,23 +1138,38 @@ services:
                     }
                   }
                 }
-                if (ev.type === 'session.usage_checkpoint' && ev.data && ev.data.accountingSnapshot) {
-                  const snap = ev.data.accountingSnapshot;
-                  if (snap.currentModel) modelUsed = snap.currentModel;
-                  if (snap.totalPremiumRequestCost) premiumRequests = Number(snap.totalPremiumRequestCost) || premiumRequests;
-                  if (snap.totalApiDurationMs) durationMs = Number(snap.totalApiDurationMs) || durationMs;
-                  if (snap.tokenDetails) {
-                    u.input_tokens = Number(snap.tokenDetails.input && snap.tokenDetails.input.tokenCount) || u.input_tokens;
-                    u.output_tokens = Number(snap.tokenDetails.output && snap.tokenDetails.output.tokenCount) || u.output_tokens;
-                    u.cache_read_tokens = Number(snap.tokenDetails.cache_read && snap.tokenDetails.cache_read.tokenCount) || u.cache_read_tokens;
-                  }
+                if (ev.type === 'session.usage_record' && ev.data && ev.data.usage) {
+                  const ru = ev.data.usage;
+                  stepCalls++;
+                  if (ru.responseModel || ru.model) modelUsed = ru.responseModel || ru.model;
+                  const tin = Number(ru.inputTokens) || 0;
+                  const cr = Number(ru.cacheReadTokens) || 0;
+                  const cw = Number(ru.cacheWriteTokens) || 0;
+                  stepUncachedIn += Math.max(0, tin - cr - cw);
+                  stepCacheWrite += cw;
+                  stepCacheRead += cr;
+                  stepOut += Number(ru.outputTokens) || 0;
+                  stepReasoning += Number(ru.reasoningTokens) || 0;
+                  stepDurationMs += Number(ru.duration) || 0;
+                }
+                if (ev.type === 'session.usage_checkpoint' && ev.data) {
+                  if (ev.data.totalNanoAiu != null) nanoAiu = Number(ev.data.totalNanoAiu) || nanoAiu;
+                  if (ev.data.totalPremiumRequests != null) premiumRequests = Number(ev.data.totalPremiumRequests) || premiumRequests;
+                  if (ev.data.accountingSnapshot || ev.data.modelMetrics) applySnapshot(ev.data.accountingSnapshot, ev.data.modelMetrics);
+                }
+                if (ev.type === 'session.shutdown' && ev.data) {
+                  if (ev.data.totalNanoAiu != null) nanoAiu = Number(ev.data.totalNanoAiu) || nanoAiu;
+                  if (ev.data.totalPremiumRequests != null) premiumRequests = Number(ev.data.totalPremiumRequests) || premiumRequests;
+                  if (ev.data.totalApiDurationMs) durationMs = Number(ev.data.totalApiDurationMs) || durationMs;
+                  if (ev.data.accountingSnapshot || ev.data.modelMetrics) applySnapshot(ev.data.accountingSnapshot, ev.data.modelMetrics);
                 }
                 if (ev.type === 'result') {
                   if (ev.sessionId) sessionId = ev.sessionId;
                   if (typeof ev.exitCode === 'number') exitCode = ev.exitCode;
                   if (ev.usage) {
                     if (ev.usage.sessionDurationMs) durationMs = Number(ev.usage.sessionDurationMs) || durationMs;
-                    if (ev.usage.premiumRequests) premiumRequests = Number(ev.usage.premiumRequests) || premiumRequests;
+                    if (ev.usage.premiumRequests != null) premiumRequests = Number(ev.usage.premiumRequests) || premiumRequests;
+                    if (ev.usage.totalNanoAiu != null) nanoAiu = Number(ev.usage.totalNanoAiu) || nanoAiu;
                   }
                 }
               };
@@ -1044,16 +1187,33 @@ services:
               child.on('error', (e) => done({ error: e.message }));
               child.on('close', (code, signal) => {
                 if (buf.trim()) handleLine(buf.trim());
-                if (signal && !timedOut) return done({ stopped: true });
-                if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
-                const text = texts.join('\n\n').trim();
-                if (!text && (code !== 0 || exitCode !== 0)) {
-                  return done({ error: 'copilot saiu com código ' + (code || exitCode) + ': ' + (err || out).slice(-500) });
+                if (!hasSnapshotTokens && stepCalls > 0) {
+                  u.input_tokens = stepUncachedIn;
+                  u.cache_creation_input_tokens = stepCacheWrite;
+                  u.output_tokens = stepOut;
+                  u.thinking_tokens = stepReasoning;
+                  u.cache_read_tokens = stepCacheRead;
+                  if (!durationMs && stepDurationMs) durationMs = stepDurationMs;
                 }
                 const ms = durationMs || (Date.now() - started);
-                logUsage('copilot', chatId, 0, ms, u, modelUsed || opts.model || 'auto');
+                const aiu = nanoAiu > 0 ? Math.round((nanoAiu / 1e9) * 10000) / 10000 : 0;
+                const hasAnyUsage = u.input_tokens > 0 || u.cache_creation_input_tokens > 0 || u.output_tokens > 0 || u.thinking_tokens > 0 || u.cache_read_tokens > 0 || aiu > 0;
+                if (signal && !timedOut) {
+                  if (hasAnyUsage) logUsage('copilot', chatId, 0, ms, u, modelUsed || opts.model || 'auto', { aiu, premiumRequests });
+                  return done({ stopped: true });
+                }
+                if (timedOut) {
+                  if (hasAnyUsage) logUsage('copilot', chatId, 0, ms, u, modelUsed || opts.model || 'auto', { aiu, premiumRequests });
+                  return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
+                }
+                const text = texts.join('\n\n').trim();
+                if (!text && (code !== 0 || exitCode !== 0)) {
+                  if (hasAnyUsage) logUsage('copilot', chatId, 0, ms, u, modelUsed || opts.model || 'auto', { aiu, premiumRequests });
+                  return done({ error: 'copilot saiu com código ' + (code || exitCode) + ': ' + (err || out).slice(-500) });
+                }
+                logUsage('copilot', chatId, 0, ms, u, modelUsed || opts.model || 'auto', { aiu, premiumRequests });
                 done({ text: text || '(sem resposta)', sessionId, provider: 'copilot',
-                  usage: { cost: 0, ms, turns: turns || 1, premiumRequests, in: u.input_tokens, out: u.output_tokens, cacheRead: u.cache_read_tokens } });
+                  usage: { cost: 0, ms, turns: turns || 1, premiumRequests, aiu, in: u.input_tokens + u.cache_creation_input_tokens, out: u.output_tokens + u.thinking_tokens, cacheRead: u.cache_read_tokens } });
               });
             });
           }
@@ -1253,13 +1413,13 @@ services:
           // Instructions for Antigravity / OpenCode: the same bridge rules without Claude-only MCP contradictions.
           function antigravityPrompt(chatId, bot, providerHint = 'antigravity') {
             const memory = fs.existsSync(MEMORY_DIR)
-              ? 'Memória do Caio: leia primeiro o arquivo MEMORY.md na pasta ' + MEMORY_DIR + ' e abra os arquivos que forem relevantes para o pedido. Lá estão os dados de contato, acessos e preferências.'
+              ? (OWNER_NAME ? 'Memória de ' + OWNER_NAME : 'Memória do usuário') + ': leia primeiro o arquivo MEMORY.md na pasta ' + MEMORY_DIR + ' e abra os arquivos que forem relevantes para o pedido. Lá estão os dados de contato, acessos e preferências.'
               : 'Não há pasta de memória configurada.';
             return [
               systemPrompt(chatId, bot, providerHint),
               memory,
               providerHint === 'antigravity'
-                ? 'Você é o Antigravity respondendo pela ponte. Use as mesmas credenciais e ferramentas do ambiente: GitHub (gh já autenticado), Coolify, WAHA, Gmail e os scripts em ~/bin. Os arquivos de acesso ficam em ~/.config.'
+                ? 'Você é o Antigravity respondendo pela ponte. Use as credenciais, MCPs e ferramentas disponíveis no ambiente (~/bin, ~/.config) respeitando as regras acima.'
                 : 'Você está respondendo pela ponte via ' + (PROVIDERS[providerHint] || providerHint) + '. Use as ferramentas disponíveis no ambiente (~/bin, ~/.config) respeitando as regras acima.',
             ].join('\n\n');
           }
@@ -1401,6 +1561,7 @@ services:
             if (p === 'antigravity') return fs.existsSync(AGY_BIN);
             if (p === 'opencode') return Boolean(OPENCODE_BIN && (OPENCODE_BIN === 'opencode' || fs.existsSync(OPENCODE_BIN)));
             if (p === 'copilot') return Boolean(COPILOT_BIN && (COPILOT_BIN === 'copilot' || fs.existsSync(COPILOT_BIN)));
+            if (p === 'ollama') return fs.existsSync(OLLAMA_BIN);
             if (p === 'openai_compat') return compatConfig().enabled;
             return false;
           }
@@ -1430,6 +1591,12 @@ services:
               const text = !opts.resume ? antigravityPrompt(chatId, effectiveBot, 'copilot') + '\n\n---\n\n' + actualPrompt : actualPrompt;
               const model = opts.modelOverride || (cfg.cp && cfg.cp.cpModel) || settings.copilotModel || COPILOT_DEFAULT_MODEL;
               return runCopilot(chatId, text, { model, effort: cfg.effort, resume: opts.resume, botId: effectiveBot.id, bot: effectiveBot, sandboxed: isSandboxed, readOnly: opts.readOnly, displayPrompt }, onActivity, onEvent);
+            }
+            if (provider === 'ollama') {
+              const model = opts.modelOverride || (cfg.ol && cfg.ol.olModel) || settings.ollamaModel || OLLAMA_DEFAULT_MODEL;
+              try { await ensureOllama(); } catch (e) { return { error: e.message, text: '', isError: true }; }
+              const { effort: _e, ...rest } = opts;
+              return runClaude(chatId, actualPrompt, { model, ...rest, resume: opts.resume, extraEnv: ollamaEnv(model), bot: effectiveBot, displayPrompt }, onActivity, onEvent);
             }
             if (provider === 'openai_compat') {
               const model = opts.modelOverride || cfg.model;
@@ -1487,8 +1654,8 @@ services:
               const alertUsd = Number(settings.spending && settings.spending.taskAlertUsd || 0);
               if (alertUsd > 0 && r && r.usage && Number(r.usage.cost) >= alertUsd) {
                 audit({ action: 'spending-alert', chatId, bot: cfg.bot.id, cost: r.usage.cost, threshold: alertUsd });
-                const costUrl = isWeb(chatId) ? '/#/chat/' + String(chatId).slice(4) : '';
-                notifyPush({ title: 'Alerta de custo', body: 'Execucao custou USD ' + Number(r.usage.cost).toFixed(2) + ' (limite por tarefa: USD ' + alertUsd.toFixed(2) + ')', chatId, ...(costUrl ? { url: costUrl } : {}) });
+                const costUrl = isWeb(chatId) ? '/#/chat/' + String(chatId).slice(4) : '/#/usage';
+                notifyPush({ title: 'Alerta de custo', body: 'Execucao custou USD ' + Number(r.usage.cost).toFixed(2) + ' (limite por tarefa: USD ' + alertUsd.toFixed(2) + ')', chatId, url: costUrl });
               }
               return r;
             } finally {
@@ -1617,7 +1784,7 @@ services:
           const EFFORT_CHOICES = [['low', '/effort low'], ['medium', '/effort medium'], ['high', '/effort high'], ['xhigh', '/effort xhigh'], ['max', '/effort max'], ['Padrão', '/effort default']];
           const HELP_MENU = [['Status', '/status'], ['Nova conversa', '/new'], ['Trocar modelo', '/model'], ['Trocar esforço', '/effort'],
             ['Uso e custo', '/usage'], ['Últimas execuções', '/log'], ['Agendamentos', '/schedules'], ['Interromper tarefa', '/stop'], ['Trocar provedor', '/provider'], ['Trocar bot', '/bot']];
-          const PROVIDER_CHOICES = [['Claude Code', '/provider claude'], ['Antigravity', '/provider antigravity'], ['GitHub Copilot', '/provider copilot'], ['OpenCode (grátis)', '/provider opencode']];
+          const PROVIDER_CHOICES = [['Claude Code', '/provider claude'], ['Antigravity', '/provider antigravity'], ['GitHub Copilot', '/provider copilot'], ['OpenCode (grátis)', '/provider opencode'], ['Ollama Cloud', '/provider ollama']];
           const MENU_TTL = 120000;
           const menus = new Map();  // chatId -> { at, options: [command] }   numbered menu waiting for a "1", "2"...
           const polls = new Map();  // poll message id (last segment) -> { chatId, options: { label: command } }
@@ -1805,18 +1972,24 @@ services:
             switch (cmd) {
               case '/help': return sendMenu(chatId, 'O que você quer fazer?', HELP_MENU, HELP);
               case '/new':
-                delete c.session; delete c.agySession; delete c.ocSession; delete c.cpSession; save();
+                delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; delete c.cpSession; delete c.olSession; save();
                 return reply(chatId, 'Nova conversa iniciada com ' + botLabel(botOf(c)) + '. Modelo: ' + (runConfig(c).model || 'padrão') + '.', true);
               case '/provider': {
                 const cur = PROVIDERS[providerOf(c)];
                 if (!arg) return sendChoice(chatId, 'Provedor atual: ' + cur + '. Escolha:', PROVIDER_CHOICES);
-                const a = arg.toLowerCase(); const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : a;
-                if (!PROVIDERS[want] || want === 'openai_compat') return reply(chatId, 'Provedor inválido. Opções: claude, antigravity, copilot, opencode.', true);
+                const a = arg.toLowerCase(); const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : (a === 'ollama' || a === 'cloud') ? 'ollama' : a;
+                if (!PROVIDERS[want] || want === 'openai_compat') return reply(chatId, 'Provedor inválido. Opções: claude, antigravity, copilot, opencode, ollama.', true);
                 c.provider = want; save();
                 return reply(chatId, 'Provedor desta conversa: ' + PROVIDERS[want] + '. Vale a partir da próxima mensagem. Use /new para começar do zero no novo provedor.', true);
               }
               case '/model':
                 if (providerOf(c) === 'antigravity') return agyModelCommand(chatId, c, arg, isDefault);
+                if (providerOf(c) === 'ollama') {
+                  if (!arg) return reply(chatId, 'Modelo Ollama atual: ' + ((runConfig(c).ol && runConfig(c).ol.olModel) || OLLAMA_DEFAULT_MODEL) + '. Use /model <nome>, ex.: /model glm-5.3-flash:cloud, /model kimi-k2.6:cloud, /model default.', true);
+                  if (isDefault(arg)) { delete c.olModel; delete c.model; } else { c.olModel = arg.trim(); c.model = arg.trim(); }
+                  save();
+                  return reply(chatId, 'Modelo Ollama desta conversa: ' + ((runConfig(c).ol && runConfig(c).ol.olModel) || OLLAMA_DEFAULT_MODEL) + '. Use /new para começar do zero.', true);
+                }
                 if (providerOf(c) === 'copilot') {
                   if (!arg) {
                     const cur = (runConfig(c).cp && runConfig(c).cp.cpModel) || COPILOT_DEFAULT_MODEL;
@@ -1860,7 +2033,7 @@ services:
                 const b = findBot(arg);
                 if (!b) return reply(chatId, 'Bot não encontrado. Disponíveis: ' + Object.values(bots).map((x) => x.name).join(', ') + '.', true);
                 if (b.id === DEFAULT_BOT) delete c.bot; else c.bot = b.id;
-                delete c.session; delete c.agySession; delete c.ocSession; save();
+                delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; save();
                 audit({ action: 'chat-bot', chatId, bot: b.id });
                 return reply(chatId, 'Agora quem responde é ' + botLabel(b) + '. Conversa nova iniciada.', true);
               }
@@ -1969,21 +2142,22 @@ services:
               case '/help':
                 return out('**Comandos disponíveis no Chat Web:**\n- `/new` — inicia nova sessão limpa\n- `/status` — mostra bot, provedor, modelo e fila\n- `/usage` — uso desta conversa e gasto do mês\n- `/log [n]` — últimas execuções\n- `/provider <claude|antigravity|copilot|opencode|openai_compat>` — troca provedor\n- `/model <id|default>` — troca modelo\n- `/effort <low|medium|high|xhigh|max|default>` — troca esforço\n- `/bot <nome>` — troca bot da conversa\n- `/stop` — interrompe execução atual\n- `/schedules` — lista agendamentos desta conversa\n- `/council <pergunta>` — consulta múltiplos modelos em paralelo e sintetiza\n- `/<slug-da-skill>` — executa uma skill');
               case '/new':
-                delete c.session; delete c.agySession; delete c.ocSession; delete c.cpSession; save();
+                delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; delete c.cpSession; delete c.olSession; save();
                 return out('Nova conversa iniciada com **' + botLabel(botOf(c)) + '**. Provedor: ' + PROVIDERS[providerOf(c)] + '.');
               case '/provider': {
-                if (!arg) return out('Provedor atual: **' + PROVIDERS[providerOf(c)] + '**. Use `/provider claude`, `/provider antigravity`, `/provider copilot`, `/provider opencode` ou `/provider openai_compat`.');
+                if (!arg) return out('Provedor atual: **' + PROVIDERS[providerOf(c)] + '**. Use `/provider claude`, `/provider antigravity`, `/provider copilot`, `/provider opencode`, `/provider ollama` ou `/provider openai_compat`.');
                 const a = arg.toLowerCase();
-                const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : (a === 'byom' || a === 'compat' || a === 'openai_compat') ? 'openai_compat' : a;
-                if (!PROVIDERS[want]) return out('Provedor inválido. Opções: `claude`, `antigravity`, `copilot`, `opencode`, `openai_compat`.');
+                const want = (a === 'code' || a === 'claude') ? 'claude' : (a === 'agy' || a === 'antigravity') ? 'antigravity' : (a === 'oc' || a === 'opencode') ? 'opencode' : (a === 'cp' || a === 'gh' || a === 'github' || a === 'copilot') ? 'copilot' : (a === 'ollama' || a === 'cloud') ? 'ollama' : (a === 'byom' || a === 'compat' || a === 'openai_compat') ? 'openai_compat' : a;
+                if (!PROVIDERS[want]) return out('Provedor inválido. Opções: `claude`, `antigravity`, `copilot`, `opencode`, `ollama`, `openai_compat`.');
                 c.provider = want; save();
                 return out('Provedor desta conversa alterado para **' + PROVIDERS[want] + '** (vale a partir da próxima mensagem).');
               }
               case '/model': {
                 const p = providerOf(c);
-                if (!arg) return out('Modelo atual (' + PROVIDERS[p] + '): `' + (p === 'antigravity' ? (c.agyModel || 'padrão') : p === 'opencode' ? (runConfig(c).oc.ocModel || OPENCODE_DEFAULT_MODEL) : p === 'copilot' ? ((runConfig(c).cp && runConfig(c).cp.cpModel) || COPILOT_DEFAULT_MODEL) : (runConfig(c).model || 'padrão')) + '`.');
+                if (!arg) return out('Modelo atual (' + PROVIDERS[p] + '): `' + (p === 'antigravity' ? (c.agyModel || 'padrão') : p === 'opencode' ? (runConfig(c).oc.ocModel || OPENCODE_DEFAULT_MODEL) : p === 'copilot' ? ((runConfig(c).cp && runConfig(c).cp.cpModel) || COPILOT_DEFAULT_MODEL) : p === 'ollama' ? ((runConfig(c).ol && runConfig(c).ol.olModel) || OLLAMA_DEFAULT_MODEL) : (runConfig(c).model || 'padrão')) + '`.');
                 if (p === 'antigravity') { if (isDefault(arg)) delete c.agyModel; else c.agyModel = arg; }
                 else if (p === 'opencode') { if (isDefault(arg)) { delete c.ocModel; delete c.model; } else { c.ocModel = arg; c.model = arg; } }
+                else if (p === 'ollama') { if (isDefault(arg)) { delete c.olModel; delete c.model; } else { c.olModel = arg; c.model = arg; } }
                 else if (p === 'copilot') { if (isDefault(arg)) { delete c.cpModel; delete c.model; } else { c.cpModel = arg; c.model = arg; } }
                 else { if (isDefault(arg)) delete c.model; else c.model = arg; }
                 save();
@@ -2002,7 +2176,7 @@ services:
                 const b = findBot(arg);
                 if (!b) return out('Bot não encontrado. Disponíveis: ' + Object.values(bots).map((x) => x.name).join(', ') + '.');
                 if (b.id === DEFAULT_BOT) delete c.bot; else c.bot = b.id;
-                delete c.session; delete c.agySession; delete c.ocSession; save();
+                delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; save();
                 audit({ action: 'chat-bot', chatId, bot: b.id, via: 'web-cmd' });
                 return out('Agora quem responde é **' + botLabel(b) + '**. Nova sessão iniciada.');
               }
@@ -2113,7 +2287,7 @@ services:
               if (!body) return;
               audit({ action: 'guest-message', from: number, name: guest.name, bot: gBot, chars: body.length });
               enqueue(chatId, async () => {
-                const gPrompt = '[VISITANTE AUTORIZADO: ' + guest.name + ' (acesso restrito ao bot ' + gBot + '). Ajude apenas no escopo deste bot. NUNCA revele segredos, credenciais, dados de trabalho, infraestrutura ou mensagens privadas do Caio. NUNCA envie mensagens a terceiros nem altere configuracoes.]\n\n' + body;
+                const gPrompt = '[VISITANTE AUTORIZADO: ' + guest.name + ' (acesso restrito ao bot ' + gBot + '). Ajude apenas no escopo deste bot. NUNCA revele segredos, credenciais, dados de trabalho, infraestrutura ou mensagens privadas do ' + (OWNER_NAME || 'usuário') + '. NUNCA envie mensagens a terceiros nem altere configuracoes.]\n\n' + body;
                 const r = await runTurn(chatId, gBot, gPrompt, null, null, null, { sandboxed: true, readOnly: guest.readOnly !== false });
                 const parsedGuest = r.error ? { text: 'Não consegui responder agora. Tente de novo em instantes.', suggestions: [] } : extractSuggestions(r.text || '');
                 await reply(chatId, parsedGuest.text || '(resposta vazia)', Boolean(r.error));
@@ -2254,7 +2428,7 @@ services:
             const id = botId || botOf(c).id;
             const own = id === botOf(c).id;
             const prov = runConfig(c, own ? undefined : id).provider;
-            const key = prov === 'antigravity' ? 'agySession' : prov === 'opencode' ? 'ocSession' : prov === 'copilot' ? 'cpSession' : 'session';
+            const key = prov === 'antigravity' ? 'agySession' : prov === 'opencode' ? 'ocSession' : prov === 'copilot' ? 'cpSession' : prov === 'ollama' ? 'olSession' : 'session';
             const store = own ? c : ((c.botSessions = c.botSessions || {})[id] = c.botSessions[id] || {});
             const opts = { resume: store[key], bot: own ? undefined : id, ...(extra || {}) };
             let r = await runAgent(chatId, prompt, opts, onActivity, onEvent);
@@ -3104,22 +3278,20 @@ services:
             if (prompts.size > 300) prompts.delete(prompts.keys().next().value);
             audit({ action: kind === 'secret' ? 'secret-request' : kind === 'nudge' ? 'nudge-ask' : 'prompt-ask', chatId, id: p.id, title, question: question.slice(0, 80) });
             emitPrompt(p);
-            const promptUrl = isWeb(chatId) ? '/#/chat/' + String(chatId).slice(4) : '';
-            if (isWeb(chatId)) {
-              const c = chats[chatId];
-              webGlobalEmit({
-                type: 'prompt',
-                chatId,
-                chatTitle: (c && c.title) || 'Conversa web',
-                prompt: promptView(p),
-                tag: 'prompt-' + p.id,
-                url: promptUrl,
-              });
-            }
+            const promptUrl = isWeb(chatId) ? '/#/chat/' + String(chatId).slice(4) : '/#/inbox';
+            const promptChat = isWeb(chatId) ? chats[chatId] : null;
+            webGlobalEmit({
+              type: 'prompt',
+              chatId,
+              chatTitle: isWeb(chatId) ? ((promptChat && promptChat.title) || 'Conversa web') : 'Central de Decisões',
+              prompt: promptView(p),
+              tag: 'prompt-' + p.id,
+              url: promptUrl,
+            });
             if (isWeb(chatId) && kind === 'nudge') {
               webAppend(chatId, { role: 'assistant', bot: callerBot, text: '💡 **' + title + '**\n\n' + question, prompts: [promptView(p)], noPush: true });
             }
-            notifyPush({ title: title, body: cleanPushPreview(question, 180), chatId, tag: 'prompt-' + p.id, ...(promptUrl ? { url: promptUrl } : {}) });
+            notifyPush({ title: title, body: cleanPushPreview(question, 180), chatId, tag: 'prompt-' + p.id, url: promptUrl });
             if (isTelegram(chatId)) {
               tgSendPrompt(p).catch((e) => log('tg prompt failed:', e.message));
             } else if (isDiscord(chatId)) {
@@ -3691,17 +3863,17 @@ services:
               example: '☀️ *Bom dia!* São Paulo 23°C (parcialmente nublado)\n• 2 e-mails urgentes (Fatura AWS, Contrato)\n• 3 tarefas abertas no Board\n• Destaques de IA hoje...',
               instructions: 'Você é o bot de Briefing Matinal. Entregue sempre um resumo direto, escaneável em menos de 1 minuto, dividido em: Clima, E-mails urgentes, Pendências/Board e 3 notícias importantes. Nunca enrole.',
               approvalMode: 'auto',
-              skill: { name: 'Briefing Matinal', description: 'Gera o resumo matinal estruturado', instructions: '1. Verifique o clima da cidade do usuário.\n2. Liste os e-mails não lidos importantes (usando ~/bin/gmail.py se disponível).\n3. Consulte tickets abertos em GET /tickets.\n4. Traga 3 manchetes relevantes de tecnologia/IA.\n5. Formate em seções curtas com emojis.' },
+              skill: { name: 'Briefing Matinal', description: 'Gera o resumo matinal estruturado', instructions: '1. Verifique o clima da cidade do usuário.\n2. Liste os e-mails não lidos importantes (usando ~/bin/gmail.py ou MCP de e-mail se disponível).\n3. Consulte tickets abertos em GET /tickets.\n4. Traga 3 manchetes relevantes de tecnologia/IA.\n5. Formate em seções curtas com emojis.' },
               routine: { cron: '0 8 * * 1-5', description: 'Briefing matinal (seg-sex 8h)', prompt: 'Execute o briefing matinal completo com clima, e-mails importantes, tarefas abertas e 3 destaques do dia.', paused: true },
             },
             {
               id: 'triagem-gmail', name: 'Triagem de Gmail', emoji: '📬', color: '#0a84ff',
               description: 'Analisa a caixa de entrada, destaca urgências, detecta assinaturas esquecidas e rascunha respostas.',
-              example: '📬 *Triagem (14 não lidos)*\n🔴 Urgente: Confirmação de voo\n🟡 Responder hoje: Lucas sobre projeto\n🟢 11 newsletters (resumo em 3 linhas)',
-              instructions: 'Você faz triagem de e-mails usando ~/bin/gmail.py. Classifique em Urgente, Responder hoje e Informativos. NUNCA apague e-mails nem envie respostas sem aprovação via cartão (/prompts).',
+              example: '📬 *Triagem (14 não lidos)*\n🔴 Urgente: Confirmação de voo\n🟡 Responder hoje: Equipe sobre projeto\n🟢 11 newsletters (resumo em 3 linhas)',
+              instructions: 'Você faz triagem de e-mails (usando ~/bin/gmail.py ou MCP de e-mail se disponível). Classifique em Urgente, Responder hoje e Informativos. NUNCA apague e-mails nem envie respostas sem aprovação via cartão (/prompts).',
               approvalMode: 'ask',
               blockRules: 'Nunca excluir e-mails de serviços, casa, carro, bens duráveis ou notas fiscais. Nunca enviar e-mail sem aprovação explícita.',
-              skill: { name: 'Triagem Gmail', description: 'Classifica e-mails não lidos por prioridade', instructions: '1. Leia os últimos 20 e-mails não lidos via ~/bin/gmail.py.\n2. Separe em: Urgentes, Ação necessária, Notas/Faturas e Newsletters.\n3. Sugira rascunhos curtos para os que pedem resposta.' },
+              skill: { name: 'Triagem Gmail', description: 'Classifica e-mails não lidos por prioridade', instructions: '1. Leia os últimos 20 e-mails não lidos (usando ~/bin/gmail.py ou MCP de e-mail se disponível).\n2. Separe em: Urgentes, Ação necessária, Notas/Faturas e Newsletters.\n3. Sugira rascunhos curtos para os que pedem resposta.' },
               routine: { cron: '30 8 * * 1-5', description: 'Triagem diária de e-mails', prompt: 'Faça a triagem dos e-mails não lidos das últimas 24h e envie um resumo priorizado.', paused: true },
             },
             {
@@ -4388,26 +4560,66 @@ services:
             return [
               '<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
               '<title>Computador do Agente</title>',
-              '<style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0b0d12;color:#e5e7eb;font-family:system-ui,sans-serif}#screen{width:100%;height:100%;display:flex;align-items:center;justify-content:center}#msg{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font-size:14px;color:#94a3b8;pointer-events:none}</style>',
+              '<style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0b0d12;color:#e5e7eb;font-family:system-ui,sans-serif}#screen{width:100%;height:100%;display:flex;align-items:center;justify-content:center}#msg{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font-size:14px;color:#94a3b8;pointer-events:none}#tools{position:fixed;z-index:2;right:12px;bottom:12px;display:flex;gap:8px;align-items:center}#keyboard{display:flex;gap:6px;padding:8px;background:#111827eF;border:1px solid #475569;border-radius:10px}#keyboard[hidden],#tools[hidden]{display:none}#text{width:min(55vw,320px);font:inherit;font-size:16px;padding:8px;border:1px solid #64748b;border-radius:6px;background:#0b0d12;color:#fff}button{font:inherit;font-size:14px;padding:9px 12px;border:0;border-radius:8px;background:#2563eb;color:#fff;touch-action:manipulation}</style>',
               '</head><body><div id="screen"></div><div id="msg">Conectando à tela do computador...</div>',
+              '<div id="tools" hidden><button id="keyboard-toggle" type="button" aria-expanded="false">⌨ Digitar</button><div id="keyboard" hidden><input id="text" type="text" maxlength="1000" autocomplete="off" autocapitalize="off" spellcheck="false" inputmode="text" enterkeyhint="send" placeholder="Digite o texto para enviar"><button id="send-text" type="button">Enviar</button></div></div>',
               '<script type="module">',
               'import RFB from "./novnc/core/rfb.js";',
               'const msg = document.getElementById("msg");',
+              'const screen = document.getElementById("screen");',
+              'const tools = document.getElementById("tools");',
+              'const keyboard = document.getElementById("keyboard");',
+              'const keyboardToggle = document.getElementById("keyboard-toggle");',
+              'const textInput = document.getElementById("text");',
+              'const sendTextButton = document.getElementById("send-text");',
               'const proto = location.protocol === "https:" ? "wss://" : "ws://";',
               'const wsUrl = proto + location.host + ' + JSON.stringify(wsPath) + ';',
               'let rfb = null;',
+              'let connected = false;',
+              'let viewOnlyMode = ' + (viewOnly ? 'true' : 'false') + ';',
+              'function focusRemote() { if (rfb && !rfb.viewOnly) rfb.focus(); }',
+              'function updateControls() { tools.hidden = !rfb || !connected || rfb.viewOnly; if (tools.hidden) { keyboard.hidden = true; textInput.value = ""; keyboardToggle.setAttribute("aria-expanded", "false"); } }',
+              'function sendText(text) {',
+              '  if (!rfb || !connected || rfb.viewOnly || !text) return false;',
+              '  for (const char of text.replace(/\\r\\n?/g, "\\n")) {',
+              '    const code = char.codePointAt(0);',
+              '    const keysym = code === 10 ? 0xff0d : code === 9 ? 0xff09 : code === 8 ? 0xff08 : code <= 0xff ? code : 0x01000000 | code;',
+              '    rfb.sendKey(keysym);',
+              '  }',
+              '  return true;',
+              '}',
               'function connect() {',
               '  msg.textContent = "Conectando à tela do computador..."; msg.style.display = "flex";',
-              '  rfb = new RFB(document.getElementById("screen"), wsUrl);',
+              '  connected = false;',
+              '  rfb = new RFB(screen, wsUrl);',
               '  rfb.scaleViewport = true; rfb.resizeSession = false; rfb.clipViewport = false;',
-              '  rfb.viewOnly = ' + (viewOnly ? 'true' : 'false') + ';',
-              '  rfb.addEventListener("connect", () => { msg.style.display = "none"; parent.postMessage({ type: "computer-connected" }, "*"); });',
-              '  rfb.addEventListener("disconnect", () => { msg.textContent = "Desconectado. Reconectando..."; msg.style.display = "flex"; setTimeout(connect, 2000); });',
+              '  rfb.viewOnly = viewOnlyMode;',
+              '  updateControls();',
+              '  rfb.addEventListener("connect", () => { connected = true; updateControls(); msg.style.display = "none"; if (!rfb.viewOnly) focusRemote(); parent.postMessage({ type: "computer-connected" }, location.origin); });',
+              '  rfb.addEventListener("disconnect", () => { connected = false; updateControls(); msg.textContent = "Desconectado. Reconectando..."; msg.style.display = "flex"; setTimeout(connect, 2000); });',
               '}',
+              'screen.addEventListener("pointerdown", focusRemote, { capture: true });',
+              'screen.addEventListener("touchstart", focusRemote, { passive: true, capture: true });',
+              'keyboardToggle.addEventListener("click", () => {',
+              '  if (!rfb || rfb.viewOnly) return;',
+              '  keyboard.hidden = !keyboard.hidden;',
+              '  keyboardToggle.setAttribute("aria-expanded", String(!keyboard.hidden));',
+              '  if (!keyboard.hidden) textInput.focus();',
+              '});',
+              'function submitText() {',
+              '  if (!sendText(textInput.value)) return;',
+              '  textInput.value = "";',
+              '  textInput.focus();',
+              '}',
+              'sendTextButton.addEventListener("click", submitText);',
+              'textInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); submitText(); } });',
               'window.addEventListener("message", (e) => {',
-              '  if (!rfb || !e.data) return;',
-              '  if (e.data.type === "viewOnly") rfb.viewOnly = Boolean(e.data.value);',
-              '  if (e.data.type === "clipboard" && e.data.text) rfb.clipboardPasteFrom(String(e.data.text));',
+              '  if (e.source !== parent || e.origin !== location.origin || !rfb || !e.data) return;',
+              '  if (e.data.type === "viewOnly") { viewOnlyMode = Boolean(e.data.value); rfb.viewOnly = viewOnlyMode; updateControls(); if (!rfb.viewOnly) focusRemote(); }',
+              '  if (e.data.type === "computer-focus") focusRemote();',
+              '  if (e.data.type === "computer-keyboard" && e.data.action === "open" && !rfb.viewOnly) { keyboard.hidden = false; keyboardToggle.setAttribute("aria-expanded", "true"); textInput.focus(); }',
+              '  if (e.data.type === "computer-type" && typeof e.data.text === "string") sendText(e.data.text);',
+              '  if (e.data.type === "clipboard" && typeof e.data.text === "string" && e.data.text) rfb.clipboardPasteFrom(e.data.text);',
               '});',
               'connect();',
               '</script></body></html>',
@@ -4549,7 +4761,7 @@ services:
                 else { tk.status = 'done'; tk.result = String(r.text || '').slice(0, 8000); }
                 saveTasks();
                 recordRun(cid, { prompt: '[task #' + id + '] ' + title.slice(0, 60), ms: tk.ms, cost: tk.cost, error: tk.error });
-                const taskUrl = isWeb(parentChatId) ? '/#/chat/' + String(parentChatId).slice(4) : '';
+                const taskUrl = isWeb(parentChatId) ? '/#/chat/' + String(parentChatId).slice(4) : '/#/board';
                 if (isWeb(parentChatId)) {
                   webEmit(parentChatId, { type: 'task', task: taskView(tk) });
                   webAppend(parentChatId, { role: 'assistant', bot: botId, text: '🧵 **Tarefa paralela concluída — ' + title + '**\n\n' + (tk.error ? 'Erro: ' + tk.error : tk.result), noPush: true });
@@ -4565,7 +4777,7 @@ services:
                 } else if (!isDeleg(parentChatId)) {
                   reply(parentChatId, '🧵 *Tarefa paralela concluída — ' + title + '*\n\n' + (tk.error ? 'Erro: ' + tk.error : tk.result), Boolean(tk.error)).catch(() => {});
                 }
-                notifyPush({ title: 'Tarefa concluída: ' + title, body: cleanPushPreview(tk.error || tk.result, 160), chatId: parentChatId, tag: 'task-' + id, ...(taskUrl ? { url: taskUrl } : {}) });
+                notifyPush({ title: 'Tarefa concluída: ' + title, body: cleanPushPreview(tk.error || tk.result, 160), chatId: parentChatId, tag: 'task-' + id, url: taskUrl });
               } finally {
                 finishPendingJob('task:' + id);
               }
@@ -5289,7 +5501,8 @@ services:
             drafts = drafts.slice(-200);
             saveDrafts();
             audit({ action: 'draft-create', id: d.id, channel, to, status: d.status, via });
-            notifyPush({ title: 'Novo rascunho (' + channel + ')', body: 'Para ' + to + ': ' + body.slice(0, 120), tag: 'draft-' + d.id });
+            notifyPush({ title: 'Novo rascunho (' + channel + ')', body: 'Para ' + to + ': ' + body.slice(0, 120), tag: 'draft-' + d.id, url: '/#/inbox' });
+            webGlobalEmit({ type: 'draft', id: d.id, channel, to, body: cleanPushPreview(body, 160), tag: 'draft-' + d.id, url: '/#/inbox' });
             const chLabel = channel === 'email' ? 'E-mail' : 'WhatsApp';
             const draftLines = [
               '📝 *Rascunho aguardando decisão*',
@@ -5299,7 +5512,7 @@ services:
             if (d.channel === 'email' && d.subject) draftLines.push('• *Assunto:* ' + d.subject);
             if (d.status === 'scheduled' && d.scheduledAt) draftLines.push('• *Agendado para:* ' + formatDecisionDate(d.scheduledAt));
             draftLines.push('• *Prévia:* ' + cleanPushPreview(d.body, 220));
-            notifyDecisionWhatsApp(draftLines.join('\n'), { panelPath: '' }).catch(() => {});
+            notifyDecisionWhatsApp(draftLines.join('\n'), { panelPath: '/#/inbox' }).catch(() => {});
             return d;
           }
           function patchDraft(id, b, via = 'panel') {
@@ -5343,11 +5556,30 @@ services:
                 await sendMessage({ to: d.to, text: d.body });
               } else {
                 const bin = d.from === 'gmail' ? path.join(env.HOME || '/tmp', 'bin', 'gmail.py') : path.join(env.HOME || '/tmp', 'bin', 'agentmail');
-                const args = d.from === 'gmail'
-                  ? ['send', '--to', d.to, '--subject', d.subject || '(sem assunto)', '--body', d.body]
-                  : ['send', '--to', d.to, '--subject', d.subject || '(sem assunto)', '--text', d.body];
-                const r = await execCmd(bin, args, 30000);
-                if (r.code !== 0) throw new Error((r.err || r.out || 'falha ao enviar e-mail').slice(0, 300));
+                if (fs.existsSync(bin)) {
+                  const args = d.from === 'gmail'
+                    ? ['send', '--to', d.to, '--subject', d.subject || '(sem assunto)', '--body', d.body]
+                    : ['send', '--to', d.to, '--subject', d.subject || '(sem assunto)', '--text', d.body];
+                  const r = await execCmd(bin, args, 30000);
+                  if (r.code !== 0) throw new Error((r.err || r.out || 'falha ao enviar e-mail').slice(0, 300));
+                } else {
+                  const amKey = env.AGENTMAIL_API_KEY || (secrets.agentmail_api_key && secrets.agentmail_api_key.value) || '';
+                  const amInbox = env.AGENTMAIL_INBOX || (secrets.agentmail_inbox && secrets.agentmail_inbox.value) || '';
+                  if (d.from !== 'gmail' && amKey && amInbox) {
+                    const r = await fetch('https://api.agentmail.to/v0/inboxes/' + encodeURIComponent(amInbox) + '/messages/send', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + amKey },
+                      body: JSON.stringify({ to: [d.to], subject: d.subject || '(sem assunto)', text: d.body }),
+                      signal: AbortSignal.timeout(30000),
+                    });
+                    if (!r.ok) {
+                      const errTxt = await r.text().catch(() => '');
+                      throw new Error('AgentMail HTTP ' + r.status + (errTxt ? ': ' + errTxt.slice(0, 200) : ''));
+                    }
+                  } else {
+                    throw new Error('Envio de e-mail não configurado (configure AGENTMAIL_API_KEY + AGENTMAIL_INBOX ou instale ~/bin/gmail.py)');
+                  }
+                }
               }
               d.status = 'sent';
               d.sentAt = new Date().toISOString();
@@ -5371,7 +5603,7 @@ services:
               if (d.channel === 'email' && d.subject) errLines.push('• *Assunto:* ' + d.subject);
               errLines.push('• *Erro:* ' + cleanPushPreview(e.message, 220));
               errLines.push('_Revise ou tente reenviar na Central de Decisões._');
-              notifyDecisionWhatsApp(errLines.join('\n'), { panelPath: '' }).catch(() => {});
+              notifyDecisionWhatsApp(errLines.join('\n'), { panelPath: '/#/inbox' }).catch(() => {});
               throw e;
             } finally {
               draftSending.delete(d.id);
@@ -5585,7 +5817,7 @@ services:
               const atIso = b.at ? new Date(b.at).toISOString() : new Date(Date.now() + mins * 60000).toISOString();
               const targetChat = b.chatId || (ALLOWED[0] ? ALLOWED[0] + '@c.us' : Object.keys(chats).find((id) => !isWeb(id) && !isDeleg(id)) || '');
               if (!targetChat) throw new Error('nenhum chat de destino disponível para lembrete');
-              const sc = addSchedule({ chatId: targetChat, at: atIso, description: (title || text).slice(0, 80), prompt: 'Lembre o Caio de forma curta e direta: ' + combined });
+              const sc = addSchedule({ chatId: targetChat, at: atIso, description: (title || text).slice(0, 80), prompt: 'Lembre ' + (OWNER_NAME || 'o usuário') + ' de forma curta e direta: ' + combined });
               return { ok: true, action, id: sc.id, at: atIso, spoken: 'Lembrete agendado: ' + sc.description };
             }
 
@@ -6010,12 +6242,12 @@ services:
               html: pageHtml, bot: DEFAULT_BOT, chatId, public: false,
             }, 'preset');
             const existing = schedules.find((s) => s.description && s.description.includes('Briefing Diário'));
-            const prompt = 'Monte o Briefing Diário do Caio (curto, direto e útil):\n' +
+            const prompt = 'Monte o Briefing Diário' + (OWNER_NAME ? ' de ' + OWNER_NAME : '') + ' (curto, direto e útil):\n' +
               '1. Liste tickets abertos/em review em http://127.0.0.1:' + PORT + '/tickets e rascunhos/pendências em http://127.0.0.1:' + PORT + '/drafts.\n' +
-              '2. Verifique saúde rápida do servidor (~/bin/health-watchdog --verbose) e e-mails recentes importantes.\n' +
+              '2. Verifique saúde rápida do servidor (GET http://127.0.0.1:' + PORT + '/health ou ~/bin/health-watchdog --verbose se existir) e e-mails recentes importantes.\n' +
               '3. Se relevante, inclua 2-3 destaques rápidos de IA/tech.\n' +
               '4. Atualize a Página Viva do briefing via PUT http://127.0.0.1:' + PORT + '/pages/briefing-diario/data com JSON {"date":"<hoje>","summary":"...","cards":[{"title":"Tarefas","body":"..."},{"title":"Infra & E-mails","body":"..."},{"title":"Radar","body":"..."}]}.\n' +
-              (withAudio ? '5. Gere um resumo falado de ~1 minuto com ~/bin/falar e envie via ~/bin/enviar-voz ao Caio no WhatsApp.\n' : '') +
+              (withAudio ? '5. Gere um resumo falado de ~1 minuto e envie como nota de voz no WhatsApp (via POST http://127.0.0.1:' + PORT + '/send-voice ou ~/bin/falar + ~/bin/enviar-voz se configurados).\n' : '') +
               '6. Responda com um resumo enxuto (sem tabelas se for WhatsApp).';
             const sched = existing || addSchedule({ chatId: chatId || 'web:briefing', cron, bot: DEFAULT_BOT, description: '☀️ Briefing Diário (Página Viva' + (withAudio ? ' + Áudio' : '') + ')', prompt });
             return { page, schedule: sched };
@@ -6209,6 +6441,47 @@ services:
             return result;
           }
 
+          async function sendVoice(reqBody) {
+            const { to, path: p, text } = reqBody || {};
+            if (reqBody && reqBody.chatId && readOnlyRuns.has(String(reqBody.chatId))) throw new Error('bloqueado pelo modo proativo somente leitura (read-only)');
+            let chatId = reqBody && reqBody.chatId;
+            if (to) chatId = await resolveTo(to);
+            else if (!chatId || !chats[chatId]) throw new Error('chatId ou to obrigatório');
+            let oggPath = '';
+            let cleanup = false;
+            let engine = '';
+            try {
+              if (p) {
+                const abs = path.resolve(WORKDIR, p);
+                if (!fs.existsSync(abs)) throw new Error('arquivo não encontrado: ' + abs);
+                if (path.extname(abs).toLowerCase() === '.ogg') {
+                  oggPath = abs;
+                  engine = 'arquivo';
+                } else {
+                  if (!binExists('ffmpeg')) throw new Error('ffmpeg não encontrado para converter áudio em .ogg');
+                  oggPath = path.join(INBOX, 'voice-tmp-' + crypto.randomBytes(4).toString('hex') + '.ogg');
+                  cleanup = true;
+                  const conv = await execCmd('ffmpeg', ['-y', '-loglevel', 'error', '-i', abs, '-ac', '1', '-ar', '24000', '-c:a', 'libopus', '-b:a', '40k', oggPath], 120000);
+                  if (conv.code !== 0 || !fs.existsSync(oggPath)) throw new Error('conversão para opus falhou: ' + (conv.err || '').slice(0, 200));
+                  engine = 'ffmpeg';
+                }
+              } else if (text && String(text).trim()) {
+                oggPath = path.join(INBOX, 'voice-tmp-' + crypto.randomBytes(4).toString('hex') + '.ogg');
+                cleanup = true;
+                const tts = await synthesizeSpeech(String(text).trim(), oggPath);
+                engine = tts.engine;
+              } else {
+                throw new Error('informe "text" ou "path"');
+              }
+              const data = fs.readFileSync(oggPath).toString('base64');
+              await waha('POST', '/api/sendVoice', { session: WAHA_SESSION, chatId, file: { mimetype: 'audio/ogg; codecs=opus', filename: 'voz.ogg', data }, convert: false });
+              audit({ action: 'send-voice', to: chatId, engine });
+              return { sent: true, chatId, engine };
+            } finally {
+              if (cleanup && oggPath) { try { fs.unlinkSync(oggPath); } catch {} }
+            }
+          }
+
           // ---------- web chat (conversations started from the Agent Control panel) ----------
           const WEB_DIR = path.join(DATA_DIR, 'web');
           fs.mkdirSync(WEB_DIR, { recursive: true });
@@ -6299,12 +6572,114 @@ services:
           // Voice notes from the panel are transcribed by the bridge (~/bin/transcrever: Groq, local Whisper as fallback),
           // shown under the voice note and handed to the agent, so it doesn't transcribe again.
           async function transcribeFile(file) {
-            if (!fs.existsSync(HOME_BIN('transcrever'))) return null;
-            const r = await execCmd(HOME_BIN('transcrever'), [file], 180000);
-            const mt = /^\[([^\]]+)\]\s*([\s\S]*)(?![\s\S])/.exec((r.out || '').trim());
-            return r.code === 0 && mt && mt[2].trim() ? { engine: mt[1].trim(), text: mt[2].trim() } : null;
+            if (fs.existsSync(HOME_BIN('transcrever'))) {
+              const r = await execCmd(HOME_BIN('transcrever'), [file], 180000);
+              const mt = /^\[([^\]]+)\]\s*([\s\S]*)(?![\s\S])/.exec((r.out || '').trim());
+              return r.code === 0 && mt && mt[2].trim() ? { engine: mt[1].trim(), text: mt[2].trim() } : null;
+            }
+            const groqKey = env.GROQ_API_KEY || (secrets.groq_api_key && secrets.groq_api_key.value) || '';
+            if (groqKey) {
+              try {
+                const fd = new FormData();
+                fd.append('file', new Blob([fs.readFileSync(file)]), path.basename(file));
+                fd.append('model', env.STT_MODEL || 'whisper-large-v3-turbo');
+                fd.append('language', env.STT_LANGUAGE || 'pt');
+                fd.append('response_format', 'text');
+                const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+                  method: 'POST', headers: { Authorization: 'Bearer ' + groqKey }, body: fd, signal: AbortSignal.timeout(45000),
+                });
+                const txt = (await r.text()).trim();
+                if (r.ok && txt) return { engine: 'Groq Whisper', text: txt };
+              } catch {}
+            }
+            const openaiKey = env.OPENAI_API_KEY || (secrets.openai_api_key && secrets.openai_api_key.value) || '';
+            if (openaiKey) {
+              try {
+                const fd = new FormData();
+                fd.append('file', new Blob([fs.readFileSync(file)]), path.basename(file));
+                fd.append('model', 'whisper-1');
+                fd.append('language', env.STT_LANGUAGE || 'pt');
+                fd.append('response_format', 'text');
+                const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+                  method: 'POST', headers: { Authorization: 'Bearer ' + openaiKey }, body: fd, signal: AbortSignal.timeout(45000),
+                });
+                const txt = (await r.text()).trim();
+                if (r.ok && txt) return { engine: 'OpenAI Whisper', text: txt };
+              } catch {}
+            }
+            return null;
           }
-          // Spoken replies for the panel: ~/bin/falar (Gemini TTS, Piper fallback) to Opus, then AAC/M4A so Safari plays it.
+          // Spoken replies for the panel: ~/bin/falar (Gemini TTS, Piper fallback) or native Gemini/OpenAI/espeak-ng -> Opus, then AAC/M4A so Safari plays it.
+          async function synthesizeSpeech(text, outOgg) {
+            if (fs.existsSync(HOME_BIN('falar'))) {
+              const r = await execCmd(HOME_BIN('falar'), [text, outOgg], 240000);
+              if (!fs.existsSync(outOgg)) throw new Error('falar falhou: ' + (r.err || r.out).slice(-300));
+              const engine = (/^\[([^\]]+)\]/m.exec(r.out || '') || [])[1] || 'falar';
+              return { file: outOgg, engine };
+            }
+            const geminiKey = env.GEMINI_API_KEY || (secrets.gemini_api_key && secrets.gemini_api_key.value) || '';
+            if (geminiKey && binExists('ffmpeg')) {
+              try {
+                const model = String(env.TTS_MODEL || 'gemini-2.5-flash-preview-tts').trim();
+                const voiceName = String(env.TTS_VOICE || 'Kore').trim();
+                const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
+                  body: JSON.stringify({
+                    contents: [{ parts: [{ text }] }],
+                    generationConfig: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName } } } },
+                  }),
+                  signal: AbortSignal.timeout(120000),
+                });
+                if (r.ok) {
+                  const j = await r.json();
+                  const parts = (j && j.candidates && j.candidates[0] && j.candidates[0].content && j.candidates[0].content.parts) || [];
+                  const inline = parts.find((p) => p && p.inlineData && p.inlineData.data);
+                  if (inline) {
+                    const pcm = outOgg + '.pcm';
+                    try {
+                      fs.writeFileSync(pcm, Buffer.from(inline.inlineData.data, 'base64'));
+                      const c = await execCmd('ffmpeg', ['-y', '-loglevel', 'error', '-f', 's16le', '-ar', '24000', '-ac', '1', '-i', pcm, '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11', '-c:a', 'libopus', '-b:a', '40k', outOgg], 120000);
+                      if (c.code === 0 && fs.existsSync(outOgg)) return { file: outOgg, engine: 'Gemini TTS' };
+                    } finally {
+                      try { fs.unlinkSync(pcm); } catch {}
+                    }
+                  }
+                }
+              } catch {}
+            }
+            const openaiKey = env.OPENAI_API_KEY || (secrets.openai_api_key && secrets.openai_api_key.value) || '';
+            if (openaiKey) {
+              try {
+                const r = await fetch('https://api.openai.com/v1/audio/speech', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + openaiKey },
+                  body: JSON.stringify({ model: env.OPENAI_TTS_MODEL || 'tts-1', voice: env.OPENAI_TTS_VOICE || 'nova', input: text, response_format: 'opus' }),
+                  signal: AbortSignal.timeout(120000),
+                });
+                if (r.ok) {
+                  const buf = Buffer.from(await r.arrayBuffer());
+                  if (buf.length) {
+                    fs.writeFileSync(outOgg, buf);
+                    return { file: outOgg, engine: 'OpenAI TTS' };
+                  }
+                }
+              } catch {}
+            }
+            if (binExists('espeak-ng') && binExists('ffmpeg')) {
+              const wav = outOgg + '.wav';
+              try {
+                const sp = await execCmd('espeak-ng', ['-v', env.ESPEAK_VOICE || 'pt-br', '-w', wav, text], 60000);
+                if (sp.code === 0 && fs.existsSync(wav)) {
+                  const c = await execCmd('ffmpeg', ['-y', '-loglevel', 'error', '-i', wav, '-af', 'highpass=f=80,loudnorm=I=-16:TP=-1.5:LRA=11', '-ac', '1', '-ar', '24000', '-c:a', 'libopus', '-b:a', '40k', outOgg], 120000);
+                  if (c.code === 0 && fs.existsSync(outOgg)) return { file: outOgg, engine: 'Local espeak-ng' };
+                }
+              } finally {
+                try { fs.unlinkSync(wav); } catch {}
+              }
+            }
+            throw new Error('TTS não configurado: defina GEMINI_API_KEY ou OPENAI_API_KEY, ou instale espeak-ng + ffmpeg');
+          }
           function speakableText(md) {
             return String(md || '').replace(/```[\s\S]*?```/g, ' ').replace(/`([^`]+)`/g, (_, a) => a).replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
               .replace(/\[([^\]]+)\]\([^)]*\)/g, (_, a) => a).replace(/https?:\/\/\S+/g, ' ').replace(/^\s*[-*+]\s+/gm, '').replace(/^\s*#+\s*/gm, '')
@@ -6324,9 +6699,8 @@ services:
               if (text.length > 3000) text = text.slice(0, 3000).replace(/[^.!?]*(?![\s\S])/, '') || text.slice(0, 3000);
               const name = 'web-tts-' + String(chatId).slice(4).replace(/[^a-f0-9]/g, '') + '-' + msgId.replace(/[^a-f0-9]/g, '');
               const ogg = path.join(INBOX, name + '.ogg'), m4a = path.join(INBOX, name + '.m4a');
-              const r = await execCmd(HOME_BIN('falar'), [text, ogg], 240000);
-              if (!fs.existsSync(ogg)) throw new Error('falar falhou: ' + (r.err || r.out).slice(-300));
-              const engine = (/^\[([^\]]+)\]/m.exec(r.out || '') || [])[1] || '';
+              const tts = await synthesizeSpeech(text, ogg);
+              const engine = tts.engine || '';
               const c = await execCmd('ffmpeg', ['-y', '-loglevel', 'error', '-i', ogg, '-c:a', 'aac', '-b:a', '64k', '-movflags', '+faststart', m4a], 120000);
               try { fs.unlinkSync(ogg); } catch {}
               if (c.code !== 0 || !fs.existsSync(m4a)) throw new Error('conversão falhou: ' + c.err.slice(-300));
@@ -6391,16 +6765,56 @@ services:
               return '[O usuário enviou ' + kind + ' (' + f.type + ', ' + f.name + ') salvo em ' + path.join(INBOX, f.file) + ']';
             });
             if (transcript) notes.push(engine
-              ? '[Transcrição automática da mensagem de voz, já feita pela ponte com ~/bin/transcrever (motor: ' + engine + '). Não transcreva de novo; ao citar o motor, use este: ' + transcript + ']'
+              ? '[Transcrição automática da mensagem de voz, já feita pela ponte (motor: ' + engine + '). Não transcreva de novo; ao citar o motor, use este: ' + transcript + ']'
               : '[Transcrição automática da mensagem de voz, feita no navegador: ' + transcript + ']');
             return notes.join('\n') + '\n\n' + (text || (transcript ? 'Responda à mensagem de voz.' : 'Analise o conteúdo e responda.'));
+          }
+
+          // ---------- AI chat titles ----------
+          // After the first exchange of a web chat still carrying the default title (first message cut to 60 chars), the
+          // chat's provider writes a short descriptive title with its cheapest model. Runs in the background; any failure
+          // keeps the current title. Titles edited by hand (titleManual) are never overwritten.
+          const TITLE_MODELS = { claude: 'haiku', copilot: 'claude-haiku-4.5' };
+          const titleBusy = new Set();
+          async function autoTitleChat(chatId, userText, replyText) {
+            try {
+              const c = chats[chatId];
+              if (!c || c.titleManual || c.titleGenerated || !c.titleAuto || titleBusy.has(chatId) || settings.autoTitle === false || env.BRIDGE_AUTO_TITLE === 'off') return;
+              if (!String(userText || '').trim()) return;
+              titleBusy.add(chatId);
+              const provider = runConfig(c).provider;
+              const cid = 'title:' + crypto.randomBytes(4).toString('hex');
+              const prompt = 'Gere um título curto (3 a 7 palavras, no máximo 50 caracteres) em português do Brasil que descreva esta conversa, para o usuário encontrá-la depois. Responda SOMENTE com o título: sem aspas, sem ponto final, sem explicação, sem usar ferramentas.\n\nMensagem do usuário:\n'
+                + String(userText).slice(0, 600) + '\n\nResposta do assistente:\n' + String(replyText || '').slice(0, 600);
+              let r;
+              try {
+                r = await Promise.race([
+                  runAgent(cid, prompt, { readOnly: true, noSteer: true, noFallback: true, noRouting: true, skipSemantic: true, providerOverride: provider, modelOverride: TITLE_MODELS[provider] || '' }),
+                  new Promise((resolve) => setTimeout(() => resolve({ error: 'timeout' }), 60000)),
+                ]);
+              } finally { delete chats[cid]; }
+              if (!r || r.error || r.stopped) return;
+              let t = String(r.text || '').split('\n').map((x) => x.trim()).find(Boolean) || '';
+              const junk = /["'“”«»*#.\s]/;
+              t = t.replace(/^(t[ií]tulo\s*:\s*)/i, '').replace(/\s+/g, ' ');
+              while (t && junk.test(t[0])) t = t.slice(1);
+              while (t && junk.test(t[t.length - 1])) t = t.slice(0, -1);
+              t = t.slice(0, 60);
+              const cur = chats[chatId];
+              if (!t || t.length < 3 || !cur || cur.titleManual || !cur.titleAuto) return;
+              cur.title = t; cur.titleGenerated = true; delete cur.titleAuto;
+              save();
+              audit({ action: 'chat-title', chatId, provider });
+              webEmit(chatId, { type: 'title', title: t });
+            } catch (e) { log('auto title failed', e.message); }
+            finally { titleBusy.delete(chatId); }
           }
 
           function webSend(chatId, text, files = [], transcript = '') {
             const c = chat(chatId);
             const um = webAppend(chatId, { role: 'user', text, ...(files.length ? { files } : {}), ...(transcript ? { transcript } : {}) });
             let label = text || transcript || (files[0] && (files[0].voice ? 'Mensagem de voz' : files[0].name)) || '';
-            if (!c.title || c.title === 'Nova conversa') { c.title = label.replace(/\s+/g, ' ').slice(0, 60); save(); }
+            if (!c.title || c.title === 'Nova conversa') { c.title = label.replace(/\s+/g, ' ').slice(0, 60); c.titleAuto = true; save(); }
             // Support bridge slash commands directly in the web panel (/new, /status, /provider, /model, /effort, /bot, /stop, /council, /usage, /log, /schedules, /help)
             if (!files.length && text.startsWith('/')) {
               const firstCmd = text.trim().split(/\s+/)[0].toLowerCase();
@@ -6415,7 +6829,7 @@ services:
             if (transcribing) transcribing.then((tr) => {
               if (!tr) return webUpdate(chatId, um.id, { transcriptFailed: true });
               webUpdate(chatId, um.id, { transcript: tr.text, transcriptEngine: tr.engine });
-              if (c.title === 'Mensagem de voz') { c.title = tr.text.replace(/\s+/g, ' ').slice(0, 60); save(); }
+              if (c.title === 'Mensagem de voz') { c.title = tr.text.replace(/\s+/g, ' ').slice(0, 60); c.titleAuto = true; save(); }
             });
             let usedSkillSlug = '';
             const buildPrompt = (tr) => {
@@ -6478,6 +6892,7 @@ services:
                   error: Boolean(r.error), stopped: Boolean(r.stopped),
                   usage: { ms, cost: r.usage ? r.usage.cost : 0, turns: r.usage ? r.usage.turns : 0, ...(r.usage && r.usage.estimated ? { estimated: true } : {}) },
                 });
+                if (!r.stopped && !r.error) autoTitleChat(chatId, label || (tr && tr.text) || '', parsedReply.text);
                 if (r.stopped) break;
               }
               webEmit(chatId, { type: 'idle' });
@@ -6497,11 +6912,15 @@ services:
           // Every run appends one line to usage.jsonl. Claude's history before that file existed is rebuilt from
           // Claude Code's own transcripts (~/.claude/projects/**/*.jsonl), which carry token counts per message.
           const USAGE_FILE = path.join(DATA_DIR, 'usage.jsonl');
-          function logUsage(provider, chatId, cost, ms, u, model) {
+          function logUsage(provider, chatId, cost, ms, u, model, extra) {
             try {
               u = u || {};
+              const aiuVal = extra && Number(extra.aiu) > 0 ? Math.round(Number(extra.aiu) * 10000) / 10000 : 0;
+              const premVal = extra && Number(extra.premiumRequests) > 0 ? Number(extra.premiumRequests) : 0;
               const line = { at: new Date().toISOString(), provider, web: isWeb(chatId), cost: cost || 0, ms: ms || 0,
                 ...(model ? { model: String(model) } : {}),
+                ...(aiuVal > 0 ? { aiu: aiuVal } : {}),
+                ...(premVal > 0 ? { premiumRequests: premVal } : {}),
                 in: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0), out: (u.output_tokens || 0) + (u.thinking_tokens || 0),
                 cacheRead: u.cache_read_input_tokens || u.cache_read_tokens || 0 };
               fs.appendFileSync(USAGE_FILE, JSON.stringify(line) + '\n');
@@ -6511,8 +6930,9 @@ services:
           const HOME_DIR = env.HOME || '/tmp';
           const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch { return null; } };
 
-          const usageCache = { claude: null, agy: null, agyProject: null, claudeBlockedUntil: 0 };
+          const usageCache = { claude: null, agy: null, agyProject: null, claudeBlockedUntil: 0, copilot: null };
           const CLAUDE_USAGE_TTL = 5 * 60000; // the oauth/usage endpoint rate-limits hard: poll at most every 5 min
+          const COPILOT_USAGE_TTL = 2 * 60000;
           const CLAUDE_CRED_FILE = path.join(HOME_DIR, '.claude', '.credentials.json');
           const CLAUDE_OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
           // Refreshes ~/.claude/.credentials.json with its refreshToken. Runs use CLAUDE_CODE_OAUTH_TOKEN, so nothing
@@ -6618,6 +7038,357 @@ services:
             }
             usageCache.agy = { t: Date.now(), v };
             return v;
+          }
+
+          async function copilotLimits() {
+            const c = usageCache.copilot;
+            if (c && Date.now() - c.t < (c.v && c.v.error ? 60000 : COPILOT_USAGE_TTL)) return c.v;
+            const prevOk = c && c.v && c.v.plan ? c.v : null;
+            const installed = await isCliBinInstalled(COPILOT_BIN, 'cp');
+            if (!installed && !env.COPILOT_USAGE_URL && !env.COPILOT_GITHUB_TOKEN) {
+              const v = { installed: false, plan: null, planLabel: null, quotas: [], fetchedAt: new Date().toISOString(), error: null, stale: false };
+              usageCache.copilot = { t: Date.now(), v };
+              return v;
+            }
+            const token = await getCopilotToken();
+            if (!token) {
+              const v = {
+                installed,
+                ...(prevOk || {}),
+                plan: prevOk ? prevOk.plan : null,
+                planLabel: prevOk ? prevOk.planLabel : null,
+                quotas: prevOk ? prevOk.quotas : [],
+                fetchedAt: prevOk ? prevOk.fetchedAt : new Date().toISOString(),
+                error: installed ? 'GitHub Copilot sem token (rode gh auth login ou configure COPILOT_GITHUB_TOKEN)' : null,
+                stale: Boolean(prevOk),
+              };
+              usageCache.copilot = { t: Date.now(), v };
+              return v;
+            }
+            let v;
+            try {
+              const url = env.COPILOT_USAGE_URL || 'https://api.github.com/copilot_internal/user';
+              const r = await fetch(url, {
+                signal: AbortSignal.timeout(15000),
+                headers: {
+                  Authorization: 'Bearer ' + token,
+                  Accept: 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                  'User-Agent': 'claude-zap',
+                },
+              });
+              if (!r.ok) throw new Error('Copilot cota: HTTP ' + r.status + (r.status === 401 || r.status === 403 ? ' (token sem acesso ou expirado)' : ''));
+              const j = await r.json();
+              const plan = j.access_type_sku || j.copilot_plan || null;
+              const cpPlanNames = {
+                free_limited_copilot: 'Free',
+                individual: 'Pro',
+                copilot_for_individuals: 'Pro',
+                pro_plus: 'Pro+',
+                copilot_pro_plus: 'Pro+',
+                business: 'Business',
+                copilot_for_business: 'Business',
+                enterprise: 'Enterprise',
+                copilot_for_enterprise: 'Enterprise',
+              };
+              const planLabel = cpPlanNames[plan] || cpPlanNames[j.copilot_plan] || j.copilot_plan || plan || null;
+              const resetsAt = j.quota_reset_date_utc || (j.quota_reset_date ? j.quota_reset_date + 'T00:00:00.000Z' : null);
+              const quotaLabels = { chat: 'Chat', completions: 'Autocompletar', premium_interactions: 'Premium' };
+              const quotaOrder = { chat: 0, premium_interactions: 1, completions: 2 };
+              const quotas = [];
+              for (const [k, q] of Object.entries(j.quota_snapshots || {})) {
+                if (!q || typeof q !== 'object') continue;
+                const ent = Number(q.entitlement) || 0;
+                if (!q.unlimited && !q.has_quota && ent <= 0) continue;
+                const used = Number(q.credits_used ?? q.used ?? 0) || 0;
+                const rem = Number(q.remaining ?? q.quota_remaining ?? 0) || 0;
+                let percent = null;
+                if (!q.unlimited) {
+                  if (typeof q.percent_remaining === 'number' && Number.isFinite(q.percent_remaining)) {
+                    percent = Math.round(Math.max(0, Math.min(100, 100 - q.percent_remaining)) * 10) / 10;
+                  } else if (ent > 0) {
+                    percent = Math.round(Math.max(0, Math.min(100, (used / ent) * 100)) * 10) / 10;
+                  }
+                }
+                quotas.push({
+                  id: k,
+                  label: quotaLabels[k] || k,
+                  unlimited: Boolean(q.unlimited),
+                  percent,
+                  used,
+                  remaining: rem,
+                  entitlement: ent,
+                  overageCount: Number(q.overage_count) || 0,
+                  resetsAt,
+                });
+              }
+              quotas.sort((a, b) => (quotaOrder[a.id] ?? 99) - (quotaOrder[b.id] ?? 99));
+              v = {
+                installed,
+                login: j.login || null,
+                plan,
+                planLabel,
+                quotas,
+                resetsAt,
+                tokenBasedBilling: Boolean(j.token_based_billing),
+                fetchedAt: new Date().toISOString(),
+              };
+            } catch (e) {
+              v = { installed, ...(prevOk || {}), error: e.message, stale: Boolean(prevOk) };
+            }
+            usageCache.copilot = { t: Date.now(), v };
+            return v;
+          }
+
+          let cpDbCache = { sig: '', value: null };
+          function copilotDbHistory() {
+            const dbPath = path.join(HOME_DIR, '.copilot', 'session-store.db');
+            const sig = sqliteSig(dbPath);
+            if (!sig) return { days: {}, since: null, models: [], monthByYm: {} };
+            if (cpDbCache.sig === sig && cpDbCache.value) return cpDbCache.value;
+            const db = openReadOnlySqlite(dbPath);
+            if (!db) return { days: {}, since: null, models: [], monthByYm: {} };
+            const days = {};
+            const monthRaw = {};
+            const allModels = new Set();
+            let minIso = '';
+            try {
+              const rows = db.prepare('SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_nano_aiu, request_multiplier, duration_ms, initiator, created_at FROM assistant_usage_events').all();
+              for (const r of rows) {
+                if (!r || !r.created_at) continue;
+                let dk;
+                try { dk = dayKey(r.created_at); } catch { continue; }
+                if (!minIso || r.created_at < minIso) minIso = r.created_at;
+                const ym = dk.slice(0, 7);
+                const inpTotal = Number(r.input_tokens) || 0;
+                const cr = Number(r.cache_read_tokens) || 0;
+                const cw = Number(r.cache_write_tokens) || 0;
+                const nonCacheIn = Math.max(0, inpTotal - cr);
+                const outTok = (Number(r.output_tokens) || 0) + (Number(r.reasoning_tokens) || 0);
+                const totTok = inpTotal + outTok;
+                const aiu = (Number(r.total_nano_aiu) || 0) / 1e9;
+                const req = r.initiator === 'user' ? (Number(r.request_multiplier) || 1) : 0;
+                const dur = Number(r.duration_ms) || 0;
+
+                const d = (days[dk] ||= { in: 0, out: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, calls: 0, requests: 0, aiu: 0, ms: 0, sessions: new Set(), models: new Set() });
+                d.in += nonCacheIn; d.out += outTok; d.cacheRead += cr; d.cacheWrite += cw; d.totalTokens += totTok;
+                d.calls += 1; d.requests += req; d.aiu += aiu; d.ms += dur;
+                if (r.session_id) d.sessions.add(r.session_id);
+                if (r.model) { d.models.add(r.model); allModels.add(r.model); }
+
+                const m = (monthRaw[ym] ||= { tokens: 0, cacheRead: 0, totalTokens: 0, aiu: 0, requests: 0, calls: 0, sessions: new Set(), models: new Set() });
+                m.tokens += nonCacheIn + outTok; m.cacheRead += cr; m.totalTokens += totTok; m.aiu += aiu; m.requests += req; m.calls += 1;
+                if (r.session_id) m.sessions.add(r.session_id);
+                if (r.model) m.models.add(r.model);
+              }
+            } catch {}
+            finally { try { db.close(); } catch {} }
+
+            const cleanDays = {};
+            for (const [k, d] of Object.entries(days)) {
+              cleanDays[k] = {
+                in: d.in, out: d.out, cacheRead: d.cacheRead, cacheWrite: d.cacheWrite, totalTokens: d.totalTokens,
+                calls: d.calls, requests: Math.round(d.requests * 10) / 10,
+                aiu: Math.round(d.aiu * 10000) / 10000, ms: d.ms,
+                sessionsCount: d.sessions.size, models: [...d.models].sort(),
+              };
+            }
+            const monthByYm = {};
+            for (const [ym, m] of Object.entries(monthRaw)) {
+              monthByYm[ym] = {
+                tokens: m.tokens, cacheRead: m.cacheRead, totalTokens: m.totalTokens,
+                credits: Math.round(m.aiu * 100) / 100, requests: Math.round(m.requests * 10) / 10,
+                calls: m.calls, sessionsCount: m.sessions.size, models: [...m.models].sort(),
+              };
+            }
+            const value = { days: cleanDays, since: minIso || null, models: [...allModels].sort(), monthByYm };
+            cpDbCache = { sig, value };
+            return value;
+          }
+
+          let ocDbCache = { sig: '', value: null };
+          function openCodeDbHistory() {
+            const dataRoot = env.XDG_DATA_HOME || path.join(HOME_DIR, '.local', 'share');
+            const dbPath = path.join(dataRoot, 'opencode', 'opencode.db');
+            const sig = sqliteSig(dbPath);
+            if (!sig) return { days: {}, since: null, lastOkAt: 0, hasPaid: false, hasAccount: false, monthByYm: {} };
+            if (ocDbCache.sig === sig && ocDbCache.value) return ocDbCache.value;
+            const db = openReadOnlySqlite(dbPath);
+            if (!db) return { days: {}, since: null, lastOkAt: 0, hasPaid: false, hasAccount: false, monthByYm: {} };
+            const days = {};
+            const monthRaw = {};
+            const events = [];
+            let minTs = 0, lastOkAt = 0, hasPaid = false, hasAccount = false;
+            try {
+              try {
+                const r1 = db.prepare('SELECT count(*) AS n FROM account').get();
+                if (r1 && Number(r1.n) > 0) hasAccount = true;
+              } catch {}
+              try {
+                const r2 = db.prepare('SELECT count(*) AS n FROM control_account').get();
+                if (r2 && Number(r2.n) > 0) hasAccount = true;
+              } catch {}
+              const rows = db.prepare('SELECT id, session_id, time_created, data FROM message WHERE data LIKE ?').all('%"assistant"%');
+              for (const r of rows) {
+                let msg;
+                try { msg = JSON.parse(r.data); } catch { continue; }
+                if (!msg || msg.role !== 'assistant') continue;
+                const ts = Number(msg.time && msg.time.created) || Number(r.time_created) || 0;
+                if (!ts) continue;
+                const tk = msg.tokens || {};
+                const inp = Number(tk.input) || 0;
+                const cw = Number(tk.cache && tk.cache.write) || 0;
+                const cr = Number(tk.cache && tk.cache.read) || 0;
+                const outTok = (Number(tk.output) || 0) + (Number(tk.reasoning) || 0);
+                const cost = Number(msg.cost) || 0;
+                const nonCacheIn = inp + cw;
+                const totalTok = Number(tk.total) || (nonCacheIn + outTok + cr);
+                const isValid = nonCacheIn > 0 || outTok > 0 || cr > 0 || Boolean(msg.finish);
+                if (!isValid) continue;
+                const completedTs = Number(msg.time && msg.time.completed) || ts;
+                if (completedTs > lastOkAt) lastOkAt = completedTs;
+                if (!minTs || ts < minTs) minTs = ts;
+                if (cost > 0) hasPaid = true;
+                events.push([ts, nonCacheIn + outTok]);
+
+                let dk;
+                try { dk = dayKey(ts); } catch { continue; }
+                const ym = dk.slice(0, 7);
+                const d = (days[dk] ||= { in: 0, out: 0, cacheRead: 0, totalTokens: 0, cost: 0, msgs: 0, sessions: new Set(), models: new Set() });
+                d.in += nonCacheIn; d.out += outTok; d.cacheRead += cr; d.totalTokens += totalTok; d.cost += cost; d.msgs += 1;
+                if (r.session_id) d.sessions.add(r.session_id);
+                if (msg.modelID) d.models.add(msg.modelID);
+
+                const m = (monthRaw[ym] ||= { tokens: 0, cacheRead: 0, totalTokens: 0, costUsd: 0, messages: 0, sessions: new Set(), models: new Set() });
+                m.tokens += nonCacheIn + outTok; m.cacheRead += cr; m.totalTokens += totalTok; m.costUsd += cost; m.messages += 1;
+                if (r.session_id) m.sessions.add(r.session_id);
+                if (msg.modelID) m.models.add(msg.modelID);
+              }
+            } catch {}
+            finally { try { db.close(); } catch {} }
+
+            const cleanDays = {};
+            for (const [k, d] of Object.entries(days)) {
+              cleanDays[k] = {
+                in: d.in, out: d.out, cacheRead: d.cacheRead, totalTokens: d.totalTokens,
+                cost: Math.round(d.cost * 1000000) / 1000000,
+                msgs: d.msgs, sessionsCount: d.sessions.size, models: [...d.models].sort(),
+              };
+            }
+            const monthByYm = {};
+            for (const [ym, m] of Object.entries(monthRaw)) {
+              monthByYm[ym] = {
+                tokens: m.tokens, cacheRead: m.cacheRead, totalTokens: m.totalTokens,
+                costUsd: Math.round(m.costUsd * 1000000) / 1000000,
+                messages: m.messages, sessionsCount: m.sessions.size, models: [...m.models].sort(),
+              };
+            }
+            const value = { days: cleanDays, since: minTs ? new Date(minTs).toISOString() : null, lastOkAt, hasPaid, hasAccount, monthByYm, events };
+            ocDbCache = { sig, value };
+            return value;
+          }
+
+          let ocLogCache = { sig: '', value: null };
+          function openCodeLogLimit() {
+            const dataRoot = env.XDG_DATA_HOME || path.join(HOME_DIR, '.local', 'share');
+            const logPath = path.join(dataRoot, 'opencode', 'log', 'opencode.log');
+            let st;
+            try { st = fs.statSync(logPath); } catch { return null; }
+            const sig = st.size + ':' + st.mtimeMs;
+            if (ocLogCache.sig === sig) return ocLogCache.value;
+            let found = null;
+            let fd;
+            try {
+              const bytesToRead = Math.min(st.size, 65536);
+              if (bytesToRead > 0) {
+                fd = fs.openSync(logPath, 'r');
+                const buf = Buffer.alloc(bytesToRead);
+                fs.readSync(fd, buf, 0, bytesToRead, st.size - bytesToRead);
+                const lines = buf.toString('utf8').split('\n');
+                for (let i = lines.length - 1; i >= 0; i--) {
+                  const line = lines[i];
+                  if (!/level=ERROR/i.test(line) || !OPENCODE_LIMIT_RE.test(line)) continue;
+                  const tsM = line.match(/timestamp=(\S+)/);
+                  const modM = line.match(/modelID=(\S+)/);
+                  const errM = line.match(/error\.error="([^"]+)"/);
+                  found = {
+                    at: tsM ? tsM[1] : new Date(st.mtimeMs).toISOString(),
+                    model: modM ? modM[1] : '',
+                    message: errM ? errM[1] : 'Free usage limit reached',
+                  };
+                  break;
+                }
+              }
+            } catch {}
+            finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
+            ocLogCache = { sig, value: found };
+            return found;
+          }
+
+          // Estimated usage meter for the free tier (no official quota API): rolling window, limit calibrated from
+          // how much was used right before each past "free usage limit" streak (median of the samples).
+          const OC_EST_WINDOW_MS = 5 * 3600000;
+          let ocHitsCache = { sig: '', value: [] };
+          function openCodeLimitHits() {
+            const dataRoot = env.XDG_DATA_HOME || path.join(HOME_DIR, '.local', 'share');
+            const logPath = path.join(dataRoot, 'opencode', 'log', 'opencode.log');
+            let st; try { st = fs.statSync(logPath); } catch { return []; }
+            const sig = st.size + ':' + st.mtimeMs;
+            if (ocHitsCache.sig === sig) return ocHitsCache.value;
+            const out = [];
+            try {
+              for (const line of fs.readFileSync(logPath, 'utf8').split('\n')) {
+                if (!/level=ERROR/i.test(line) || !OPENCODE_LIMIT_RE.test(line)) continue;
+                const m = line.match(/timestamp=(\S+)/); const t = m ? Date.parse(m[1]) : NaN;
+                if (Number.isFinite(t)) out.push(t);
+              }
+            } catch {}
+            out.sort((a, b) => a - b);
+            ocHitsCache = { sig, value: out };
+            return out;
+          }
+          function openCodeEstimate(events, rateLimited, now = Date.now()) {
+            if (!Array.isArray(events) || !events.length) return null;
+            const countIn = (from, to) => { let n = 0, tok = 0; for (const [t, k] of events) if (t >= from && t < to) { n++; tok += k; } return { n, tok }; };
+            const samples = [];
+            let prev = 0;
+            for (const h of openCodeLimitHits()) {
+              if (h - prev > OC_EST_WINDOW_MS) { const c = countIn(h - OC_EST_WINDOW_MS, h); if (c.n >= 5) samples.push(c.n); }
+              prev = h;
+            }
+            const cur = countIn(now - OC_EST_WINDOW_MS, now + 1);
+            if (!samples.length) return { estimated: true, windowHours: OC_EST_WINDOW_MS / 3600000, used: cur.n, tokens: cur.tok, limit: null, percent: rateLimited && cur.n > 0 ? 100 : null, samples: 0 };
+            samples.sort((a, b) => a - b);
+            const limit = samples[Math.floor(samples.length / 2)];
+            const percent = (rateLimited && cur.n > 0) ? 100 : Math.min(100, Math.round((cur.n / limit) * 100));
+            const oldest = events.filter(([t]) => t >= now - OC_EST_WINDOW_MS).reduce((a, [t]) => Math.min(a, t), Infinity);
+            return { estimated: true, windowHours: OC_EST_WINDOW_MS / 3600000, used: cur.n, tokens: cur.tok, limit, percent, samples: samples.length,
+              freesAt: Number.isFinite(oldest) && cur.n > 0 ? new Date(oldest + OC_EST_WINDOW_MS).toISOString() : null };
+          }
+
+          function openCodeSummary(ocDb, ocMonth, installed) {
+            const logLim = openCodeLogLimit();
+            const candidates = [openCodeLastLimit, logLim].filter((x) => x && x.at);
+            candidates.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+            const lim = candidates[0] || null;
+            const lastOkAt = Math.max(openCodeLastOkAt, ocDb.lastOkAt || 0);
+            const limMs = lim && lim.at ? Date.parse(lim.at) : NaN;
+            const rateLimited = Boolean(lim && Number.isFinite(limMs) && limMs >= lastOkAt && (Date.now() - limMs) < 24 * 3600000);
+            const hasPaid = Boolean(ocDb.hasPaid || (ocMonth && ocMonth.costUsd > 0));
+            return {
+              installed,
+              plan: hasPaid ? 'paid' : 'free',
+              planLabel: hasPaid ? 'Pago / API' : 'Gratuito',
+              hasAccount: Boolean(ocDb.hasAccount),
+              status: rateLimited ? 'limit_reached' : 'ok',
+              rateLimited,
+              error: rateLimited ? ('Limite gratuito do OpenCode atingido' + (lim.model ? ' (' + lim.model + ')' : '') + ' — aguarde renovação ou use outro provedor') : null,
+              limitHitAt: rateLimited ? lim.at : null,
+              lastActivityAt: lastOkAt ? new Date(lastOkAt).toISOString() : null,
+              fetchedAt: new Date().toISOString(),
+              month: ocMonth,
+              estimate: openCodeEstimate(ocDb.events, rateLimited),
+            };
           }
 
           // Claude Code transcripts, parsed once per file version (size + mtime).
@@ -6729,29 +7500,233 @@ services:
           }
 
           async function usageReport(nDays = 56) {
-            const [claude, antigravity] = await Promise.all([claudeLimits(), agyLimits()]);
+            const [claude, antigravity, copilotLim, ocInstalled] = await Promise.all([
+              claudeLimits(),
+              agyLimits(),
+              copilotLimits(),
+              isCliBinInstalled(OPENCODE_BIN, 'oc'),
+            ]);
             const tdays = claudeTranscriptDays();
+            const cpDb = copilotDbHistory();
+            const ocDb = openCodeDbHistory();
             const log = {};
+            const firstByProvider = {};
             try {
               for (const line of fs.readFileSync(USAGE_FILE, 'utf8').split('\n')) {
                 if (!line) continue; let j; try { j = JSON.parse(line); } catch { continue; }
-                const d = ((log[dayKey(j.at)] ||= {})[j.provider] ||= { runs: 0, cost: 0, ms: 0, in: 0, out: 0, cacheRead: 0 });
+                if (!j.at || !j.provider) continue;
+                if (!firstByProvider[j.provider]) firstByProvider[j.provider] = j.at;
+                const d = ((log[dayKey(j.at)] ||= {})[j.provider] ||= { runs: 0, cost: 0, ms: 0, in: 0, out: 0, cacheRead: 0, aiu: 0, premiumRequests: 0, models: new Set() });
                 const lineCost = (j.provider === 'antigravity' && !(Number(j.cost) > 0))
                   ? estimateAgyCost(j.model, { input_tokens: j.in, output_tokens: j.out, cache_read_tokens: j.cacheRead })
                   : (Number(j.cost) || 0);
                 d.runs += 1; d.cost += lineCost; d.ms += j.ms || 0; d.in += j.in || 0; d.out += j.out || 0; d.cacheRead += j.cacheRead || 0;
+                d.aiu += Number(j.aiu) || 0; d.premiumRequests += Number(j.premiumRequests) || 0;
+                if (j.model) d.models.add(String(j.model));
               }
             } catch {}
+            const knownProviders = Object.keys(PROVIDERS);
+            const emptyStats = () => ({
+              tokens: 0, cacheRead: 0, totalTokens: 0, runs: 0, cost: 0, msgs: 0, credits: 0,
+              telemetry: { runs: false, tokens: false, cost: false, credits: false },
+              costEstimated: false,
+            });
+            const providerStats = () => Object.fromEntries(knownProviders.map((id) => [id, emptyStats()]));
             const days = [];
+            const providers = providerStats();
             for (let i = nDays - 1; i >= 0; i--) {
               const date = dayKey(Date.now() - i * 86400000);
-              const tc = tdays[date], lc = log[date]?.claude, la = log[date]?.antigravity, lcp = log[date]?.copilot;
+              const tc = tdays[date], lc = log[date]?.claude, la = log[date]?.antigravity, lcp = log[date]?.copilot, loc = log[date]?.opencode;
+              const cpDay = cpDb.days[date];
+              const ocDay = ocDb.days[date];
+              const dayProviders = providerStats();
+              for (const [id, stats] of Object.entries(log[date] || {})) {
+                if (!dayProviders[id]) dayProviders[id] = emptyStats();
+                dayProviders[id].tokens = (stats.in || 0) + (stats.out || 0);
+                dayProviders[id].cacheRead = stats.cacheRead || 0;
+                dayProviders[id].totalTokens = dayProviders[id].tokens + dayProviders[id].cacheRead;
+                dayProviders[id].runs = stats.runs || 0;
+                dayProviders[id].cost = Math.round((stats.cost || 0) * 1000000) / 1000000;
+                dayProviders[id].credits = Math.round((stats.aiu || 0) * 100) / 100;
+                dayProviders[id].telemetry.runs = true;
+                dayProviders[id].telemetry.tokens = (stats.in || 0) > 0 || (stats.out || 0) > 0 || (stats.cacheRead || 0) > 0;
+                dayProviders[id].telemetry.cost = id === 'claude' || id === 'antigravity' || id === 'opencode';
+                dayProviders[id].telemetry.credits = (stats.aiu || 0) > 0;
+                dayProviders[id].costEstimated = id === 'antigravity';
+              }
+              if (tc) {
+                dayProviders.claude.tokens = Math.max(dayProviders.claude.tokens, tc.in + tc.out);
+                dayProviders.claude.cacheRead = Math.max(dayProviders.claude.cacheRead, tc.cacheRead || 0);
+                dayProviders.claude.totalTokens = dayProviders.claude.tokens + dayProviders.claude.cacheRead;
+                dayProviders.claude.msgs = tc.msgs || 0;
+                dayProviders.claude.telemetry.tokens = true;
+                dayProviders.claude.telemetry.runs = dayProviders.claude.runs > 0 || tc.msgs > 0;
+              }
+              if (lc) {
+                dayProviders.claude.runs = lc.runs || dayProviders.claude.runs;
+                dayProviders.claude.cost = Math.round((lc.cost || dayProviders.claude.cost) * 1000000) / 1000000;
+                dayProviders.claude.telemetry.runs = true;
+                dayProviders.claude.telemetry.cost = true;
+              }
+              if (cpDay || lcp) {
+                const tok = Math.max(lcp ? lcp.in + lcp.out : 0, cpDay ? cpDay.in + cpDay.out : 0);
+                const cr = Math.max(lcp?.cacheRead || 0, cpDay?.cacheRead || 0);
+                const tot = Math.max(tok + cr, cpDay?.totalTokens || 0);
+                const runs = Math.max(lcp?.runs || 0, cpDay ? Math.round(cpDay.requests) : 0);
+                const msgs = cpDay?.calls || 0;
+                const credits = Math.round(Math.max(lcp?.aiu || 0, cpDay?.aiu || 0) * 100) / 100;
+                dayProviders.copilot.tokens = tok;
+                dayProviders.copilot.cacheRead = cr;
+                dayProviders.copilot.totalTokens = tot;
+                dayProviders.copilot.runs = runs;
+                dayProviders.copilot.msgs = msgs;
+                dayProviders.copilot.credits = credits;
+                dayProviders.copilot.cost = 0;
+                dayProviders.copilot.telemetry.runs = Boolean(runs > 0 || msgs > 0);
+                dayProviders.copilot.telemetry.tokens = Boolean(tok > 0 || cr > 0);
+                dayProviders.copilot.telemetry.cost = false;
+                dayProviders.copilot.telemetry.credits = Boolean(credits > 0);
+              }
+              if (ocDay || loc) {
+                const tok = Math.max(loc ? loc.in + loc.out : 0, ocDay ? ocDay.in + ocDay.out : 0);
+                const cr = Math.max(loc?.cacheRead || 0, ocDay?.cacheRead || 0);
+                const tot = Math.max(tok + cr, ocDay?.totalTokens || 0);
+                const runs = Math.max(loc?.runs || 0, ocDay?.sessionsCount || 0);
+                const msgs = ocDay?.msgs || 0;
+                const cost = Math.round(Math.max(loc?.cost || 0, ocDay?.cost || 0) * 1000000) / 1000000;
+                dayProviders.opencode.tokens = tok;
+                dayProviders.opencode.cacheRead = cr;
+                dayProviders.opencode.totalTokens = tot;
+                dayProviders.opencode.runs = runs;
+                dayProviders.opencode.msgs = msgs;
+                dayProviders.opencode.cost = cost;
+                dayProviders.opencode.telemetry.runs = Boolean(runs > 0 || msgs > 0);
+                dayProviders.opencode.telemetry.tokens = Boolean(tok > 0 || cr > 0);
+                dayProviders.opencode.telemetry.cost = Boolean(runs > 0 || msgs > 0 || cost > 0);
+              }
+              for (const [id, ds] of Object.entries(dayProviders)) {
+                const ps = providers[id] ||= emptyStats();
+                ps.tokens += ds.tokens;
+                ps.cacheRead += ds.cacheRead || 0;
+                ps.totalTokens += ds.totalTokens || 0;
+                ps.runs += ds.runs;
+                ps.cost = Math.round((ps.cost + ds.cost) * 1000000) / 1000000;
+                ps.msgs += ds.msgs || 0;
+                ps.credits = Math.round((ps.credits + (ds.credits || 0)) * 100) / 100;
+                ps.telemetry.runs ||= ds.telemetry.runs;
+                ps.telemetry.tokens ||= ds.telemetry.tokens;
+                ps.telemetry.cost ||= ds.telemetry.cost;
+                ps.telemetry.credits ||= Boolean(ds.telemetry.credits);
+                ps.costEstimated ||= ds.costEstimated;
+                ds.telemetry.available = Boolean(ds.telemetry.runs || ds.telemetry.tokens || ds.telemetry.cost || ds.telemetry.credits);
+              }
               days.push({ date,
                 claude: { tokens: tc ? tc.in + tc.out : (lc ? lc.in + lc.out : 0), out: tc?.out || lc?.out || 0, cacheRead: tc?.cacheRead || lc?.cacheRead || 0, msgs: tc?.msgs || 0, runs: lc?.runs || 0, cost: lc?.cost || 0 },
                 antigravity: { tokens: la ? la.in + la.out : 0, out: la?.out || 0, cacheRead: la?.cacheRead || 0, runs: la?.runs || 0, cost: Math.round((la?.cost || 0) * 1000000) / 1000000 },
-                copilot: { tokens: lcp ? lcp.in + lcp.out : 0, out: lcp?.out || 0, cacheRead: lcp?.cacheRead || 0, runs: lcp?.runs || 0 } });
+                copilot: {
+                  tokens: dayProviders.copilot.tokens,
+                  out: Math.max(lcp?.out || 0, cpDay?.out || 0),
+                  cacheRead: dayProviders.copilot.cacheRead,
+                  totalTokens: dayProviders.copilot.totalTokens,
+                  runs: dayProviders.copilot.runs,
+                  msgs: dayProviders.copilot.msgs,
+                  credits: dayProviders.copilot.credits,
+                },
+                opencode: {
+                  tokens: dayProviders.opencode.tokens,
+                  out: Math.max(loc?.out || 0, ocDay?.out || 0),
+                  cacheRead: dayProviders.opencode.cacheRead,
+                  totalTokens: dayProviders.opencode.totalTokens,
+                  runs: dayProviders.opencode.runs,
+                  msgs: dayProviders.opencode.msgs,
+                  cost: dayProviders.opencode.cost,
+                },
+                providers: dayProviders });
             }
-            return { fetchedAt: new Date().toISOString(), claude, antigravity, days, tz: TZ, spending: monthlySpendSummary(), routineForecasts: routineForecasts(), historySince: { antigravity: fs.existsSync(USAGE_FILE) ? (fs.readFileSync(USAGE_FILE, 'utf8').slice(0, 40).match(/"at":"([^"]+)/) || [])[1] || null : null } };
+            for (const id of Object.keys(providers)) {
+              if (!providers[id].telemetry.runs && !providers[id].telemetry.tokens && !providers[id].telemetry.cost && !providers[id].telemetry.credits) {
+                providers[id].telemetry = { ...providers[id].telemetry, available: false };
+              } else {
+                providers[id].telemetry.available = true;
+              }
+            }
+            const ym = dayKey(Date.now()).slice(0, 7);
+            const cpDbMonth = cpDb.monthByYm[ym];
+            const cpMonthDates = new Set([...Object.keys(cpDb.days), ...Object.keys(log)].filter((dk) => dk.startsWith(ym)));
+            const cpMonthModels = new Set(cpDbMonth ? cpDbMonth.models : []);
+            let cpMonthTok = 0, cpMonthCr = 0, cpMonthTot = 0, cpMonthCredits = 0, cpMonthReq = 0, cpMonthCalls = 0;
+            for (const dk of cpMonthDates) {
+              const dbd = cpDb.days[dk], ld = log[dk]?.copilot;
+              if (!dbd && !ld) continue;
+              const tok = Math.max(ld ? ld.in + ld.out : 0, dbd ? dbd.in + dbd.out : 0);
+              const cr = Math.max(ld?.cacheRead || 0, dbd?.cacheRead || 0);
+              cpMonthTok += tok;
+              cpMonthCr += cr;
+              cpMonthTot += Math.max(tok + cr, dbd?.totalTokens || 0);
+              cpMonthCredits += Math.max(ld?.aiu || 0, dbd?.aiu || 0);
+              cpMonthReq += Math.max(ld?.runs || 0, dbd?.requests || 0);
+              cpMonthCalls += Math.max(ld?.runs || 0, dbd?.calls || 0);
+              if (ld && ld.models) for (const m of ld.models) if (m && m !== 'auto') cpMonthModels.add(m);
+            }
+            const cpMonth = {
+              tokens: cpMonthTok,
+              cacheRead: cpMonthCr,
+              totalTokens: cpMonthTot,
+              credits: Math.round(cpMonthCredits * 100) / 100,
+              requests: Math.round(cpMonthReq * 10) / 10,
+              calls: cpMonthCalls,
+              sessions: cpDbMonth ? cpDbMonth.sessionsCount : 0,
+              models: [...cpMonthModels].sort(),
+            };
+
+            const ocDbMonth = ocDb.monthByYm[ym];
+            const ocMonthDates = new Set([...Object.keys(ocDb.days), ...Object.keys(log)].filter((dk) => dk.startsWith(ym)));
+            const ocMonthModels = new Set(ocDbMonth ? ocDbMonth.models : []);
+            let ocMonthTok = 0, ocMonthCr = 0, ocMonthTot = 0, ocMonthCost = 0, ocMonthMsgs = 0, ocMonthRuns = 0;
+            for (const dk of ocMonthDates) {
+              const dbd = ocDb.days[dk], ld = log[dk]?.opencode;
+              if (!dbd && !ld) continue;
+              const tok = Math.max(ld ? ld.in + ld.out : 0, dbd ? dbd.in + dbd.out : 0);
+              const cr = Math.max(ld?.cacheRead || 0, dbd?.cacheRead || 0);
+              ocMonthTok += tok;
+              ocMonthCr += cr;
+              ocMonthTot += Math.max(tok + cr, dbd?.totalTokens || 0);
+              ocMonthCost += Math.max(ld?.cost || 0, dbd?.cost || 0);
+              ocMonthMsgs += Math.max(ld?.runs || 0, dbd?.msgs || 0);
+              ocMonthRuns += Math.max(ld?.runs || 0, dbd?.sessionsCount || 0);
+              if (ld && ld.models) for (const m of ld.models) if (m) ocMonthModels.add(String(m).replace(/^opencode\//, ''));
+            }
+            const ocMonth = {
+              tokens: ocMonthTok,
+              cacheRead: ocMonthCr,
+              totalTokens: ocMonthTot,
+              costUsd: Math.round(ocMonthCost * 1000000) / 1000000,
+              messages: ocMonthMsgs,
+              runs: ocMonthRuns,
+              sessions: ocDbMonth ? ocDbMonth.sessionsCount : ocMonthRuns,
+              models: [...ocMonthModels].sort(),
+            };
+
+            const copilot = { ...copilotLim, month: cpMonth };
+            const opencode = openCodeSummary(ocDb, ocMonth, ocInstalled);
+            const agySince = fs.existsSync(USAGE_FILE) ? (fs.readFileSync(USAGE_FILE, 'utf8').slice(0, 40).match(/"at":"([^"]+)/) || [])[1] || null : null;
+            return {
+              fetchedAt: new Date().toISOString(),
+              claude,
+              antigravity,
+              copilot,
+              opencode,
+              providers,
+              days,
+              tz: TZ,
+              spending: monthlySpendSummary(),
+              routineForecasts: routineForecasts(),
+              historySince: {
+                antigravity: agySince,
+                copilot: cpDb.since || firstByProvider.copilot || null,
+                opencode: ocDb.since || firstByProvider.opencode || null,
+              },
+            };
           }
 
           // ---------- memory explorer: ai-memory wiki pages + Claude Code's own memory files ----------
@@ -7055,7 +8030,7 @@ services:
               id, kind: isWeb(id) ? 'web' : isDeleg(id) ? 'delegation' : 'whatsapp', members: Array.isArray(c.members) ? c.members : [], title: c.title || (isWeb(id) ? 'Conversa web' : id.split('@')[0]),
               provider: providerOf(c), providerSet: Boolean(c.provider), bot: botOf(c).id, effModel: runConfig(c).model || '', effEffort: runConfig(c).effort || '',
               model: c.model || '', effort: c.effort || '', agyModel: c.agyModel || '', agyEffort: c.agyEffort || '',
-              session: c.session || '', agySession: c.agySession || '', ocSession: c.ocSession || '', cpSession: c.cpSession || '', created: c.created || '', readAt: c.readAt || '', unread,
+              session: c.session || '', agySession: c.agySession || '', ocSession: c.ocSession || '', olSession: c.olSession || '', cpSession: c.cpSession || '', created: c.created || '', readAt: c.readAt || '', unread,
               pinned: Boolean(c.pinned), archived: Boolean(c.archived),
               totals: c.totals || { runs: 0, cost: 0, ms: 0, errors: 0 }, runs: c.runs || [], lastUsage: c.lastUsage || null,
               running: r ? { started: r.started, prompt: r.prompt } : null,
@@ -7512,6 +8487,7 @@ services:
                 const sl = slConfig();
                 return send(200, { version: VERSION, tz: TZ, permissionMode: PERMISSION_MODE, workdir: WORKDIR, uptime: Math.round(process.uptime()),
                   storage: { engine: storageEngine, pendingJobs: listPendingJobs().length },
+                  disk: diskInfo(),
                   aiMemory: { status: aiMemory.status, restarts: aiMemory.restarts }, allowed: ALLOWED.length,
                   settings: safeSettingsView(),
                   running: [...running.entries()].map(([id, r]) => ({ chatId: id, started: r.started, prompt: r.prompt, bot: r.bot || (chats[id] && chats[id].bot) || DEFAULT_BOT })),
@@ -7734,6 +8710,7 @@ services:
                 const c = chats[b];
                 if ('provider' in body) { if (body.provider && !PROVIDERS[body.provider]) throw new Error('provedor inválido'); if (body.provider) c.provider = body.provider; else delete c.provider; }
                 for (const k of ['model', 'effort', 'agyModel', 'agyEffort', 'title']) if (k in body) { if (body[k]) c[k] = String(body[k]); else delete c[k]; }
+                if ('title' in body) { delete c.titleAuto; if (body.title) c.titleManual = true; else { delete c.titleManual; delete c.titleGenerated; } } // manual edit is never overwritten
                 if (c.effort && !EFFORTS.includes(c.effort)) { delete c.effort; throw new Error('esforço inválido'); }
                 if ('members' in body) {
                   if (Array.isArray(body.members) && body.members.length) c.members = body.members.filter((x) => bots[x]).slice(0, 20); else delete c.members;
@@ -7741,13 +8718,13 @@ services:
                 if ('bot' in body) {
                   const nb = body.bot ? bots[body.bot] : bots[DEFAULT_BOT];
                   if (!nb) throw new Error('bot desconhecido');
-                  if (nb.id !== botOf(c).id) { delete c.session; delete c.agySession; delete c.ocSession; audit({ action: 'chat-bot', chatId: b, bot: nb.id, via: 'panel' }); }
+                  if (nb.id !== botOf(c).id) { delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; audit({ action: 'chat-bot', chatId: b, bot: nb.id, via: 'panel' }); }
                   if (nb.id === DEFAULT_BOT) delete c.bot; else c.bot = nb.id;
                 }
                 if ('pinned' in body) { if (body.pinned) c.pinned = true; else delete c.pinned; }
                 if ('archived' in body) { if (body.archived) c.archived = true; else delete c.archived; }
                 if (body.read) c.readAt = new Date().toISOString();
-                if (body.reset) { delete c.session; delete c.agySession; delete c.ocSession; delete c.cpSession; }
+                if (body.reset) { delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; delete c.cpSession; delete c.olSession; }
                 save();
                 return send(200, chatView(b));
               }
@@ -7928,7 +8905,7 @@ services:
                 if (!c2 && m === 'DELETE') {
                   if (bt.id === DEFAULT_BOT) throw new Error('o bot padrão não pode ser apagado');
                   delete bots[bt.id]; saveBots();
-                  for (const c of Object.values(chats)) if (c.bot === bt.id) { delete c.bot; delete c.session; delete c.agySession; delete c.ocSession; }
+                  for (const c of Object.values(chats)) if (c.bot === bt.id) { delete c.bot; delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; }
                   save();
                   for (const r of schedules) if (r.bot === bt.id) delete r.bot;
                   saveSched();
@@ -8202,6 +9179,7 @@ services:
             if (req.method === 'GET' && req.url === '/health') {
               res.writeHead(200, { 'Content-Type': 'application/json' });
               return res.end(JSON.stringify({ ok: true, version: VERSION, allowed: ALLOWED.length, running: running.size,
+                disk: diskInfo(),
                 aiMemory: { status: aiMemory.status, restarts: aiMemory.restarts, supervised: Boolean(aiMemory.child) } }));
             }
             const bufs = [];
@@ -8488,6 +9466,15 @@ services:
                   res.writeHead(500); return res.end('erro: ' + e.message);
                 }
               }
+              if (req.method === 'POST' && req.url === '/send-voice') {
+                if (!isLocal(req)) { res.writeHead(403); return res.end(); }
+                try {
+                  const out = await sendVoice(JSON.parse(raw.toString('utf8') || '{}'));
+                  res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(out));
+                } catch (e) {
+                  res.writeHead(400); return res.end('erro: ' + e.message);
+                }
+              }
               if (req.method !== 'POST' || !req.url.startsWith('/webhook')) { res.writeHead(404); return res.end(); }
               if (WEBHOOK_HMAC_KEY) {
                 const got = String(req.headers['x-webhook-hmac'] || '');
@@ -8509,6 +9496,7 @@ services:
 
           // Tell each allowed number that the service is up. Retries, because WAHA may not be ready right after boot.
           async function notifyStartup() {
+            if (!String(env.WAHA_URL || '').trim() || !ALLOWED.length) { log('startup notice skipped (WAHA_URL/ALLOWED_NUMBERS unset)'); return; }
             if (settings.startupNotify === false) { log('startup notice skipped (startupNotify=false)'); return; }
             if (inQuietHours()) { log('startup notice suppressed (quiet hours active)'); return; }
             // Natural, varied wording. Only sent to ALLOWED_NUMBERS, never to anyone else.
