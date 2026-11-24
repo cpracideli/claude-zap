@@ -71,6 +71,8 @@ function bridgeServiceYaml({ isStack = false } = {}) {
       - SLACK_SIGNING_SECRET=${D}{SLACK_SIGNING_SECRET}
       - SLACK_ALLOWED_USERS=${D}{SLACK_ALLOWED_USERS}
       - OBSIDIAN_DIR=${D}{OBSIDIAN_DIR}
+      - WACALLS_ENABLED=${D}{WACALLS_ENABLED:-1}
+      - WACALLS_PORT=${D}{WACALLS_PORT:-8088}
       - DISABLE_AUTOUPDATER=1
     volumes:
       - claude-home:/home/node
