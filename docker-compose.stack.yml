@@ -819,6 +819,9 @@ services:
                 ? '  "to" aceita o número em qualquer formato (com DDI; sem DDI assuma 55) ou um id do WhatsApp (...@c.us, grupo ...@g.us). Para arquivo a terceiros, use /send-file com "to" no lugar de "chatId". Envie a outras pessoas SÓ quando o usuário pedir (na conversa ou num agendamento que ele criou), escreva a mensagem como se fosse do usuário (sem dizer que é uma IA, a menos que ele peça) e confirme depois o que foi enviado e para quem. Respostas dessas pessoas NÃO chegam até você.'
                 : '',
               canThirdParty
+                ? 'LIGAÇÃO COM IA: para ligar (voz real no WhatsApp, conversa via Gemini Live) use curl -s -X POST http://127.0.0.1:' + PORT + '/calls/ai -H "Content-Type: application/json" -d \'{"to":"5511984691018","purpose":"motivo da ligação e o que falar","chatId":"' + chatId + '","bot":"' + (bot || botOf(chats[chatId])).id + '"}\' (opcionais: "voice", "maxMinutes", "wait"). Ligar para terceiros SÓ com pedido explícito do usuário (mesma regra do /send); para o próprio usuário é sempre permitido — inclusive em agendamentos (ex.: "me ligue amanhã às 8h para lembrar X"). Listar: curl -s http://127.0.0.1:' + PORT + '/calls/ai   Encerrar: curl -s -X DELETE http://127.0.0.1:' + PORT + '/calls/ai/ID'
+                : 'LIGAÇÃO COM IA (somente para o próprio usuário no número compartilhado): curl -s -X POST http://127.0.0.1:' + PORT + '/calls/ai -H "Content-Type: application/json" -d \'{"to":"<numero_do_usuario>","purpose":"motivo da ligação e o que falar","chatId":"' + chatId + '"}\' (ligações para terceiros estão bloqueadas).',
+              canThirdParty
                 ? 'RASCUNHOS ASSISTIDOS (Drafts — enviar depois ou revisar antes de mandar): para preparar uma mensagem de WhatsApp ou e-mail para o usuário revisar/agendar em vez de enviar na hora: curl -s -X POST http://127.0.0.1:' + PORT + '/drafts -H "Content-Type: application/json" -d \'{"channel":"whatsapp","to":"5511999998888","body":"texto","scheduledAt":""}\' (channel: whatsapp ou email; email aceita subject).'
                 : 'RASCUNHOS ASSISTIDOS (Drafts): curl -s -X POST http://127.0.0.1:' + PORT + '/drafts -H "Content-Type: application/json" -d \'{"channel":"email","to":"destino@exemplo.com","subject":"assunto","body":"texto","scheduledAt":""}\' (rascunhos de WhatsApp para terceiros estão bloqueados no número compartilhado).',
               isClaude
@@ -2973,7 +2976,7 @@ services:
             // Auto-Executor (Board Runner): periodically picks next 'todo' ticket
             try { boardRunnerTick(false); } catch (e) { log('boardRunnerTick error', e.message); }
           }
-          setInterval(tick, Number(env.SCHEDULER_TICK_MS || 15000));
+          if (env.BRIDGE_IMPORT_ONLY !== '1') setInterval(tick, Number(env.SCHEDULER_TICK_MS || 15000));
 
           // Public webhook trigger: POST /hooks/<id>/<token>. The panel forwards it from the internet.
           async function handleHook(req, res, u, raw) {
@@ -9456,6 +9459,1142 @@ services:
             socket.on('close', close);
           }
 
+          // ---------- AI WhatsApp Voice Calls (WaCalls 16k PCM <-> Gemini Live) ----------
+          const AI_CALL_DEFAULT_MAX_MINUTES = Math.max(1, Number(env.AI_CALL_MAX_MINUTES || 10));
+          const AI_CALL_NO_ANSWER_MS = Math.max(1000, Number(env.AI_CALL_NO_ANSWER_MS || 45000));
+          const AI_CALL_FRAME_MS = Math.max(10, Number(env.AI_CALL_FRAME_MS || 20));
+          const AI_CALL_END_DRAIN_MS = Math.max(200, Number(env.AI_CALL_END_DRAIN_MS || 5000));
+          const AI_CALL_GREET_DELAY_MS = Math.max(0, Number(env.AI_CALL_GREET_DELAY_MS || 350));
+          const AI_CALL_MAX_HISTORY = 50;
+          const aiCalls = new Map();
+
+          function parsePcmSampleRate(mimeType, fallback = 24000) {
+            const m = String(mimeType || '').match(/rate\s*=\s*(\d+)/i);
+            if (m) {
+              const n = Number(m[1]);
+              if (n >= 8000 && n <= 96000) return n;
+            }
+            return fallback;
+          }
+
+          // Stateful Int16 LE mono PCM resampler (box/area averaging for clean 24k -> 16k downsampling without chunk-boundary clicks).
+          function createPcmResampler(inRate = 24000, outRate = 16000) {
+            const srcRate = Math.max(1000, Number(inRate) || 24000);
+            const dstRate = Math.max(1000, Number(outRate) || 16000);
+            const ratio = srcRate / dstRate;
+            let carry = new Int16Array(0);
+            let pos = 0;
+            let oddByte = null;
+
+            function reset() {
+              carry = new Int16Array(0);
+              pos = 0;
+              oddByte = null;
+            }
+
+            function push(chunkBuf) {
+              if (!chunkBuf || !chunkBuf.length) return Buffer.alloc(0);
+              let buf = Buffer.isBuffer(chunkBuf) ? chunkBuf : Buffer.from(chunkBuf);
+              if (oddByte !== null) {
+                buf = Buffer.concat([Buffer.from([oddByte]), buf]);
+                oddByte = null;
+              }
+              if (buf.length % 2 === 1) {
+                oddByte = buf[buf.length - 1];
+                buf = buf.subarray(0, buf.length - 1);
+              }
+              if (!buf.length) return Buffer.alloc(0);
+              if (srcRate === dstRate) return Buffer.from(buf);
+
+              const nNew = buf.length >> 1;
+              const total = carry.length + nNew;
+              const samples = new Int16Array(total);
+              if (carry.length) samples.set(carry, 0);
+              for (let i = 0; i < nNew; i++) samples[carry.length + i] = buf.readInt16LE(i * 2);
+
+              const outSamples = [];
+              if (ratio >= 1) {
+                while (pos + ratio <= total) {
+                  const start = pos;
+                  const end = pos + ratio;
+                  const i0 = Math.floor(start);
+                  const i1 = Math.floor(end);
+                  let acc = 0;
+                  if (i0 === i1) {
+                    acc = samples[i0] * (end - start);
+                  } else {
+                    acc += samples[i0] * (1 - (start - i0));
+                    for (let j = i0 + 1; j < i1; j++) acc += samples[j];
+                    if (end > i1 && i1 < total) acc += samples[i1] * (end - i1);
+                  }
+                  const val = Math.round(acc / ratio);
+                  outSamples.push(val < -32768 ? -32768 : val > 32767 ? 32767 : val);
+                  pos = end;
+                }
+              } else {
+                while (pos < total - 1) {
+                  const i0 = Math.floor(pos);
+                  const f = pos - i0;
+                  const val = Math.round(samples[i0] * (1 - f) + samples[i0 + 1] * f);
+                  outSamples.push(val < -32768 ? -32768 : val > 32767 ? 32767 : val);
+                  pos += ratio;
+                }
+              }
+              const drop = Math.floor(pos);
+              carry = drop < total ? samples.slice(drop) : new Int16Array(0);
+              pos -= drop;
+
+              const out = Buffer.alloc(outSamples.length * 2);
+              for (let i = 0; i < outSamples.length; i++) out.writeInt16LE(outSamples[i], i * 2);
+              return out;
+            }
+
+            return { push, reset, inRate: srcRate, outRate: dstRate };
+          }
+
+          // Real-time PCM frame pacer: drains queued 16kHz Int16 LE PCM at exact 1x rate (e.g., 640B every 20ms)
+          // so WaCalls CallManager does not burst SRTP packets, with instant clear() for barge-in.
+          function createPcmPacer(opts) {
+            opts = opts || {};
+            const frameMs = Math.max(10, Number(opts.frameMs || AI_CALL_FRAME_MS));
+            const sampleRate = Math.max(8000, Number(opts.sampleRate || 16000));
+            const frameBytes = Math.round((sampleRate * frameMs) / 1000) * 2;
+            const maxQueueMs = Math.max(frameMs * 10, Number(opts.maxQueueMs || 60000));
+            const maxQueueBytes = Math.round((sampleRate * maxQueueMs) / 1000) * 2;
+            const onFrame = typeof opts.onFrame === 'function' ? opts.onFrame : () => {};
+            const onDrain = typeof opts.onDrain === 'function' ? opts.onDrain : () => {};
+
+            let queue = [];
+            let queuedBytes = 0;
+            let timer = null;
+            let nextDueAt = 0;
+            let stopped = false;
+            let sentFrames = 0;
+            let drainWaiters = [];
+
+            function notifyDrained() {
+              if (queuedBytes >= frameBytes || timer) return;
+              const list = drainWaiters;
+              drainWaiters = [];
+              for (const fn of list) { try { fn(); } catch {} }
+              try { onDrain(); } catch {}
+            }
+
+            function takeBytes(n) {
+              if (queuedBytes < n) return null;
+              const out = Buffer.allocUnsafe(n);
+              let offset = 0;
+              while (offset < n && queue.length) {
+                const head = queue[0];
+                const need = n - offset;
+                if (head.length <= need) {
+                  head.copy(out, offset);
+                  offset += head.length;
+                  queue.shift();
+                } else {
+                  head.copy(out, offset, 0, need);
+                  queue[0] = head.subarray(need);
+                  offset += need;
+                }
+              }
+              queuedBytes -= n;
+              return out;
+            }
+
+            function dropOldest(excessBytes) {
+              let left = Math.min(excessBytes, queuedBytes);
+              while (left > 0 && queue.length) {
+                const head = queue[0];
+                if (head.length <= left) {
+                  left -= head.length;
+                  queuedBytes -= head.length;
+                  queue.shift();
+                } else {
+                  queue[0] = head.subarray(left);
+                  queuedBytes -= left;
+                  left = 0;
+                }
+              }
+            }
+
+            function tick() {
+              timer = null;
+              if (stopped) return;
+              if (queuedBytes < frameBytes) {
+                notifyDrained();
+                return;
+              }
+              const frame = takeBytes(frameBytes);
+              if (frame) {
+                sentFrames += 1;
+                try { onFrame(frame); } catch {}
+              }
+              if (stopped) return;
+              if (queuedBytes >= frameBytes) {
+                const now = Date.now();
+                nextDueAt += frameMs;
+                if (nextDueAt < now - frameMs * 3) nextDueAt = now + frameMs;
+                timer = setTimeout(tick, Math.max(1, nextDueAt - now));
+              } else {
+                notifyDrained();
+              }
+            }
+
+            function startIfNeeded() {
+              if (stopped || timer || queuedBytes < frameBytes) return;
+              nextDueAt = Date.now();
+              // Send first frame immediately for low latency, then pace subsequent frames.
+              tick();
+            }
+
+            function enqueue(buf) {
+              if (stopped || !buf || !buf.length) return;
+              const b = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+              if (!b.length) return;
+              queue.push(b);
+              queuedBytes += b.length;
+              if (queuedBytes > maxQueueBytes) {
+                const alignedExcess = Math.floor((queuedBytes - maxQueueBytes) / 2) * 2;
+                if (alignedExcess > 0) dropOldest(alignedExcess);
+              }
+              startIfNeeded();
+            }
+
+            function flushPartial() {
+              if (stopped || queuedBytes <= 0) return;
+              const rem = queuedBytes % frameBytes;
+              if (rem === 0) return;
+              const pad = Buffer.alloc(frameBytes - rem);
+              queue.push(pad);
+              queuedBytes += pad.length;
+              startIfNeeded();
+            }
+
+            function clear() {
+              queue = [];
+              queuedBytes = 0;
+              if (timer) {
+                clearTimeout(timer);
+                timer = null;
+              }
+              notifyDrained();
+            }
+
+            function stop() {
+              stopped = true;
+              clear();
+            }
+
+            function queuedMs() {
+              return Math.round((queuedBytes / 2 / sampleRate) * 1000);
+            }
+
+            function waitUntilDrained(timeoutMs = AI_CALL_END_DRAIN_MS) {
+              if (stopped || (queuedBytes < frameBytes && !timer)) return Promise.resolve();
+              return new Promise((resolve) => {
+                let done = false;
+                const finish = () => {
+                  if (done) return;
+                  done = true;
+                  if (t) clearTimeout(t);
+                  resolve();
+                };
+                const t = setTimeout(finish, Math.max(50, Number(timeoutMs) || AI_CALL_END_DRAIN_MS));
+                drainWaiters.push(finish);
+              });
+            }
+
+            return {
+              frameMs,
+              frameBytes,
+              enqueue,
+              flushPartial,
+              clear,
+              stop,
+              queuedMs,
+              waitUntilDrained,
+              stats: () => ({ queuedBytes, queuedMs: queuedMs(), sentFrames, active: Boolean(timer) }),
+            };
+          }
+
+          function normalizeCallPhone(raw) {
+            const s = String(raw || '').trim();
+            if (!s) {
+              const err = new Error('destinatário "to" obrigatório');
+              err.status = 400;
+              throw err;
+            }
+            if (s.endsWith('@g.us') || s.endsWith('@newsletter') || s === 'status@broadcast') {
+              const err = new Error('ligações de voz não são suportadas para grupos ou canais');
+              err.status = 400;
+              throw err;
+            }
+            const base = s.includes('@') ? s.split('@')[0].split(':')[0] : s;
+            let digits = base.replace(/\D/g, '');
+            if (digits.length === 10 || digits.length === 11) digits = '55' + digits;
+            if (digits.length < 10 || digits.length > 15) {
+              const err = new Error('número inválido (use DDI+DDD+número, ex. 5511984691018)');
+              err.status = 400;
+              throw err;
+            }
+            return digits;
+          }
+
+          function buildAiCallSystemPrompt(opts) {
+            const b = opts.bot || bots[DEFAULT_BOT] || { id: DEFAULT_BOT, name: 'Agent', description: '', instructions: '' };
+            const targetLang = String(opts.lang || 'pt-BR').trim() || 'pt-BR';
+            const nowStr = new Date().toLocaleString('pt-BR', { timeZone: TZ });
+            const ownerLabel = OWNER_NAME || 'Caio';
+            const peerLabel = '+' + opts.to;
+            const whoLine = opts.isOwnerCall
+              ? ('Você está ligando para o próprio ' + ownerLabel + ' (' + peerLabel + ').')
+              : ('Você está ligando para ' + peerLabel + ' a pedido de ' + ownerLabel + '.');
+            const lines = [
+              'Você é o assistente de voz em tempo real de ' + ownerLabel + ', fazendo uma LIGAÇÃO DE VOZ REAL pelo WhatsApp.',
+              'Identidade atual: bot "' + b.name + '" (id: ' + b.id + ').' + (b.description ? ' Descrição: ' + b.description : ''),
+              whoLine,
+              'Fuso horário: ' + TZ + '. Data/hora atual: ' + nowStr + '.',
+              'Idioma: ' + targetLang + '. Fale sempre em português do Brasil, de forma natural, calorosa, direta e breve, como numa ligação telefônica real.',
+              'Regras de fala: frases curtas e claras, sem markdown, listas longas, asteriscos, URLs ou códigos ditados. Se a pessoa interromper, pare imediatamente e responda ao que ela disse.',
+              'MOTIVO / CONTEXTO DA LIGAÇÃO (siga fielmente):\n' + String(opts.purpose || '').trim(),
+              'FERRAMENTA ask_agent: use sempre que precisar consultar dados reais (memória, agenda, e-mail, WhatsApp, arquivos, código, servidores/Coolify, outros bots) ou executar alguma ação real durante a ligação. Diga rapidamente "só um instante, vou verificar" e chame ask_agent.',
+              'FERRAMENTA end_call: quando a conversa terminar (objetivo cumprido e despedida feita, ou a pessoa pedir para encerrar), despeça-se brevemente (ex.: "Combinado, tchau!") e chame end_call para desligar a chamada.',
+            ];
+            if (b.instructions) {
+              lines.push('Instruções do bot ativo (adapte para fala curta de ligação):\n' + String(b.instructions).slice(0, 2500));
+            }
+            if (opts.chatId) {
+              const rawList = isWeb(opts.chatId)
+                ? webHistory(opts.chatId).map((m) => ({ role: m.role, bot: m.bot, text: m.text || m.transcript || '' }))
+                : ((chats[opts.chatId] && chats[opts.chatId].recent) || []);
+              const recent = rawList.filter((m) => String(m.text || '').trim()).slice(-8);
+              if (recent.length) {
+                lines.push('Contexto recente da conversa:\n' +
+                  recent.map((m) => {
+                    const speaker = m.role === 'user' ? 'Usuário' : ((m.bot && bots[m.bot] ? bots[m.bot].name : b.name) || 'Assistente');
+                    return speaker + ': ' + String(m.text || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+                  }).join('\n'));
+              }
+            }
+            return lines.join('\n\n');
+          }
+
+          function formatAiCallSummary(rec) {
+            const peerLabel = '+' + rec.to;
+            const lines = [];
+            if (rec.status === 'no_answer') {
+              lines.push('📞 Ligação IA para ' + peerLabel + ' — não atendeu.');
+            } else if (rec.status === 'declined') {
+              lines.push('📞 Ligação IA para ' + peerLabel + ' — recusada.');
+            } else if (rec.status === 'busy') {
+              lines.push('📞 Ligação IA para ' + peerLabel + ' — linha ocupada.');
+            } else if (rec.status === 'error') {
+              lines.push('📞 Ligação IA para ' + peerLabel + ' — erro: ' + (rec.error || rec.endReason || 'falha'));
+            } else if (rec.status === 'cancelled') {
+              lines.push('📞 Ligação IA para ' + peerLabel + ' — cancelada antes de atender.');
+            } else {
+              lines.push('📞 Ligação IA para ' + peerLabel + ' (' + rec.durationSec + 's, encerramento: ' + (rec.endReason || 'concluída') + ').');
+            }
+            if (rec.purpose) lines.push('Motivo: ' + rec.purpose.slice(0, 300));
+            if (Array.isArray(rec.transcript) && rec.transcript.length) {
+              lines.push('Transcrição:');
+              for (const item of rec.transcript) {
+                const who = item.role === 'user' ? 'Pessoa' : 'IA';
+                lines.push('- ' + who + ': ' + item.text);
+              }
+            }
+            return lines.join('\n');
+          }
+
+          function persistAiCallOutcome(rec) {
+            if (!rec || !rec.chatId) return;
+            const summaryText = rec.summary || formatAiCallSummary(rec);
+            try {
+              if (isWeb(rec.chatId)) {
+                chat(rec.chatId);
+                webAppend(rec.chatId, {
+                  role: 'assistant',
+                  provider: 'gemini-live',
+                  bot: rec.bot || DEFAULT_BOT,
+                  noPush: true,
+                  text: summaryText,
+                  meta: {
+                    voiceCall: true,
+                    aiCall: true,
+                    aiCallId: rec.id,
+                    callId: rec.callId || '',
+                    to: rec.to,
+                    status: rec.status,
+                    endReason: rec.endReason || '',
+                    durationSec: rec.durationSec || 0,
+                    model: rec.model || '',
+                    voice: rec.voice || '',
+                  },
+                });
+              } else {
+                remember(rec.chatId, 'assistant', summaryText, rec.bot || DEFAULT_BOT);
+              }
+            } catch (e) {
+              log('ai-call persist failed:', e.message);
+            }
+          }
+
+          function aiCallView(rec) {
+            return {
+              id: rec.id,
+              callId: rec.callId || '',
+              sessionId: rec.sessionId || '',
+              to: rec.to,
+              peer: '+' + rec.to,
+              isOwner: Boolean(rec.isOwner),
+              purpose: rec.purpose,
+              chatId: rec.chatId || '',
+              bot: rec.bot,
+              voice: rec.voice,
+              model: rec.model,
+              status: rec.status,
+              endReason: rec.endReason || '',
+              error: rec.error || '',
+              startedAt: rec.startedAt,
+              connectedAt: rec.connectedAt || '',
+              endedAt: rec.endedAt || '',
+              durationSec: rec.durationSec || 0,
+              turns: rec.turns || 0,
+              stats: rec.stats ? { ...rec.stats } : undefined,
+              transcript: rec.transcript.slice(),
+              summary: rec.summary || '',
+            };
+          }
+
+          function listAiCalls() {
+            return [...aiCalls.values()].reverse().map(aiCallView);
+          }
+
+          function getAiCall(id) {
+            return aiCalls.get(String(id || '').trim()) || null;
+          }
+
+          async function waitAiCall(rec, secs) {
+            const ms = Math.min(Math.max(Number(secs) || 0, 0), 300) * 1000;
+            if (rec && rec.promise && ms && !rec.endedAt) {
+              await Promise.race([rec.promise, new Promise((r) => setTimeout(r, ms))]);
+            }
+            return aiCallView(rec);
+          }
+
+          async function hangupAiCall(id, reason = 'api_ended') {
+            const rec = getAiCall(id);
+            if (!rec) {
+              const err = new Error('ligação IA não encontrada');
+              err.status = 404;
+              throw err;
+            }
+            if (typeof rec._hangup === 'function') {
+              await rec._hangup(reason);
+            }
+            return aiCallView(rec);
+          }
+
+          function hangupAllAiCalls(reason = 'bridge_shutdown') {
+            for (const rec of aiCalls.values()) {
+              if (!rec.endedAt && typeof rec._hangup === 'function') {
+                try { rec._hangup(reason); } catch {}
+              }
+            }
+          }
+
+          async function decodeWsBinaryData(data) {
+            if (!data) return Buffer.alloc(0);
+            if (Buffer.isBuffer(data)) return data;
+            if (data instanceof ArrayBuffer) return Buffer.from(data);
+            if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+            if (typeof data.arrayBuffer === 'function') return Buffer.from(await data.arrayBuffer());
+            return Buffer.alloc(0);
+          }
+
+          async function wacallsDeleteCall(sid, callId, ownerClientId) {
+            if (!sid || !callId) return;
+            try {
+              await fetch(WACALLS_URL + '/api/sessions/' + encodeURIComponent(sid) + '/calls/' + encodeURIComponent(callId), {
+                method: 'DELETE',
+                headers: ownerClientId ? { 'X-Client-Id': ownerClientId } : {},
+                signal: AbortSignal.timeout(4000),
+              });
+            } catch {}
+          }
+
+          async function startAiCall(body, via = 'api') {
+            body = body && typeof body === 'object' ? body : {};
+            const phone = normalizeCallPhone(body.to || body.phone);
+            const purpose = String(body.purpose || body.context || body.message || '').trim().slice(0, 4000);
+            if (!purpose) {
+              const err = new Error('"purpose" (ou "context") obrigatório');
+              err.status = 400;
+              throw err;
+            }
+
+            let resolvedChatId = String(body.chatId || '').trim();
+            if (resolvedChatId && !chats[resolvedChatId] && !resolvedChatId.includes(':') && chats['web:' + resolvedChatId]) {
+              resolvedChatId = 'web:' + resolvedChatId;
+            }
+            if (resolvedChatId && readOnlyRuns.has(resolvedChatId)) {
+              const err = new Error('bloqueado pelo modo proativo somente leitura (read-only)');
+              err.status = 403;
+              throw err;
+            }
+
+            const isOwner = isAllowedPhone(phone);
+            if (!isOwner && !allowThirdPartySend()) {
+              audit({ action: 'ai-call-blocked', to: phone, reason: THIRD_PARTY_BLOCKED_MSG, via });
+              const err = new Error(THIRD_PARTY_BLOCKED_MSG);
+              err.status = 403;
+              throw err;
+            }
+
+            const apiKey = resolveGeminiApiKey();
+            if (!apiKey) {
+              const err = new Error('GEMINI_API_KEY não configurada (configure gemini_api_key no Cofre, GEMINI_API_KEY ou ~/.config/gemini/api_key)');
+              err.status = 503;
+              throw err;
+            }
+
+            let sessRes = await wacallsFetchSessions();
+            if (!sessRes.ok) {
+              await ensureWaCalls().catch(() => {});
+              sessRes = await wacallsFetchSessions();
+            }
+            if (!sessRes.ok) {
+              const err = new Error('WaCalls indisponível em ' + WACALLS_URL);
+              err.status = 503;
+              throw err;
+            }
+            const requestedSid = String(body.sessionId || '').trim();
+            const session = (requestedSid ? sessRes.sessions.find((s) => s && s.id === requestedSid && s.paired) : null)
+              || sessRes.sessions.find((s) => s && s.paired && s.state === 'open')
+              || sessRes.sessions.find((s) => s && s.paired);
+            if (!session) {
+              const err = new Error('Nenhuma sessão WhatsApp pareada no WaCalls');
+              err.status = 503;
+              throw err;
+            }
+
+            const botParam = String(body.bot || '').trim();
+            const activeBot = (botParam && (bots[botParam] || mentionBot(botParam) || findBot(botParam)))
+              || (resolvedChatId && chats[resolvedChatId] ? botOf(chats[resolvedChatId]) : bots[DEFAULT_BOT]);
+            const botId = activeBot ? activeBot.id : DEFAULT_BOT;
+            const voice = String(body.voice || GEMINI_LIVE_DEFAULT_VOICE).trim() || 'Kore';
+            const lang = String(body.lang || 'pt-BR').trim() || 'pt-BR';
+            const maxMinutes = Math.min(60, Math.max(0.1, Number(body.maxMinutes || AI_CALL_DEFAULT_MAX_MINUTES) || AI_CALL_DEFAULT_MAX_MINUTES));
+            const noAnswerMs = body.noAnswerSec !== undefined
+              ? Math.min(180000, Math.max(1000, Number(body.noAnswerSec) * 1000))
+              : AI_CALL_NO_ANSWER_MS;
+
+            const id = crypto.randomBytes(4).toString('hex');
+            const ownerClientId = 'ai-call-' + id;
+            let activeModel = normalizeGeminiModel(body.model || '') || GEMINI_LIVE_DEFAULT_MODEL;
+
+            const rec = {
+              id,
+              callId: '',
+              sessionId: session.id,
+              to: phone,
+              isOwner,
+              purpose,
+              chatId: resolvedChatId,
+              bot: botId,
+              voice,
+              model: activeModel,
+              status: 'starting',
+              endReason: '',
+              error: '',
+              startedAt: new Date().toISOString(),
+              connectedAt: '',
+              endedAt: '',
+              durationSec: 0,
+              turns: 0,
+              stats: { waFramesIn: 0, waFramesOut: 0, geminiAudioChunks: 0, interruptions: 0, greetingSent: false },
+              transcript: [],
+              summary: '',
+              promise: null,
+              _hangup: null,
+            };
+            aiCalls.set(id, rec);
+            if (aiCalls.size > AI_CALL_MAX_HISTORY) aiCalls.delete(aiCalls.keys().next().value);
+
+            // Subscribe to WaCalls SSE before starting the call so no ringing/connected/ended event is ever missed.
+            let sseReq = null;
+            let sseHandler = null;
+            const closeSse = () => {
+              if (sseReq) {
+                try { sseReq.destroy(); } catch {}
+                sseReq = null;
+              }
+            };
+            sseReq = http.request({
+              host: '127.0.0.1',
+              port: WACALLS_PORT,
+              path: '/api/events?clientId=' + encodeURIComponent(ownerClientId),
+              method: 'GET',
+              headers: { Accept: 'text/event-stream' },
+            }, (res) => {
+              if (res.statusCode !== 200) { res.resume(); return; }
+              let sBuf = '';
+              res.setEncoding('utf8');
+              res.on('data', (chunk) => {
+                sBuf += chunk;
+                sBuf = sBuf.replace(/\r\n/g, '\n');
+                let sep;
+                while ((sep = sBuf.indexOf('\n\n')) !== -1) {
+                  const block = sBuf.slice(0, sep);
+                  sBuf = sBuf.slice(sep + 2);
+                  const dataLines = [];
+                  for (const line of block.split('\n')) {
+                    if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+                  }
+                  if (!dataLines.length) continue;
+                  try {
+                    const ev = JSON.parse(dataLines.join('\n'));
+                    if (sseHandler) sseHandler(ev);
+                  } catch {}
+                }
+              });
+            });
+            sseReq.on('error', () => {});
+            sseReq.end();
+
+            // Initiate outbound WhatsApp call via WaCalls
+            let startResp;
+            let startText = '';
+            try {
+              startResp = await fetch(WACALLS_URL + '/api/sessions/' + encodeURIComponent(session.id) + '/calls', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'X-Client-Id': ownerClientId },
+                body: JSON.stringify({ phone }),
+                signal: AbortSignal.timeout(15000),
+              });
+              startText = await startResp.text();
+            } catch (e) {
+              closeSse();
+              rec.status = 'error';
+              rec.error = 'Falha ao iniciar ligação no WaCalls: ' + e.message;
+              rec.endedAt = new Date().toISOString();
+              rec.summary = formatAiCallSummary(rec);
+              persistAiCallOutcome(rec);
+              const err = new Error(rec.error);
+              err.status = 502;
+              throw err;
+            }
+            let startJson = null;
+            try { startJson = JSON.parse(startText); } catch {}
+            const callId = startJson && startJson.call && startJson.call.callId ? String(startJson.call.callId) : '';
+            if (!startResp.ok || !callId) {
+              closeSse();
+              const msg = (startJson && startJson.error) || startText.slice(0, 200) || ('HTTP ' + startResp.status);
+              rec.status = 'error';
+              rec.error = 'WaCalls recusou iniciar chamada: ' + msg;
+              rec.endedAt = new Date().toISOString();
+              rec.summary = formatAiCallSummary(rec);
+              persistAiCallOutcome(rec);
+              const err = new Error(rec.error);
+              err.status = startResp.status >= 400 && startResp.status < 500 ? startResp.status : 502;
+              throw err;
+            }
+
+            rec.callId = callId;
+            rec.status = 'ringing';
+            audit({ action: 'ai-call-start', id, callId, sid: session.id, to: phone, isOwner, bot: botId, purpose: purpose.slice(0, 120), via });
+            log('ai-call', id, 'ringing', '+' + phone, 'callId=' + callId);
+
+            let resolveDone;
+            rec.promise = new Promise((r) => { resolveDone = r; });
+
+            let closed = false;
+            let callActive = false;
+            let connectedAtMs = 0;
+            let greetingSent = false;
+            let geminiSetupDone = false;
+            let everGeminiSetupDone = false;
+            let triedFallback = false;
+            let resumeHandle = '';
+            let reconnectAttempts = 0;
+            let waWs = null;
+            let geminiWs = null;
+            let geminiMsgQueue = Promise.resolve();
+            let waMsgQueue = Promise.resolve();
+            let noAnswerTimer = null;
+            let maxDurationTimer = null;
+            let reconnectTimer = null;
+            let greetTimer = null;
+            let endCallTimer = null;
+            let pendingEndCall = false;
+            let pendingEndReason = '';
+            let pendingUserText = '';
+            let pendingAssistantText = '';
+            const cancelledToolCalls = new Set();
+
+            let resampler = createPcmResampler(24000, 16000);
+            const pacer = createPcmPacer({
+              frameMs: AI_CALL_FRAME_MS,
+              sampleRate: 16000,
+              onFrame(frame) {
+                if (closed || !waWs || waWs.readyState !== 1) return;
+                try { waWs.send(frame); rec.stats.waFramesOut += 1; } catch {}
+              },
+            });
+
+            const flushUserTranscript = () => {
+              const t = pendingUserText.trim();
+              if (!t) return;
+              pendingUserText = '';
+              rec.transcript.push({ role: 'user', text: t, at: new Date().toISOString() });
+            };
+            const flushAssistantTranscript = () => {
+              const t = pendingAssistantText.trim();
+              if (!t) return;
+              pendingAssistantText = '';
+              rec.transcript.push({ role: 'assistant', text: t, at: new Date().toISOString() });
+            };
+            const flushAllTranscripts = () => {
+              flushUserTranscript();
+              flushAssistantTranscript();
+            };
+
+            const sendGeminiJson = (obj) => {
+              if (!geminiWs || geminiWs.readyState !== 1) return false;
+              try { geminiWs.send(JSON.stringify(obj)); return true; } catch { return false; }
+            };
+
+            const finish = async (finalStatus, reason, shouldDeleteWaCall) => {
+              if (closed) return;
+              closed = true;
+              if (noAnswerTimer) { clearTimeout(noAnswerTimer); noAnswerTimer = null; }
+              if (maxDurationTimer) { clearTimeout(maxDurationTimer); maxDurationTimer = null; }
+              if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+              if (greetTimer) { clearTimeout(greetTimer); greetTimer = null; }
+              if (endCallTimer) { clearTimeout(endCallTimer); endCallTimer = null; }
+              pacer.stop();
+              resampler.reset();
+              flushAllTranscripts();
+              closeSse();
+
+              if (geminiWs) {
+                const gRef = geminiWs;
+                geminiWs = null;
+                try { gRef._bridgeIntentionalClose = true; gRef.close(1000, 'call ended'); } catch {}
+              }
+              if (waWs) {
+                const wRef = waWs;
+                waWs = null;
+                try { wRef._bridgeIntentionalClose = true; wRef.close(1000, 'call ended'); } catch {}
+              }
+              if (shouldDeleteWaCall) {
+                await wacallsDeleteCall(session.id, callId, ownerClientId);
+              }
+
+              const endedMs = Date.now();
+              rec.status = finalStatus;
+              rec.endReason = String(reason || finalStatus || '');
+              rec.endedAt = new Date(endedMs).toISOString();
+              rec.durationSec = connectedAtMs ? Math.max(0, Math.round((endedMs - connectedAtMs) / 1000)) : 0;
+              rec.summary = formatAiCallSummary(rec);
+              persistAiCallOutcome(rec);
+              audit({
+                action: 'ai-call-end',
+                id,
+                callId,
+                to: phone,
+                status: rec.status,
+                reason: rec.endReason,
+                durationSec: rec.durationSec,
+                turns: rec.turns,
+                transcriptLines: rec.transcript.length,
+              });
+              log('ai-call', id, 'ended status=' + rec.status, 'reason=' + rec.endReason, 'duration=' + rec.durationSec + 's', 'in=' + rec.stats.waFramesIn, 'out=' + rec.stats.waFramesOut, 'gemChunks=' + rec.stats.geminiAudioChunks);
+              resolveDone(rec);
+            };
+
+            rec._hangup = (reason = 'api_ended') => finish(callActive ? 'completed' : 'cancelled', reason, true);
+
+            const scheduleGracefulEnd = (reason) => {
+              if (closed) return;
+              pendingEndCall = true;
+              pendingEndReason = String(reason || 'ai_ended');
+              if (endCallTimer) clearTimeout(endCallTimer);
+              // Hard safety cap so the call always hangs up even if Gemini does not send turnComplete
+              endCallTimer = setTimeout(() => {
+                endCallTimer = null;
+                finish('completed', pendingEndReason, true);
+              }, Math.max(1500, AI_CALL_END_DRAIN_MS + 1500));
+              if (endCallTimer.unref) endCallTimer.unref();
+            };
+
+            const maybeSendGreeting = () => {
+              if (closed || greetingSent || !callActive || !geminiSetupDone) return;
+              greetingSent = true;
+              const trigger = () => {
+                greetTimer = null;
+                if (closed || !geminiSetupDone) return;
+                rec.stats.greetingSent = true;
+                sendGeminiJson({
+                  clientContent: {
+                    turns: [{
+                      role: 'user',
+                      parts: [{ text: '[A pessoa acabou de atender a ligação. Cumprimente de forma natural e breve e diga o motivo da ligação.]' }],
+                    }],
+                    turnComplete: true,
+                  },
+                });
+              };
+              if (AI_CALL_GREET_DELAY_MS > 0) {
+                greetTimer = setTimeout(trigger, AI_CALL_GREET_DELAY_MS);
+                if (greetTimer.unref) greetTimer.unref();
+              } else {
+                trigger();
+              }
+            };
+
+            const markCallConnected = () => {
+              if (closed || callActive) return;
+              callActive = true;
+              connectedAtMs = Date.now();
+              rec.status = 'active';
+              rec.connectedAt = new Date(connectedAtMs).toISOString();
+              if (noAnswerTimer) { clearTimeout(noAnswerTimer); noAnswerTimer = null; }
+              maxDurationTimer = setTimeout(() => {
+                maxDurationTimer = null;
+                finish('completed', 'max_duration', true);
+              }, Math.round(maxMinutes * 60000));
+              if (maxDurationTimer.unref) maxDurationTimer.unref();
+              audit({ action: 'ai-call-connected', id, callId, to: phone });
+              log('ai-call', id, 'connected', '+' + phone);
+              maybeSendGreeting();
+            };
+
+            // No-answer timeout while ringing
+            noAnswerTimer = setTimeout(() => {
+              noAnswerTimer = null;
+              if (!callActive && !closed) {
+                finish('no_answer', 'no_answer', true);
+              }
+            }, noAnswerMs);
+            if (noAnswerTimer.unref) noAnswerTimer.unref();
+
+            sseHandler = (ev) => {
+              if (closed || !ev || typeof ev !== 'object') return;
+              const evCallId = String(ev.id || ev.callId || '');
+              if (evCallId !== callId) return;
+              if (ev.type === 'call-status') {
+                const st = String(ev.status || '').toLowerCase();
+                if (st === 'connected' || st === 'active') {
+                  markCallConnected();
+                } else if (st === 'ended') {
+                  finish(callActive ? 'completed' : 'no_answer', String(ev.reason || (callActive ? 'peer_ended' : 'no_answer')), false);
+                }
+              } else if (ev.type === 'call-ended') {
+                const rsn = String(ev.reason || '').toLowerCase();
+                if (!callActive) {
+                  const st = (rsn.includes('declin') || rsn.includes('reject'))
+                    ? 'declined'
+                    : rsn.includes('busy')
+                      ? 'busy'
+                      : 'no_answer';
+                  finish(st, rsn || st, false);
+                } else {
+                  finish('completed', rsn || 'peer_ended', false);
+                }
+              }
+            };
+
+            const handleGeminiToolCall = (fc) => {
+              const fcId = String((fc && fc.id) || crypto.randomBytes(4).toString('hex'));
+              const fnName = String((fc && fc.name) || '');
+              const args = (fc && fc.args && typeof fc.args === 'object') ? fc.args : {};
+              if (fnName === 'end_call') {
+                const reason = String(args.reason || 'ai_ended').trim() || 'ai_ended';
+                audit({ action: 'ai-call-tool', id, callId, tool: 'end_call', reason });
+                sendGeminiJson({
+                  toolResponse: {
+                    functionResponses: [{ id: fcId, name: 'end_call', response: { result: 'Ok, encerrando a ligação agora.' } }],
+                  },
+                });
+                scheduleGracefulEnd(reason);
+                // If pacer already has audio queued or finishes quickly without another model turn, check drain shortly
+                pacer.waitUntilDrained(AI_CALL_END_DRAIN_MS).then(() => {
+                  if (closed || !pendingEndCall) return;
+                  // Allow short window for Gemini to emit closing audio/turnComplete if it called end_call before speaking goodbye
+                  setTimeout(() => {
+                    if (closed || !pendingEndCall) return;
+                    if (pacer.stats().queuedBytes === 0 && !pacer.stats().active) {
+                      finish('completed', pendingEndReason, true);
+                    }
+                  }, 1200).unref();
+                });
+                return;
+              }
+              if (fnName === 'ask_agent') {
+                const request = String(args.request || '').trim();
+                const targetBotArg = String(args.bot || '').trim();
+                flushUserTranscript();
+                audit({ action: 'ai-call-tool', id, callId, tool: 'ask_agent', preview: request.slice(0, 80) });
+                executeVoiceAskAgent(resolvedChatId, activeBot, request, targetBotArg).then((result) => {
+                  if (closed || cancelledToolCalls.has(fcId)) return;
+                  sendGeminiJson({
+                    toolResponse: {
+                      functionResponses: [{ id: fcId, name: 'ask_agent', response: { result } }],
+                    },
+                  });
+                }).catch((err) => {
+                  if (closed || cancelledToolCalls.has(fcId)) return;
+                  const errMsg = String((err && err.message) || err || 'erro desconhecido');
+                  sendGeminiJson({
+                    toolResponse: {
+                      functionResponses: [{ id: fcId, name: 'ask_agent', response: { result: 'Erro ao executar ask_agent: ' + errMsg } }],
+                    },
+                  });
+                });
+                return;
+              }
+              sendGeminiJson({
+                toolResponse: {
+                  functionResponses: [{ id: fcId, name: fnName, response: { result: 'Ferramenta desconhecida: ' + fnName } }],
+                },
+              });
+            };
+
+            const handleGeminiMessage = (msg) => {
+              if (closed || !msg || typeof msg !== 'object') return;
+              if (msg.setupComplete !== undefined) {
+                geminiSetupDone = true;
+                everGeminiSetupDone = true;
+                reconnectAttempts = 0;
+                rec.model = activeModel;
+                maybeSendGreeting();
+              }
+              if (msg.sessionResumptionUpdate && msg.sessionResumptionUpdate.newHandle && msg.sessionResumptionUpdate.resumable !== false) {
+                resumeHandle = String(msg.sessionResumptionUpdate.newHandle);
+              }
+              if (msg.goAway) {
+                if (!closed && resumeHandle && reconnectAttempts < GEMINI_LIVE_MAX_RECONNECTS) {
+                  reconnectAttempts += 1;
+                  if (geminiWs) {
+                    const oldWs = geminiWs;
+                    geminiWs = null;
+                    try { oldWs._bridgeIntentionalClose = true; oldWs.close(1000, 'reconnecting'); } catch {}
+                  }
+                  geminiSetupDone = false;
+                  const delay = GEMINI_LIVE_RECONNECT_BASE_MS * Math.pow(2, reconnectAttempts - 1);
+                  reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!closed) connectGemini(); }, delay);
+                  return;
+                }
+              }
+              if (msg.toolCallCancellation && Array.isArray(msg.toolCallCancellation.ids)) {
+                for (const cid of msg.toolCallCancellation.ids) cancelledToolCalls.add(String(cid));
+              }
+              if (msg.toolCall && Array.isArray(msg.toolCall.functionCalls)) {
+                for (const fc of msg.toolCall.functionCalls) handleGeminiToolCall(fc);
+              }
+              const sc = msg.serverContent;
+              if (sc && typeof sc === 'object') {
+                if (sc.inputTranscription && typeof sc.inputTranscription.text === 'string' && sc.inputTranscription.text) {
+                  pendingUserText += sc.inputTranscription.text;
+                }
+                if (sc.modelTurn && Array.isArray(sc.modelTurn.parts)) {
+                  for (const part of sc.modelTurn.parts) {
+                    if (part && part.inlineData && part.inlineData.data) {
+                      const mime = String(part.inlineData.mimeType || '').toLowerCase();
+                      if (mime.startsWith('audio/pcm')) {
+                        flushUserTranscript();
+                        rec.stats.geminiAudioChunks += 1;
+                        const inRate = parsePcmSampleRate(mime, 24000);
+                        if (resampler.inRate !== inRate) resampler = createPcmResampler(inRate, 16000);
+                        const rawPcm = Buffer.from(part.inlineData.data, 'base64');
+                        const pcm16 = resampler.push(rawPcm);
+                        if (pcm16.length) pacer.enqueue(pcm16);
+                      }
+                    }
+                  }
+                }
+                if (sc.outputTranscription && typeof sc.outputTranscription.text === 'string' && sc.outputTranscription.text) {
+                  flushUserTranscript();
+                  pendingAssistantText += sc.outputTranscription.text;
+                }
+                if (sc.interrupted) {
+                  // Barge-in: immediately clear outbound playback queue
+                  rec.stats.interruptions += 1;
+                  pacer.clear();
+                  resampler.reset();
+                  flushAllTranscripts();
+                }
+                if (sc.turnComplete) {
+                  rec.turns += 1;
+                  pacer.flushPartial();
+                  flushAllTranscripts();
+                  if (pendingEndCall) {
+                    pacer.waitUntilDrained(AI_CALL_END_DRAIN_MS).then(() => {
+                      if (closed) return;
+                      setTimeout(() => { if (!closed) finish('completed', pendingEndReason, true); }, 250).unref();
+                    });
+                  }
+                }
+              }
+            };
+
+            const connectGemini = () => {
+              if (closed) return;
+              geminiSetupDone = false;
+              const url = GEMINI_LIVE_WS_URL + (GEMINI_LIVE_WS_URL.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(apiKey);
+              let ws;
+              try {
+                ws = new WebSocket(url);
+              } catch (e) {
+                rec.error = 'Erro ao conectar ao Gemini Live: ' + e.message;
+                finish('error', 'gemini_connect_error', true);
+                return;
+              }
+              geminiWs = ws;
+              let lastError = '';
+
+              ws.addEventListener('open', () => {
+                if (closed || geminiWs !== ws) { try { ws._bridgeIntentionalClose = true; ws.close(); } catch {} return; }
+                const sysText = buildAiCallSystemPrompt({ to: phone, isOwnerCall: isOwner, purpose, chatId: resolvedChatId, bot: activeBot, lang });
+                const setupPayload = {
+                  setup: {
+                    model: activeModel,
+                    generationConfig: {
+                      responseModalities: ['AUDIO'],
+                      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
+                    },
+                    systemInstruction: { parts: [{ text: sysText }] },
+                    inputAudioTranscription: {},
+                    outputAudioTranscription: {},
+                    sessionResumption: resumeHandle ? { handle: resumeHandle } : {},
+                    contextWindowCompression: { slidingWindow: {} },
+                    tools: [{
+                      functionDeclarations: [
+                        {
+                          name: 'ask_agent',
+                          description: 'Aciona o agente completo da ponte com acesso a todas as ferramentas (WhatsApp, e-mail, memória, arquivos, código, Coolify, GitHub, agenda, outros bots). Use quando precisar executar uma ação real ou consultar dados durante a ligação.',
+                          parameters: {
+                            type: 'OBJECT',
+                            properties: {
+                              request: { type: 'STRING', description: 'Instrução clara e autossuficiente do que executar ou consultar' },
+                              bot: { type: 'STRING', description: 'ID opcional de um bot especialista (ex: infra, email, familia, trabalho, viagens). Omita para usar o bot atual.' },
+                            },
+                            required: ['request'],
+                          },
+                        },
+                        {
+                          name: 'end_call',
+                          description: 'Encerra a ligação telefônica do WhatsApp após a despedida ou quando a pessoa pedir para desligar.',
+                          parameters: {
+                            type: 'OBJECT',
+                            properties: {
+                              reason: { type: 'STRING', description: 'Motivo curto do encerramento (ex.: objetivo cumprido, pessoa se despediu)' },
+                            },
+                          },
+                        },
+                      ],
+                    }],
+                  },
+                };
+                try { ws.send(JSON.stringify(setupPayload)); }
+                catch (e) { lastError = e.message; }
+              });
+
+              ws.addEventListener('message', (ev) => {
+                if (closed || geminiWs !== ws) return;
+                geminiMsgQueue = geminiMsgQueue.then(async () => {
+                  if (closed || geminiWs !== ws) return;
+                  const txt = await decodeWsMessageText(ev.data);
+                  let parsed;
+                  try { parsed = JSON.parse(txt); } catch { return; }
+                  handleGeminiMessage(parsed);
+                }).catch((e) => { log('ai-call gemini msg err:', e.message); });
+              });
+
+              ws.addEventListener('error', (ev) => {
+                lastError = (ev && ev.message) || 'erro na conexão WebSocket com Gemini Live';
+              });
+
+              ws.addEventListener('close', (ev) => {
+                if (closed || ws._bridgeIntentionalClose || geminiWs !== ws) return;
+                geminiWs = null;
+                const code = Number((ev && ev.code) || 1006);
+                const reason = String((ev && ev.reason) || lastError || ('código ' + code));
+                if (!everGeminiSetupDone && !triedFallback && GEMINI_LIVE_FALLBACK_MODEL && activeModel !== GEMINI_LIVE_FALLBACK_MODEL) {
+                  log('ai-call', id, 'setup failed on', activeModel, '(' + reason + '), falling back to', GEMINI_LIVE_FALLBACK_MODEL);
+                  triedFallback = true;
+                  activeModel = GEMINI_LIVE_FALLBACK_MODEL;
+                  rec.model = activeModel;
+                  resumeHandle = '';
+                  connectGemini();
+                  return;
+                }
+                const unrecoverable = code === 4001 || code === 4003 || code === 1008;
+                if (everGeminiSetupDone && !unrecoverable && resumeHandle && reconnectAttempts < GEMINI_LIVE_MAX_RECONNECTS) {
+                  reconnectAttempts += 1;
+                  geminiSetupDone = false;
+                  const delay = GEMINI_LIVE_RECONNECT_BASE_MS * Math.pow(2, reconnectAttempts - 1);
+                  reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!closed) connectGemini(); }, delay);
+                  return;
+                }
+                rec.error = 'Conexão Gemini Live encerrada: ' + reason;
+                finish('error', 'gemini_closed', true);
+              });
+            };
+
+            // Connect binary audio WS to WaCalls immediately so WSBridge is ready as soon as peer answers
+            const waWsUrl = 'ws://127.0.0.1:' + WACALLS_PORT + '/api/sessions/' + encodeURIComponent(session.id) + '/calls/' + encodeURIComponent(callId) + '/ws?clientId=' + encodeURIComponent(ownerClientId);
+            try {
+              waWs = new WebSocket(waWsUrl);
+              waWs.binaryType = 'arraybuffer';
+            } catch (e) {
+              rec.error = 'Erro ao abrir WS do WaCalls: ' + e.message;
+              await finish('error', 'wacalls_ws_error', true);
+              return aiCallView(rec);
+            }
+
+            waWs.addEventListener('message', (ev) => {
+              if (closed) return;
+              waMsgQueue = waMsgQueue.then(async () => {
+                if (closed) return;
+                let pcmBuf = await decodeWsBinaryData(ev.data);
+                if (pcmBuf.length < 2) return;
+                if (pcmBuf.length % 2 === 1) pcmBuf = pcmBuf.subarray(0, pcmBuf.length - 1);
+                if (!callActive) markCallConnected();
+                if (!geminiSetupDone || !rec.stats.greetingSent || closed) return;
+                rec.stats.waFramesIn += 1;
+                sendGeminiJson({
+                  realtimeInput: {
+                    audio: { mimeType: 'audio/pcm;rate=16000', data: pcmBuf.toString('base64') },
+                  },
+                });
+              }).catch((e) => { log('ai-call wacalls msg err:', e.message); });
+            });
+
+            waWs.addEventListener('error', (ev) => {
+              if (closed) return;
+              log('ai-call', id, 'wacalls ws error:', (ev && ev.message) || 'unknown');
+            });
+
+            waWs.addEventListener('close', () => {
+              if (closed || (waWs && waWs._bridgeIntentionalClose)) return;
+              // Give SSE a brief moment to deliver the exact end reason (declined/busy/user_ended)
+              setTimeout(() => {
+                if (!closed) {
+                  finish(callActive ? 'completed' : 'no_answer', callActive ? 'peer_ended' : 'no_answer', false);
+                }
+              }, 150).unref();
+            });
+
+            connectGemini();
+
+            if (body.wait !== undefined && Number(body.wait) > 0) {
+              return await waitAiCall(rec, Number(body.wait));
+            }
+            return aiCallView(rec);
+          }
+
           function execCmd(bin, args, ms = 60000) {
             const isScript = bin.endsWith('.mjs') || bin.endsWith('.js');
             return new Promise((resolve) => {
@@ -9967,6 +11106,27 @@ services:
                 return proxyWaCallsHttp(req, res, u, raw);
               }
               return send(404, { error: 'rota não encontrada' });
+            }
+            if (parts[0] === 'calls' && parts[1] === 'ai') {
+              try {
+                if (!parts[2] && m === 'GET') return send(200, { calls: listAiCalls() });
+                if (!parts[2] && m === 'POST') {
+                  const cb = raw.length ? JSON.parse(raw.toString('utf8')) : {};
+                  return send(200, await startAiCall(cb, 'panel'));
+                }
+                if (parts[2] && !parts[3] && m === 'GET') {
+                  const rec = getAiCall(parts[2]);
+                  if (!rec) return send(404, { error: 'ligação IA não encontrada' });
+                  const w = u.searchParams.get('wait');
+                  return send(200, await waitAiCall(rec, w === null ? 0 : Number(w)));
+                }
+                if (parts[2] && !parts[3] && m === 'DELETE') {
+                  return send(200, await hangupAiCall(parts[2], 'panel_ended'));
+                }
+                return send(405, { error: 'método não suportado' });
+              } catch (e) {
+                return send(e && e.status ? e.status : 400, { error: e.message });
+              }
             }
             let body = {};
             if (raw.length) { try { body = JSON.parse(raw.toString('utf8')); } catch { return send(400, { error: 'JSON inválido' }); } }
@@ -11034,6 +12194,36 @@ services:
                   res.writeHead(400); return res.end('erro: ' + e.message);
                 }
               }
+              if (u.pathname === '/calls/ai' || u.pathname.startsWith('/calls/ai/')) {
+                if (!isLocal(req) && !adminAuthorized(req)) {
+                  res.writeHead(403, { 'Content-Type': 'application/json' });
+                  return res.end(JSON.stringify({ error: 'não autorizado' }));
+                }
+                try {
+                  const idPart = u.pathname.startsWith('/calls/ai/') ? decodeURIComponent(u.pathname.slice('/calls/ai/'.length)) : '';
+                  let out;
+                  if (!idPart && req.method === 'GET') {
+                    out = { calls: listAiCalls() };
+                  } else if (!idPart && req.method === 'POST') {
+                    out = await startAiCall(JSON.parse(raw.toString('utf8') || '{}'), 'api');
+                  } else if (idPart && req.method === 'GET') {
+                    const rec = getAiCall(idPart);
+                    if (!rec) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'ligação IA não encontrada' })); }
+                    const w = u.searchParams.get('wait');
+                    out = await waitAiCall(rec, w === null ? 0 : Number(w));
+                  } else if (idPart && req.method === 'DELETE') {
+                    out = await hangupAiCall(idPart, 'api_ended');
+                  } else {
+                    res.writeHead(405, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: 'método não suportado' }));
+                  }
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  return res.end(JSON.stringify(out));
+                } catch (e) {
+                  res.writeHead(e && e.status ? e.status : 400, { 'Content-Type': 'application/json' });
+                  return res.end(JSON.stringify({ error: e.message }));
+                }
+              }
               if (u.pathname === '/voice/live-token' || u.pathname === '/voice/ask' || u.pathname.startsWith('/voice/ask/')) {
                 if (!adminAuthorized(req) && !isLocal(req)) {
                   res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -11139,6 +12329,20 @@ services:
             socket.on('error', close);
           });
 
+          export {
+            parsePcmSampleRate,
+            createPcmResampler,
+            createPcmPacer,
+            normalizeCallPhone,
+            buildAiCallSystemPrompt,
+            startAiCall,
+            listAiCalls,
+            getAiCall,
+            waitAiCall,
+            hangupAiCall,
+          };
+
+          if (env.BRIDGE_IMPORT_ONLY !== '1') {
           server.listen(PORT, () => {
             log('bridge listening on', PORT, '| version', VERSION, '| session', WAHA_SESSION, '| allowed numbers', ALLOWED.length, '| mode', PERMISSION_MODE);
             if (!ALLOWED.length) log('WARNING: ALLOWED_NUMBERS is empty, every message will be ignored');
@@ -11153,6 +12357,7 @@ services:
             setInterval(checkpointWal, 30 * 60000).unref();
             for (const sig of ['SIGTERM', 'SIGINT']) {
               process.on(sig, () => {
+                hangupAllAiCalls('bridge_shutdown');
                 stopWaCallsSse();
                 try { if (wacalls.child) wacalls.child.kill('SIGTERM'); } catch {}
                 checkpointWal();
@@ -11168,6 +12373,7 @@ services:
               log('agy models raw:', JSON.stringify(stripAnsi(cat.raw).slice(0, 1500)));
             }).catch((e) => log('agy models failed', e.message));
           });
+          }
 
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
