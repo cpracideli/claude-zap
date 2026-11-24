@@ -57,6 +57,8 @@ function bridgeServiceYaml({ isStack = false } = {}) {
       - AI_MEMORY_SERVER_URL=${D}{AI_MEMORY_SERVER_URL:-http://127.0.0.1:49374}
       - GROQ_API_KEY=${D}{GROQ_API_KEY}
       - GEMINI_API_KEY=${D}{GEMINI_API_KEY}
+      - GEMINI_LIVE_MODEL=${D}{GEMINI_LIVE_MODEL}
+      - GEMINI_LIVE_VOICE=${D}{GEMINI_LIVE_VOICE}
       - OPENAI_API_KEY=${D}{OPENAI_API_KEY}
       - TTS_MODEL=${D}{TTS_MODEL}
       - TTS_VOICE=${D}{TTS_VOICE}

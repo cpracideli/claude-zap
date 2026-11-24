@@ -45,6 +45,8 @@ services:
       - AI_MEMORY_SERVER_URL=${AI_MEMORY_SERVER_URL:-http://127.0.0.1:49374}
       - GROQ_API_KEY=${GROQ_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_LIVE_MODEL=${GEMINI_LIVE_MODEL}
+      - GEMINI_LIVE_VOICE=${GEMINI_LIVE_VOICE}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - TTS_MODEL=${TTS_MODEL}
       - TTS_VOICE=${TTS_VOICE}
@@ -5614,7 +5616,8 @@ services:
             ].join('\n') + '\n';
           }
 
-          // ---------- Gemini Live Voice Call (full-duplex real-time audio via BidiGenerateContent) ----------
+          // ---------- Gemini Live Voice Call (full-duplex real-time audio via BidiGenerateContent + Ephemeral Auth Tokens) ----------
+          const GEMINI_API_BASE = String(env.GEMINI_API_BASE || 'https://generativelanguage.googleapis.com').replace(/\/+(?![\s\S])/, '');
           const GEMINI_LIVE_WS_URL = env.GEMINI_LIVE_WS_URL || 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
           const GEMINI_LIVE_DEFAULT_MODEL = String(env.GEMINI_LIVE_MODEL || 'models/gemini-3.8-live').trim();
           const GEMINI_LIVE_FALLBACK_MODEL = String(env.GEMINI_LIVE_FALLBACK_MODEL || 'models/gemini-2.5-flash-native-audio-latest').trim();
@@ -5623,6 +5626,322 @@ services:
           const GEMINI_LIVE_RECONNECT_BASE_MS = Math.max(50, Number(env.GEMINI_LIVE_RECONNECT_BASE_MS || 600));
           const GEMINI_LIVE_TOOL_TIMEOUT_MS = Math.max(1000, Number(env.GEMINI_LIVE_TOOL_TIMEOUT_MS || 90000));
           const GEMINI_LIVE_MAX_RECONNECTS = 3;
+          const voiceLiveModelCache = { keyHash: '', model: '', at: 0 };
+          const voiceAsks = new Map();
+
+          function normalizeGeminiModel(m) {
+            const s = String(m || '').trim();
+            if (!s) return '';
+            return s.startsWith('models/') ? s : ('models/' + s);
+          }
+
+          function pickBestGeminiLiveModel(models) {
+            const bidi = (Array.isArray(models) ? models : []).filter((m) =>
+              m && m.name && Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('bidiGenerateContent')
+            );
+            if (!bidi.length) return '';
+            const specializedRe = /(transcribe|translate|robotics|genie)/i;
+            const general = bidi.filter((m) => !specializedRe.test(String(m.name)));
+            const pool = general.length ? general : bidi;
+            const score = (m) => {
+              const n = String(m.name || '').toLowerCase();
+              let s = 0;
+              if (n.includes('native-audio')) s += 100000;
+              if (n.includes('-latest')) s += 50000;
+              if (n.includes('flash')) s += 500;
+              if (n.includes('extended-thinking')) s -= 200;
+              const ver = n.match(/gemini-(\d+)(?:\.(\d+))?/);
+              if (ver) s += Number(ver[1]) * 1000 + Number(ver[2] || 0) * 100;
+              const dt = n.match(/(\d{2})-(\d{4})/);
+              if (dt) s += Math.max(0, (Number(dt[2]) - 2020) * 12 + Number(dt[1]));
+              return s;
+            };
+            pool.sort((a, b) => score(b) - score(a));
+            return normalizeGeminiModel(pool[0].name);
+          }
+
+          async function discoverGeminiLiveModel(apiKey) {
+            const envOverride = normalizeGeminiModel(env.GEMINI_LIVE_MODEL || '');
+            if (envOverride) return envOverride;
+            const keyHash = crypto.createHash('sha256').update(String(apiKey || '')).digest('hex').slice(0, 12);
+            if (voiceLiveModelCache.model && voiceLiveModelCache.keyHash === keyHash && Date.now() - voiceLiveModelCache.at < 10 * 60000) {
+              return voiceLiveModelCache.model;
+            }
+            try {
+              const r = await fetch(GEMINI_API_BASE + '/v1beta/models?key=' + encodeURIComponent(apiKey) + '&pageSize=200', {
+                signal: AbortSignal.timeout(10000),
+              });
+              if (r.ok) {
+                const data = await r.json();
+                const picked = pickBestGeminiLiveModel(data && data.models);
+                if (picked) {
+                  voiceLiveModelCache.keyHash = keyHash;
+                  voiceLiveModelCache.model = picked;
+                  voiceLiveModelCache.at = Date.now();
+                  return picked;
+                }
+              }
+            } catch (e) {
+              log('gemini live model discovery failed:', e.message);
+            }
+            return 'models/gemini-2.5-flash-native-audio-latest';
+          }
+
+          function buildVoiceTokenSystemInstruction(chatId, bot, lang) {
+            const b = bot || bots[DEFAULT_BOT] || { id: DEFAULT_BOT, name: 'Agent', description: '', instructions: '' };
+            const targetLang = String(lang || 'pt-BR').trim() || 'pt-BR';
+            const nowStr = new Date().toLocaleString('pt-BR', { timeZone: TZ });
+            const ownerPart = OWNER_NAME ? (' de ' + OWNER_NAME) : '';
+            const lines = [
+              'Você é o assistente de voz em tempo real' + ownerPart + ' no painel web Agent Control.',
+              'Identidade atual: bot "' + b.name + '" (id: ' + b.id + ').' + (b.description ? ' Descrição: ' + b.description : ''),
+              'Fuso horário: ' + TZ + '. Data/hora atual: ' + nowStr + '.',
+              'Idioma: ' + targetLang + '. Responda sempre em português do Brasil, com frases curtas, naturais e próprias para fala (sem markdown, listas longas, asteriscos, URLs ou códigos ditados).',
+              'REGRA OBRIGATÓRIA DE FERRAMENTA (perguntar_agente): para qualquer coisa que exija ação real, dados pessoais, memória, ferramentas, agenda, e-mail, WhatsApp, arquivos, código, servidores/Coolify, GitHub, pesquisas ou consulta a outros bots, CHAME a função perguntar_agente passando o pedido completo. Não invente informações nem diga que não consegue fazer; diga rapidamente que vai verificar e chame perguntar_agente. Quando o texto voltar, resuma o resultado de forma natural e curta em voz alta.',
+            ];
+            if (b.instructions) {
+              lines.push('Instruções do bot ativo (adapte para fala curta):\n' + String(b.instructions).slice(0, 3000));
+            }
+            if (chatId) {
+              const rawList = isWeb(chatId)
+                ? webHistory(chatId).map((m) => ({ role: m.role, bot: m.bot, text: m.text || m.transcript || '' }))
+                : ((chats[chatId] && chats[chatId].recent) || []);
+              const recent = rawList.filter((m) => String(m.text || '').trim()).slice(-10);
+              if (recent.length) {
+                lines.push('Contexto recente desta conversa:\n' +
+                  recent.map((m) => {
+                    const speaker = m.role === 'user' ? 'Usuário' : ((m.bot && bots[m.bot] ? bots[m.bot].name : b.name) || 'Assistente');
+                    return speaker + ': ' + String(m.text || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+                  }).join('\n'));
+              }
+            }
+            return lines.join('\n\n');
+          }
+
+          async function createVoiceLiveToken(body) {
+            body = body && typeof body === 'object' ? body : {};
+            const apiKey = resolveGeminiApiKey();
+            if (!apiKey) {
+              const err = new Error('GEMINI_API_KEY não configurada (configure GEMINI_API_KEY no Coolify, gemini_api_key no Cofre ou ~/.config/gemini/api_key)');
+              err.status = 503;
+              throw err;
+            }
+            const rawChatId = String(body.chatId || '').trim();
+            let resolvedChatId = rawChatId;
+            if (resolvedChatId && !chats[resolvedChatId] && !resolvedChatId.includes(':') && chats['web:' + resolvedChatId]) {
+              resolvedChatId = 'web:' + resolvedChatId;
+            }
+            const botParam = String(body.bot || '').trim();
+            const activeBot = (botParam && (bots[botParam] || mentionBot(botParam) || findBot(botParam)))
+              || (resolvedChatId && chats[resolvedChatId] ? botOf(chats[resolvedChatId]) : bots[DEFAULT_BOT]);
+            const voice = String(body.voice || GEMINI_LIVE_DEFAULT_VOICE).trim() || 'Kore';
+            const lang = String(body.lang || 'pt-BR').trim() || 'pt-BR';
+            const model = await discoverGeminiLiveModel(apiKey);
+            const systemInstruction = buildVoiceTokenSystemInstruction(resolvedChatId, activeBot, lang);
+            const now = Date.now();
+            const expiresAt = new Date(now + 30 * 60000).toISOString();
+            const newSessionExpireTime = new Date(now + 2 * 60000).toISOString();
+            const payload = {
+              uses: 1,
+              expireTime: expiresAt,
+              newSessionExpireTime,
+              bidiGenerateContentSetup: {
+                model,
+                generationConfig: {
+                  responseModalities: ['AUDIO'],
+                  speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
+                },
+                systemInstruction: { parts: [{ text: systemInstruction }] },
+                inputAudioTranscription: {},
+                outputAudioTranscription: {},
+                tools: [{
+                  functionDeclarations: [{
+                    name: 'perguntar_agente',
+                    description: 'Repassa o pedido ao agente principal (Claude) que tem ferramentas e contexto; devolve a resposta em texto',
+                    parameters: {
+                      type: 'OBJECT',
+                      properties: {
+                        pedido: { type: 'STRING', description: 'Pedido completo e claro para o agente executar ou responder' },
+                      },
+                      required: ['pedido'],
+                    },
+                  }],
+                }],
+              },
+            };
+            let r;
+            try {
+              r = await fetch(GEMINI_API_BASE + '/v1alpha/auth_tokens?key=' + encodeURIComponent(apiKey), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+                signal: AbortSignal.timeout(15000),
+              });
+            } catch (e) {
+              const err = new Error('Falha ao contactar Gemini auth_tokens: ' + e.message);
+              err.status = 502;
+              throw err;
+            }
+            const rawTxt = await r.text();
+            let data = null;
+            try { data = JSON.parse(rawTxt); } catch {}
+            if (!r.ok || !data || !data.name) {
+              const msg = (data && data.error && data.error.message) || rawTxt.slice(0, 240) || ('HTTP ' + r.status);
+              const err = new Error('Falha ao gerar token efêmero Gemini Live: ' + msg);
+              err.status = r.status >= 400 && r.status < 500 ? r.status : 502;
+              throw err;
+            }
+            audit({ action: 'voice-live-token', chatId: resolvedChatId || '', bot: activeBot ? activeBot.id : DEFAULT_BOT, model, voice });
+            return {
+              token: String(data.name),
+              model,
+              expiresAt,
+              voice,
+              systemInstruction,
+            };
+          }
+
+          function voiceAskView(entry) {
+            if (entry.status === 'running') {
+              return {
+                status: 'running',
+                id: entry.id,
+                chatId: entry.chatId,
+                bot: entry.bot,
+                ms: Date.now() - entry.started,
+              };
+            }
+            return {
+              status: entry.status,
+              id: entry.id,
+              chatId: entry.chatId,
+              bot: entry.bot,
+              answer: entry.answer || '',
+              ...(entry.error ? { error: entry.error } : {}),
+              ms: entry.ms || (Date.now() - entry.started),
+            };
+          }
+
+          function startVoiceAsk(body) {
+            body = body && typeof body === 'object' ? body : {};
+            const text = String(body.text || body.pedido || body.question || '').trim();
+            if (!text) {
+              const err = new Error('"text" obrigatório');
+              err.status = 400;
+              throw err;
+            }
+            let resolvedChatId = String(body.chatId || '').trim();
+            if (resolvedChatId && !chats[resolvedChatId] && !resolvedChatId.includes(':') && chats['web:' + resolvedChatId]) {
+              resolvedChatId = 'web:' + resolvedChatId;
+            }
+            if (!resolvedChatId) {
+              resolvedChatId = 'web:' + crypto.randomBytes(6).toString('hex');
+            }
+            const c = chat(resolvedChatId);
+            const botArg = String(body.bot || '').trim();
+            const targetBot = (botArg && (bots[botArg] || mentionBot(botArg) || findBot(botArg))) || botOf(c);
+            const botId = targetBot ? targetBot.id : DEFAULT_BOT;
+            const ownBot = botId === botOf(c).id;
+
+            if (isWeb(resolvedChatId)) {
+              webAppend(resolvedChatId, { role: 'user', text, meta: { voiceCall: true } });
+              if (!c.title || c.title === 'Nova conversa') {
+                c.title = text.replace(/\s+/g, ' ').slice(0, 60);
+                c.titleAuto = true;
+                save();
+              }
+            } else {
+              remember(resolvedChatId, 'user', text);
+            }
+
+            const entry = {
+              id: crypto.randomBytes(4).toString('hex'),
+              chatId: resolvedChatId,
+              bot: botId,
+              text,
+              status: 'running',
+              started: Date.now(),
+              answer: '',
+              error: '',
+              ms: 0,
+              promise: null,
+            };
+            voiceAsks.set(entry.id, entry);
+            if (voiceAsks.size > 200) voiceAsks.delete(voiceAsks.keys().next().value);
+            audit({ action: 'voice-ask', id: entry.id, chatId: resolvedChatId, bot: botId, preview: text.slice(0, 80) });
+
+            entry.promise = new Promise((resolve) => enqueue(resolvedChatId, async () => {
+              const provider = runConfig(c, ownBot ? undefined : botId).provider;
+              if (isWeb(resolvedChatId)) webEmit(resolvedChatId, { type: 'start', provider, bot: botId });
+              const tools = [];
+              const onEvent = isWeb(resolvedChatId) ? (ev) => { for (const e of webEventsFrom(ev, tools)) webEmit(resolvedChatId, e); } : null;
+              const started = Date.now();
+              delegLog.delete(resolvedChatId);
+              promptLog.delete(resolvedChatId);
+              try {
+                const r = await runTurn(
+                  resolvedChatId,
+                  ownBot ? null : botId,
+                  text,
+                  null,
+                  onEvent,
+                  isWeb(resolvedChatId) ? () => webEmit(resolvedChatId, { type: 'text', text: '(a sessão anterior não abriu; começando uma nova)' }) : null,
+                  { noSteer: true, displayPrompt: text }
+                );
+                const ms = r.usage ? r.usage.ms : Date.now() - started;
+                recordRun(resolvedChatId, { prompt: text.slice(0, 80), ms, cost: r.usage ? r.usage.cost : 0, error: r.stopped ? 'interrompido pelo usuário' : r.error });
+                const delegations = delegLog.get(resolvedChatId) || [];
+                delegLog.delete(resolvedChatId);
+                const cards = promptLog.get(resolvedChatId) || [];
+                promptLog.delete(resolvedChatId);
+                const parsedReply = (!r.stopped && !r.error)
+                  ? extractSuggestions(r.text || '')
+                  : { text: r.stopped ? '(interrompido)' : 'Erro: ' + r.error, suggestions: [] };
+                const effectiveProv = r.provider || provider;
+                if (isWeb(resolvedChatId)) {
+                  webAppend(resolvedChatId, {
+                    role: 'assistant',
+                    provider: effectiveProv,
+                    bot: botId,
+                    tools,
+                    ...(delegations.length ? { delegations } : {}),
+                    ...(cards.length ? { prompts: cards } : {}),
+                    ...(parsedReply.suggestions.length ? { suggestions: parsedReply.suggestions } : {}),
+                    meta: { voiceCall: true },
+                    text: parsedReply.text,
+                    error: Boolean(r.error),
+                    stopped: Boolean(r.stopped),
+                    noPush: true,
+                    usage: { ms, cost: r.usage ? r.usage.cost : 0, turns: r.usage ? r.usage.turns : 0, ...(r.usage && r.usage.estimated ? { estimated: true } : {}) },
+                  });
+                  if (!r.stopped && !r.error) autoTitleChat(resolvedChatId, text, parsedReply.text);
+                  webEmit(resolvedChatId, { type: 'idle' });
+                } else {
+                  remember(resolvedChatId, 'assistant', parsedReply.text, botId);
+                }
+                entry.ms = ms;
+                entry.status = r.stopped ? 'stopped' : r.error ? 'error' : 'done';
+                entry.answer = parsedReply.text;
+                entry.error = r.error || (r.stopped ? 'interrompido' : '');
+              } catch (e) {
+                entry.ms = Date.now() - started;
+                entry.status = 'error';
+                entry.error = e.message;
+                entry.answer = 'Erro: ' + e.message;
+                if (isWeb(resolvedChatId)) webEmit(resolvedChatId, { type: 'idle' });
+              }
+              resolve(entry);
+            }));
+            return entry;
+          }
+
+          async function waitVoiceAsk(entry, secs) {
+            const ms = Math.min(Math.max(Number(secs) || 0, 0), 115) * 1000;
+            if (entry.status === 'running' && ms) {
+              await Promise.race([entry.promise, new Promise((r) => setTimeout(r, ms))]);
+            }
+            return voiceAskView(entry);
+          }
 
           function resolveGeminiApiKey() {
             const fromVault = secrets.gemini_api_key && String(secrets.gemini_api_key.value || '').trim();
@@ -10333,6 +10652,19 @@ services:
               if (a === 'voice' && b === 'status' && m === 'GET') {
                 return send(200, voiceLiveStatus());
               }
+              if (a === 'voice' && b === 'live-token' && m === 'POST') {
+                return send(200, await createVoiceLiveToken(body));
+              }
+              if (a === 'voice' && b === 'ask' && !c2 && m === 'POST') {
+                const entry = startVoiceAsk(body);
+                return send(200, await waitVoiceAsk(entry, body.wait === undefined ? 110 : body.wait));
+              }
+              if (a === 'voice' && b === 'ask' && c2 && m === 'GET') {
+                const entry = voiceAsks.get(c2);
+                if (!entry) return send(404, { error: 'voice ask não encontrado' });
+                const w = u.searchParams.get('wait');
+                return send(200, await waitVoiceAsk(entry, w === null ? 100 : Number(w)));
+              }
               if (a === 'voice' && b === 'live-config' && m === 'GET') {
                 const gemSec = secrets.gemini_api_key || secrets.google_api_key || null;
                 const key = (gemSec && gemSec.value) || resolveGeminiApiKey();
@@ -10396,7 +10728,7 @@ services:
               }
               return send(404, { error: 'rota não encontrada' });
             } catch (e) {
-              return send(400, { error: e.message });
+              return send(e && e.status ? e.status : 400, { error: e.message });
             }
           }
 
@@ -10700,6 +11032,35 @@ services:
                   res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(out));
                 } catch (e) {
                   res.writeHead(400); return res.end('erro: ' + e.message);
+                }
+              }
+              if (u.pathname === '/voice/live-token' || u.pathname === '/voice/ask' || u.pathname.startsWith('/voice/ask/')) {
+                if (!adminAuthorized(req) && !isLocal(req)) {
+                  res.writeHead(401, { 'Content-Type': 'application/json' });
+                  return res.end(JSON.stringify({ error: 'não autorizado' }));
+                }
+                try {
+                  let out;
+                  if (u.pathname === '/voice/live-token' && req.method === 'POST') {
+                    out = await createVoiceLiveToken(JSON.parse(raw.toString('utf8') || '{}'));
+                  } else if (u.pathname === '/voice/ask' && req.method === 'POST') {
+                    const b = JSON.parse(raw.toString('utf8') || '{}');
+                    out = await waitVoiceAsk(startVoiceAsk(b), b.wait === undefined ? 110 : b.wait);
+                  } else if (u.pathname.startsWith('/voice/ask/') && req.method === 'GET') {
+                    const askId = decodeURIComponent(u.pathname.slice('/voice/ask/'.length));
+                    const entry = voiceAsks.get(askId);
+                    if (!entry) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'voice ask não encontrado' })); }
+                    const w = u.searchParams.get('wait');
+                    out = await waitVoiceAsk(entry, w === null ? 100 : Number(w));
+                  } else {
+                    res.writeHead(405, { 'Content-Type': 'application/json' });
+                    return res.end(JSON.stringify({ error: 'método não suportado' }));
+                  }
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  return res.end(JSON.stringify(out));
+                } catch (e) {
+                  res.writeHead(e && e.status ? e.status : 400, { 'Content-Type': 'application/json' });
+                  return res.end(JSON.stringify({ error: e.message }));
                 }
               }
               if (req.method !== 'POST' || !req.url.startsWith('/webhook')) { res.writeHead(404); return res.end(); }

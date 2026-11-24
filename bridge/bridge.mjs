@@ -5574,14 +5574,14 @@ function pickBestGeminiLiveModel(models) {
   const score = (m) => {
     const n = String(m.name || '').toLowerCase();
     let s = 0;
-    if (n.includes('native-audio')) s += 10000;
-    if (n.includes('-latest')) s += 2000;
-    if (n.includes('flash')) s += 100;
-    if (n.includes('extended-thinking')) s -= 50;
+    if (n.includes('native-audio')) s += 100000;
+    if (n.includes('-latest')) s += 50000;
+    if (n.includes('flash')) s += 500;
+    if (n.includes('extended-thinking')) s -= 200;
     const ver = n.match(/gemini-(\d+)(?:\.(\d+))?/);
-    if (ver) s += Number(ver[1]) * 100 + Number(ver[2] || 0) * 10;
+    if (ver) s += Number(ver[1]) * 1000 + Number(ver[2] || 0) * 100;
     const dt = n.match(/(\d{2})-(\d{4})/);
-    if (dt) s += Number(dt[2]) * 12 + Number(dt[1]);
+    if (dt) s += Math.max(0, (Number(dt[2]) - 2020) * 12 + Number(dt[1]));
     return s;
   };
   pool.sort((a, b) => score(b) - score(a));
@@ -10580,6 +10580,19 @@ async function handleAdmin(req, res, u, raw) {
     if (a === 'voice' && b === 'status' && m === 'GET') {
       return send(200, voiceLiveStatus());
     }
+    if (a === 'voice' && b === 'live-token' && m === 'POST') {
+      return send(200, await createVoiceLiveToken(body));
+    }
+    if (a === 'voice' && b === 'ask' && !c2 && m === 'POST') {
+      const entry = startVoiceAsk(body);
+      return send(200, await waitVoiceAsk(entry, body.wait === undefined ? 110 : body.wait));
+    }
+    if (a === 'voice' && b === 'ask' && c2 && m === 'GET') {
+      const entry = voiceAsks.get(c2);
+      if (!entry) return send(404, { error: 'voice ask não encontrado' });
+      const w = u.searchParams.get('wait');
+      return send(200, await waitVoiceAsk(entry, w === null ? 100 : Number(w)));
+    }
     if (a === 'voice' && b === 'live-config' && m === 'GET') {
       const gemSec = secrets.gemini_api_key || secrets.google_api_key || null;
       const key = (gemSec && gemSec.value) || resolveGeminiApiKey();
@@ -10643,7 +10656,7 @@ async function handleAdmin(req, res, u, raw) {
     }
     return send(404, { error: 'rota não encontrada' });
   } catch (e) {
-    return send(400, { error: e.message });
+    return send(e && e.status ? e.status : 400, { error: e.message });
   }
 }
 
@@ -10947,6 +10960,35 @@ const server = http.createServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify(out));
       } catch (e) {
         res.writeHead(400); return res.end('erro: ' + e.message);
+      }
+    }
+    if (u.pathname === '/voice/live-token' || u.pathname === '/voice/ask' || u.pathname.startsWith('/voice/ask/')) {
+      if (!adminAuthorized(req) && !isLocal(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'não autorizado' }));
+      }
+      try {
+        let out;
+        if (u.pathname === '/voice/live-token' && req.method === 'POST') {
+          out = await createVoiceLiveToken(JSON.parse(raw.toString('utf8') || '{}'));
+        } else if (u.pathname === '/voice/ask' && req.method === 'POST') {
+          const b = JSON.parse(raw.toString('utf8') || '{}');
+          out = await waitVoiceAsk(startVoiceAsk(b), b.wait === undefined ? 110 : b.wait);
+        } else if (u.pathname.startsWith('/voice/ask/') && req.method === 'GET') {
+          const askId = decodeURIComponent(u.pathname.slice('/voice/ask/'.length));
+          const entry = voiceAsks.get(askId);
+          if (!entry) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'voice ask não encontrado' })); }
+          const w = u.searchParams.get('wait');
+          out = await waitVoiceAsk(entry, w === null ? 100 : Number(w));
+        } else {
+          res.writeHead(405, { 'Content-Type': 'application/json' });
+          return res.end(JSON.stringify({ error: 'método não suportado' }));
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify(out));
+      } catch (e) {
+        res.writeHead(e && e.status ? e.status : 400, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: e.message }));
       }
     }
     if (req.method !== 'POST' || !req.url.startsWith('/webhook')) { res.writeHead(404); return res.end(); }

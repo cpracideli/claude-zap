@@ -165,8 +165,40 @@ function connectRawWs({ port, pathAndQuery, headers = {} }) {
 
 function createMockGeminiServer() {
   const connections = [];
+  const httpCalls = [];
   let onConnectionHandler = null;
-  const server = http.createServer((_req, res) => { res.writeHead(404); res.end(); });
+  const server = http.createServer((req, res) => {
+    const bufs = [];
+    req.on('data', (d) => bufs.push(d));
+    req.on('end', () => {
+      const u = new URL(req.url || '/', 'http://local');
+      const rawBody = Buffer.concat(bufs).toString('utf8');
+      let jsonBody = null;
+      try { jsonBody = rawBody ? JSON.parse(rawBody) : null; } catch {}
+      httpCalls.push({ method: req.method, pathname: u.pathname, key: u.searchParams.get('key') || '', body: jsonBody });
+      if (req.method === 'GET' && u.pathname === '/v1beta/models') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          models: [
+            { name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] },
+            { name: 'models/gemini-3.5-transcribe-live', supportedGenerationMethods: ['bidiGenerateContent'] },
+            { name: 'models/gemini-2.5-flash-native-audio-preview-09-2025', supportedGenerationMethods: ['bidiGenerateContent'] },
+            { name: 'models/gemini-2.5-flash-native-audio-latest', supportedGenerationMethods: ['bidiGenerateContent', 'countTokens'] },
+            { name: 'models/gemini-3.8-live', supportedGenerationMethods: ['bidiGenerateContent'] },
+          ],
+        }));
+      }
+      if (req.method === 'POST' && u.pathname === '/v1alpha/auth_tokens') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({
+          name: 'auth_tokens/mock-ephemeral-' + crypto.randomBytes(6).toString('hex'),
+          expireTime: jsonBody && jsonBody.expireTime,
+        }));
+      }
+      res.writeHead(404);
+      res.end();
+    });
+  });
   server.on('upgrade', (req, socket, head) => {
     const key = String(req.headers['sec-websocket-key'] || '');
     const accept = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
@@ -242,8 +274,10 @@ function createMockGeminiServer() {
       const port = server.address().port;
       resolve({
         port,
+        httpBase: `http://127.0.0.1:${port}`,
         wsUrl: `ws://127.0.0.1:${port}/ws/gemini-live`,
         connections,
+        httpCalls,
         onConnection(fn) { onConnectionHandler = fn; },
         close() {
           for (const c of connections) { try { c.socket.destroy(); } catch {} }
@@ -284,7 +318,7 @@ setTimeout(() => {
     duration_ms: 50,
     total_cost_usd: 0.001,
   }));
-}, 30);
+}, p.includes('__SLOW__') ? 700 : 30);
 `);
   return fakeClaude;
 }
@@ -319,6 +353,7 @@ test('Gemini Live voice bridge end-to-end', async (t) => {
     BRIDGE_AUTO_TITLE: 'off',
     AI_MEMORY: 'off',
     GEMINI_API_KEY: '',
+    GEMINI_API_BASE: mockGemini.httpBase,
     GEMINI_LIVE_WS_URL: mockGemini.wsUrl,
     GEMINI_LIVE_PING_MS: '600',
     GEMINI_LIVE_RECONNECT_BASE_MS: '80',
@@ -656,5 +691,59 @@ test('Gemini Live voice bridge end-to-end', async (t) => {
     assert.deepEqual(receivedHandles, ['', 'handle-alpha-1', 'handle-beta-2']);
     client.close(1000);
     await wait(80);
+  });
+
+  await t.test('6. POST /admin/voice/live-token discovers native-audio model and returns constrained ephemeral token', async () => {
+    const unauth = await api('POST', '/voice/live-token', { chatId }, 'wrong');
+    assert.equal(unauth.status, 401);
+
+    const res = await api('POST', '/voice/live-token', { chatId, bot: infraBot.body.id });
+    assert.equal(res.status, 200, JSON.stringify(res));
+    assert.ok(res.body.token && res.body.token.startsWith('auth_tokens/'));
+    assert.equal(res.body.model, 'models/gemini-2.5-flash-native-audio-latest');
+    assert.equal(res.body.voice, 'Kore');
+    assert.ok(Date.parse(res.body.expiresAt) > Date.now() + 20 * 60000);
+    assert.ok(res.body.systemInstruction.includes('perguntar_agente'));
+    assert.ok(res.body.systemInstruction.includes('contexto anterior importante'));
+    assert.ok(!JSON.stringify(res.body).includes('vault-key-999'), 'must never leak real API key');
+
+    const authCall = mockGemini.httpCalls.find((c) => c.pathname === '/v1alpha/auth_tokens');
+    assert.ok(authCall);
+    assert.equal(authCall.key, 'vault-key-999');
+    assert.equal(authCall.body.uses, 1);
+    assert.equal(authCall.body.bidiGenerateContentSetup.model, 'models/gemini-2.5-flash-native-audio-latest');
+    assert.equal(authCall.body.bidiGenerateContentSetup.tools[0].functionDeclarations[0].name, 'perguntar_agente');
+    assert.deepEqual(authCall.body.bidiGenerateContentSetup.tools[0].functionDeclarations[0].parameters.required, ['pedido']);
+  });
+
+  await t.test('7. POST /admin/voice/ask and GET /admin/voice/ask/:id execute in chat history with sync + long-poll', async () => {
+    const bad = await api('POST', '/voice/ask', { chatId, text: '   ' });
+    assert.equal(bad.status, 400);
+
+    // Synchronous completion
+    const syncRes = await api('POST', '/voice/ask', { chatId, bot: infraBot.body.id, text: 'checar disco do servidor' });
+    assert.equal(syncRes.status, 200, JSON.stringify(syncRes));
+    assert.equal(syncRes.body.status, 'done');
+    assert.ok(syncRes.body.answer.includes('TOOL_RESULT(bot=Infra)'));
+    assert.ok(syncRes.body.answer.includes('checar disco do servidor'));
+
+    // Verify persisted in chat history
+    const hist = await api('GET', `/web/${webShortId}/messages`);
+    assert.ok(hist.body.messages.some((m) => m.role === 'user' && m.text === 'checar disco do servidor' && m.meta?.voiceCall === true));
+    assert.ok(hist.body.messages.some((m) => m.role === 'assistant' && m.text.includes('TOOL_RESULT(bot=Infra)') && m.meta?.voiceCall === true));
+
+    // Async long-poll flow (wait: 0 returns running + id, then GET /voice/ask/:id?wait=10 returns done)
+    const asyncStart = await api('POST', '/voice/ask', { chatId, bot: 'default', text: 'tarefa lenta __SLOW__', wait: 0 });
+    assert.equal(asyncStart.status, 200, JSON.stringify(asyncStart));
+    assert.equal(asyncStart.body.status, 'running');
+    assert.ok(asyncStart.body.id);
+
+    const polled = await api('GET', `/voice/ask/${asyncStart.body.id}?wait=10`);
+    assert.equal(polled.status, 200, JSON.stringify(polled));
+    assert.equal(polled.body.status, 'done');
+    assert.ok(polled.body.answer.includes('tarefa lenta __SLOW__'));
+
+    const missing = await api('GET', '/voice/ask/doesnotexist?wait=1');
+    assert.equal(missing.status, 404);
   });
 });
