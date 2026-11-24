@@ -9090,6 +9090,21 @@ function handleWaCallsSseEvent(ev) {
   if (callId && wacalls.pushedCalls.has(callId)) return;
   if (callId) wacalls.pushedCalls.set(callId, now);
   const peerLabel = formatWaCallPeer(ev.peer);
+  if (callId && autoAnswerPeerMatch(ev.peer)) {
+    const chatId = chats[AI_CALL_AUTO_ANSWER_CHAT] ? AI_CALL_AUTO_ANSWER_CHAT : '';
+    log('ai-call auto-answer', callId, 'peer=' + ev.peer);
+    startAiCall({
+      to: AI_CALL_AUTO_ANSWER_PHONE,
+      incoming: { callId, sessionId: String(ev.sessionId || '') },
+      purpose: 'O ' + (OWNER_NAME || 'Caio') + ' ligou para você. Não há um motivo pré-definido: pergunte/escute o que ele precisa e resolva, usando ask_agent para consultar dados reais ou executar ações.',
+      chatId,
+      bot: DEFAULT_BOT,
+    }, 'auto-answer').catch((e) => {
+      log('ai-call auto-answer falhou:', e.message);
+      notifyPush({ title: '📞 Ligação WhatsApp', body: 'Falha ao atender automaticamente ' + peerLabel + ': ' + e.message, tag: 'wacall-' + callId, url: '/#/calls' });
+    });
+    return;
+  }
   notifyPush({
     title: '📞 Ligação WhatsApp',
     body: 'Chamada recebida de ' + peerLabel,
@@ -9394,6 +9409,24 @@ const AI_CALL_FRAME_MS = Math.max(10, Number(env.AI_CALL_FRAME_MS || 20));
 const AI_CALL_END_DRAIN_MS = Math.max(200, Number(env.AI_CALL_END_DRAIN_MS || 5000));
 const AI_CALL_GREET_DELAY_MS = Math.max(0, Number(env.AI_CALL_GREET_DELAY_MS || 350));
 const AI_CALL_MAX_HISTORY = 50;
+// Ligações RECEBIDAS atendidas automaticamente pela IA (Gemini Live) — somente estes peers
+// (número e/ou LID do WhatsApp). Vazio/"off" desativa. Demais ligações seguem só com push.
+const AI_CALL_AUTO_ANSWER = String(env.AI_CALL_AUTO_ANSWER ?? '5511984691018,29631180763152@lid')
+  .split(',').map((x) => x.trim()).filter((x) => x && x !== 'off');
+const AI_CALL_AUTO_ANSWER_PHONE = String(env.AI_CALL_AUTO_ANSWER_PHONE || '5511984691018').replace(/\D/g, '');
+const AI_CALL_AUTO_ANSWER_CHAT = String(env.AI_CALL_AUTO_ANSWER_CHAT || '29631180763152@lid');
+function autoAnswerPeerMatch(peer) {
+  const p = String(peer || '').trim().toLowerCase();
+  if (!p || !AI_CALL_AUTO_ANSWER.length) return false;
+  const user = p.split('@')[0].split(':')[0];
+  const domain = p.includes('@') ? p.split('@')[1] : '';
+  return AI_CALL_AUTO_ANSWER.some((a) => {
+    const al = a.toLowerCase();
+    if (al.includes('@')) return al.split('@')[0] === user && al.split('@')[1] === domain;
+    const digits = al.replace(/\D/g, '');
+    return domain !== 'lid' && digits && user === digits;
+  });
+}
 const aiCalls = new Map();
 
 function parsePcmSampleRate(mimeType, fallback = 24000) {
@@ -9674,7 +9707,9 @@ function buildAiCallSystemPrompt(opts) {
   const nowStr = new Date().toLocaleString('pt-BR', { timeZone: TZ });
   const ownerLabel = OWNER_NAME || 'Caio';
   const peerLabel = '+' + opts.to;
-  const whoLine = opts.isOwnerCall
+  const whoLine = opts.incoming
+    ? ('LIGAÇÃO RECEBIDA: o próprio ' + ownerLabel + ' (' + peerLabel + ') ligou para você e você atendeu automaticamente. Atenda como assistente dele e ajude no que ele pedir.')
+    : opts.isOwnerCall
     ? ('Você está ligando para o próprio ' + ownerLabel + ' (' + peerLabel + ').')
     : ('Você está ligando para ' + peerLabel + ' a pedido de ' + ownerLabel + '.');
   const lines = [
@@ -9710,7 +9745,9 @@ function buildAiCallSystemPrompt(opts) {
 function formatAiCallSummary(rec) {
   const peerLabel = '+' + rec.to;
   const lines = [];
-  if (rec.status === 'no_answer') {
+  if (rec.direction === 'inbound') {
+    lines.push('📞 Ligação recebida de ' + peerLabel + ' atendida pela IA (' + (rec.durationSec || 0) + 's' + (rec.status === 'error' ? ', erro: ' + (rec.error || rec.endReason) : ', encerramento: ' + (rec.endReason || 'concluída')) + ').');
+  } else if (rec.status === 'no_answer') {
     lines.push('📞 Ligação IA para ' + peerLabel + ' — não atendeu.');
   } else if (rec.status === 'declined') {
     lines.push('📞 Ligação IA para ' + peerLabel + ' — recusada.');
@@ -9723,7 +9760,7 @@ function formatAiCallSummary(rec) {
   } else {
     lines.push('📞 Ligação IA para ' + peerLabel + ' (' + rec.durationSec + 's, encerramento: ' + (rec.endReason || 'concluída') + ').');
   }
-  if (rec.purpose) lines.push('Motivo: ' + rec.purpose.slice(0, 300));
+  if (rec.purpose && rec.direction !== 'inbound') lines.push('Motivo: ' + rec.purpose.slice(0, 300));
   if (Array.isArray(rec.transcript) && rec.transcript.length) {
     lines.push('Transcrição:');
     for (const item of rec.transcript) {
@@ -9854,6 +9891,7 @@ async function wacallsDeleteCall(sid, callId, ownerClientId) {
 async function startAiCall(body, via = 'api') {
   body = body && typeof body === 'object' ? body : {};
   const phone = normalizeCallPhone(body.to || body.phone);
+  const incoming = body.incoming && typeof body.incoming === 'object' && body.incoming.callId ? body.incoming : null;
   const purpose = String(body.purpose || body.context || body.message || '').trim().slice(0, 4000);
   if (!purpose) {
     const err = new Error('"purpose" (ou "context") obrigatório');
@@ -9896,7 +9934,7 @@ async function startAiCall(body, via = 'api') {
     err.status = 503;
     throw err;
   }
-  const requestedSid = String(body.sessionId || '').trim();
+  const requestedSid = String((incoming && incoming.sessionId) || body.sessionId || '').trim();
   const session = (requestedSid ? sessRes.sessions.find((s) => s && s.id === requestedSid && s.paired) : null)
     || sessRes.sessions.find((s) => s && s.paired && s.state === 'open')
     || sessRes.sessions.find((s) => s && s.paired);
@@ -9927,6 +9965,7 @@ async function startAiCall(body, via = 'api') {
     sessionId: session.id,
     to: phone,
     isOwner,
+    direction: incoming ? 'inbound' : 'outbound',
     purpose,
     chatId: resolvedChatId,
     bot: botId,
@@ -9990,16 +10029,22 @@ async function startAiCall(body, via = 'api') {
   sseReq.on('error', () => {});
   sseReq.end();
 
-  // Initiate outbound WhatsApp call via WaCalls
+  // Initiate outbound WhatsApp call via WaCalls (or accept the incoming one)
   let startResp;
   let startText = '';
   try {
-    startResp = await fetch(WACALLS_URL + '/api/sessions/' + encodeURIComponent(session.id) + '/calls', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Client-Id': ownerClientId },
-      body: JSON.stringify({ phone }),
-      signal: AbortSignal.timeout(15000),
-    });
+    startResp = incoming
+      ? await fetch(WACALLS_URL + '/api/sessions/' + encodeURIComponent(session.id) + '/calls/' + encodeURIComponent(String(incoming.callId)) + '/accept', {
+        method: 'POST',
+        headers: { 'X-Client-Id': ownerClientId },
+        signal: AbortSignal.timeout(15000),
+      })
+      : await fetch(WACALLS_URL + '/api/sessions/' + encodeURIComponent(session.id) + '/calls', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Client-Id': ownerClientId },
+        body: JSON.stringify({ phone }),
+        signal: AbortSignal.timeout(15000),
+      });
     startText = await startResp.text();
   } catch (e) {
     closeSse();
@@ -10167,7 +10212,9 @@ async function startAiCall(body, via = 'api') {
         clientContent: {
           turns: [{
             role: 'user',
-            parts: [{ text: '[A pessoa acabou de atender a ligação. Cumprimente de forma natural e breve e diga o motivo da ligação.]' }],
+            parts: [{ text: incoming
+              ? '[Você acabou de atender a ligação que o ' + (OWNER_NAME || 'Caio') + ' fez para você. Atenda de forma natural e bem breve (ex.: "Oi, ' + (OWNER_NAME || 'Caio') + ', pode falar!") e espere ele dizer o que precisa.]'
+              : '[A pessoa acabou de atender a ligação. Cumprimente de forma natural e breve e diga o motivo da ligação.]' }],
           }],
           turnComplete: true,
         },
@@ -10384,7 +10431,7 @@ async function startAiCall(body, via = 'api') {
 
     ws.addEventListener('open', () => {
       if (closed || geminiWs !== ws) { try { ws._bridgeIntentionalClose = true; ws.close(); } catch {} return; }
-      const sysText = buildAiCallSystemPrompt({ to: phone, isOwnerCall: isOwner, purpose, chatId: resolvedChatId, bot: activeBot, lang });
+      const sysText = buildAiCallSystemPrompt({ to: phone, isOwnerCall: isOwner, incoming: Boolean(incoming), purpose, chatId: resolvedChatId, bot: activeBot, lang });
       const setupPayload = {
         setup: {
           model: activeModel,
@@ -10516,6 +10563,7 @@ async function startAiCall(body, via = 'api') {
   });
 
   connectGemini();
+  if (incoming) markCallConnected();
 
   if (body.wait !== undefined && Number(body.wait) > 0) {
     return await waitAiCall(rec, Number(body.wait));
