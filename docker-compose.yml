@@ -968,6 +968,12 @@ services:
                 if (timedOut) return done({ error: 'tempo limite de ' + TIMEOUT_MS / 60000 + ' min atingido', timedOut: true });
                 if (!results.length) return done({ error: 'claude saiu com código ' + code + ': ' + (err || out).slice(-500) });
                 const last = results[results.length - 1];
+                // Lost session (e.g. after a provider failover): retry once fresh instead of returning an empty answer.
+                if (opts.resume && !opts._staleRetry && /No conversation found with session ID/i.test(err + out) && results.every((x) => !x.num_turns)) {
+                  clearTimeout(timer); inputOpen = false; if (running.get(chatId) === entry) running.delete(chatId);
+                  audit({ action: 'stale-session-reset', chatId, session: opts.resume });
+                  return resolve(runClaude(chatId, prompt, { ...opts, resume: undefined, _staleRetry: true }, onActivity, onEvent));
+                }
                 const sum = (k) => results.reduce((a, x) => a + (Number(x[k]) || 0), 0);
                 done({ text: results.map((x) => x.result || '').filter((x) => x.trim()).join('\n\n'), sessionId: last.session_id,
                   isError: results.some((x) => x.is_error), usage: { cost: sum('total_cost_usd'), ms: sum('duration_ms'), turns: sum('num_turns') } });
@@ -5349,13 +5355,131 @@ services:
             const h = crypto.createHash('sha256').update(t).digest('hex');
             return settings.localBridge.devices.find((d) => d.tokenHash && d.tokenHash.length === h.length && crypto.timingSafeEqual(Buffer.from(d.tokenHash), Buffer.from(h))) || null;
           }
-          function wsSendText(socket, str) {
-            const payload = Buffer.from(String(str), 'utf8');
+          function wsAcceptKey(key) {
+            return crypto.createHash('sha1').update(String(key || '') + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+          }
+          function wsEncodeFrame(opcode, payloadBuf) {
+            const payload = Buffer.isBuffer(payloadBuf) ? payloadBuf : Buffer.from(payloadBuf || '');
+            const first = 0x80 | (opcode & 0x0f);
             let hdr;
-            if (payload.length < 126) hdr = Buffer.from([0x81, payload.length]);
-            else if (payload.length < 65536) { hdr = Buffer.alloc(4); hdr[0] = 0x81; hdr[1] = 126; hdr.writeUInt16BE(payload.length, 2); }
-            else { hdr = Buffer.alloc(10); hdr[0] = 0x81; hdr[1] = 127; hdr.writeBigUInt64BE(BigInt(payload.length), 2); }
-            socket.write(Buffer.concat([hdr, payload]));
+            if (payload.length < 126) hdr = Buffer.from([first, payload.length]);
+            else if (payload.length < 65536) { hdr = Buffer.alloc(4); hdr[0] = first; hdr[1] = 126; hdr.writeUInt16BE(payload.length, 2); }
+            else { hdr = Buffer.alloc(10); hdr[0] = first; hdr[1] = 127; hdr.writeBigUInt64BE(BigInt(payload.length), 2); }
+            return Buffer.concat([hdr, payload]);
+          }
+          function wsWriteFrame(socket, opcode, payloadBuf, maxBuffered = 0) {
+            if (!socket || socket.destroyed || !socket.writable) return false;
+            if (maxBuffered > 0 && socket.writableLength > maxBuffered) return false;
+            try { return socket.write(wsEncodeFrame(opcode, payloadBuf)); } catch { return false; }
+          }
+          function wsSendText(socket, data) {
+            const str = typeof data === 'string' ? data : JSON.stringify(data);
+            return wsWriteFrame(socket, 0x01, Buffer.from(str, 'utf8'));
+          }
+          function wsSendBinary(socket, buf) {
+            const payload = Buffer.isBuffer(buf) ? buf : Buffer.from(buf);
+            return wsWriteFrame(socket, 0x02, payload, 4 * 1024 * 1024);
+          }
+          function wsSendPing(socket, payload) {
+            return wsWriteFrame(socket, 0x09, payload ? (Buffer.isBuffer(payload) ? payload : Buffer.from(payload)) : Buffer.alloc(0));
+          }
+          function wsSendPong(socket, payload) {
+            return wsWriteFrame(socket, 0x0a, payload ? (Buffer.isBuffer(payload) ? payload : Buffer.from(payload)) : Buffer.alloc(0));
+          }
+          function wsSendClose(socket, code, reason) {
+            let payload = Buffer.alloc(0);
+            if (code) {
+              const rBuf = reason ? Buffer.from(String(reason), 'utf8').subarray(0, 123) : Buffer.alloc(0);
+              payload = Buffer.alloc(2 + rBuf.length);
+              payload.writeUInt16BE(code, 0);
+              if (rBuf.length) rBuf.copy(payload, 2);
+            }
+            wsWriteFrame(socket, 0x08, payload);
+            try { socket.end(); } catch {}
+          }
+          const WS_MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+          function createWsFrameParser(socket, handlers, head) {
+            let buf = head && head.length ? Buffer.from(head) : Buffer.alloc(0);
+            let fragOpcode = 0;
+            let fragChunks = [];
+            let fragSize = 0;
+            let closed = false;
+            const drain = () => {
+              while (!closed && buf.length >= 2) {
+                const fin = (buf[0] & 0x80) !== 0;
+                const opcode = buf[0] & 0x0f;
+                const masked = (buf[1] & 0x80) !== 0;
+                let len = buf[1] & 0x7f, off = 2;
+                if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
+                else if (len === 127) {
+                  if (buf.length < 10) return;
+                  const big = buf.readBigUInt64BE(2);
+                  if (big > BigInt(WS_MAX_MESSAGE_BYTES)) { closed = true; wsSendClose(socket, 1009, 'message too big'); return; }
+                  len = Number(big);
+                  off = 10;
+                }
+                if (len > WS_MAX_MESSAGE_BYTES) { closed = true; wsSendClose(socket, 1009, 'message too big'); return; }
+                const need = off + (masked ? 4 : 0) + len;
+                if (buf.length < need) return;
+                let data = buf.subarray(off + (masked ? 4 : 0), need);
+                if (masked) {
+                  const mask = buf.subarray(off, off + 4);
+                  data = Buffer.from(data);
+                  for (let i = 0; i < data.length; i++) data[i] ^= mask[i % 4];
+                } else {
+                  data = Buffer.from(data);
+                }
+                buf = buf.subarray(need);
+                // Control frames (RFC 6455: may be interleaved with fragmented data frames)
+                if (opcode === 8) {
+                  closed = true;
+                  const code = data.length >= 2 ? data.readUInt16BE(0) : 1000;
+                  const reason = data.length > 2 ? data.subarray(2).toString('utf8') : '';
+                  wsSendClose(socket, code);
+                  if (handlers.onClose) handlers.onClose(code, reason);
+                  return;
+                }
+                if (opcode === 9) {
+                  wsSendPong(socket, data);
+                  continue;
+                }
+                if (opcode === 10) {
+                  if (handlers.onPong) handlers.onPong(data);
+                  continue;
+                }
+                // Data frames (text=1, binary=2, continuation=0)
+                if (opcode === 1 || opcode === 2) {
+                  if (fin) {
+                    fragOpcode = 0; fragChunks = []; fragSize = 0;
+                    if (opcode === 1 && handlers.onText) handlers.onText(data.toString('utf8'));
+                    else if (opcode === 2 && handlers.onBinary) handlers.onBinary(data);
+                  } else {
+                    fragOpcode = opcode;
+                    fragChunks = [data];
+                    fragSize = data.length;
+                  }
+                } else if (opcode === 0) {
+                  if (!fragOpcode) continue;
+                  fragSize += data.length;
+                  if (fragSize > WS_MAX_MESSAGE_BYTES) { closed = true; wsSendClose(socket, 1009, 'message too big'); return; }
+                  fragChunks.push(data);
+                  if (fin) {
+                    const full = Buffer.concat(fragChunks);
+                    const op = fragOpcode;
+                    fragOpcode = 0; fragChunks = []; fragSize = 0;
+                    if (op === 1 && handlers.onText) handlers.onText(full.toString('utf8'));
+                    else if (op === 2 && handlers.onBinary) handlers.onBinary(full);
+                  }
+                }
+              }
+            };
+            socket.on('data', (chunk) => {
+              if (closed) return;
+              buf = buf.length ? Buffer.concat([buf, chunk]) : Buffer.from(chunk);
+              drain();
+            });
+            if (buf.length) drain();
+            return { drain };
           }
           function attachLocalBridgeWs(req, socket, head) {
             const u = new URL(req.url || '/', 'http://local');
@@ -5486,6 +5610,513 @@ services:
               '}',
               'connect();',
             ].join('\n') + '\n';
+          }
+
+          // ---------- Gemini Live Voice Call (full-duplex real-time audio via BidiGenerateContent) ----------
+          const GEMINI_LIVE_WS_URL = env.GEMINI_LIVE_WS_URL || 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
+          const GEMINI_LIVE_DEFAULT_MODEL = String(env.GEMINI_LIVE_MODEL || 'models/gemini-3.8-live').trim();
+          const GEMINI_LIVE_FALLBACK_MODEL = String(env.GEMINI_LIVE_FALLBACK_MODEL || 'models/gemini-2.5-flash-native-audio-latest').trim();
+          const GEMINI_LIVE_DEFAULT_VOICE = String(env.GEMINI_LIVE_VOICE || 'Kore').trim();
+          const GEMINI_LIVE_PING_MS = Math.max(500, Number(env.GEMINI_LIVE_PING_MS || 25000));
+          const GEMINI_LIVE_RECONNECT_BASE_MS = Math.max(50, Number(env.GEMINI_LIVE_RECONNECT_BASE_MS || 600));
+          const GEMINI_LIVE_TOOL_TIMEOUT_MS = Math.max(1000, Number(env.GEMINI_LIVE_TOOL_TIMEOUT_MS || 90000));
+          const GEMINI_LIVE_MAX_RECONNECTS = 3;
+
+          function resolveGeminiApiKey() {
+            const fromVault = secrets.gemini_api_key && String(secrets.gemini_api_key.value || '').trim();
+            if (fromVault) return fromVault;
+            const fromEnv = String(env.GEMINI_API_KEY || '').trim();
+            if (fromEnv) return fromEnv;
+            const keyFile = env.GEMINI_API_KEY_FILE || path.join(env.HOME || '/tmp', '.config', 'gemini', 'api_key');
+            try {
+              const fromFile = fs.readFileSync(keyFile, 'utf8').trim();
+              if (fromFile) return fromFile;
+            } catch {}
+            return '';
+          }
+
+          function voiceLiveStatus() {
+            const hasKey = Boolean(resolveGeminiApiKey());
+            return {
+              realtime: hasKey,
+              provider: 'gemini-live',
+              model: GEMINI_LIVE_DEFAULT_MODEL,
+              voice: GEMINI_LIVE_DEFAULT_VOICE,
+              hasKey,
+              ...(hasKey ? {} : { reason: 'Chave Gemini não configurada (configure gemini_api_key no Cofre, GEMINI_API_KEY ou ~/.config/gemini/api_key)' }),
+            };
+          }
+
+          function buildVoiceLiveSystemPrompt(chatId, bot, lang) {
+            const b = bot || bots[DEFAULT_BOT] || { id: DEFAULT_BOT, name: 'Agent', description: '', instructions: '' };
+            const targetLang = String(lang || 'pt-BR').trim() || 'pt-BR';
+            const nowStr = new Date().toLocaleString('pt-BR', { timeZone: TZ });
+            const lines = [
+              'Você está em uma LIGAÇÃO DE VOZ EM TEMPO REAL (áudio bidirecional) com o usuário pelo painel Agent Control.',
+              'Identidade atual: bot "' + b.name + '" (id: ' + b.id + ').' + (b.description ? ' Descrição: ' + b.description : ''),
+              'Fuso horário do usuário: ' + TZ + '. Data/hora atual: ' + nowStr + '.',
+              'Idioma principal: ' + targetLang + '. Fale de forma natural, calorosa, direta e concisa, como em uma conversa telefônica real.',
+              'Regras de estilo falado: evite listas longas, asteriscos, markdown, URLs completas ou códigos ditados; resuma informações técnicas em frases curtas e claras. Se o usuário interromper, pare imediatamente e responda ao que ele acabou de dizer.',
+              'FERRAMENTA ask_agent: você tem acesso à ferramenta ask_agent, que aciona o agente completo da ponte com acesso real a WhatsApp, e-mail, memória, arquivos, código, Coolify, GitHub, agenda, controle do iPhone (IOS_Action) e outros bots especialistas.',
+              'Use ask_agent SEMPRE que o usuário pedir uma ação real (enviar mensagem, consultar e-mail, checar servidor, editar arquivo, criar lembrete, consultar memória/agenda, pesquisar dados externos ou locais). Não invente dados nem diga que não tem acesso: chame ask_agent com uma instrução clara e autossuficiente e, quando voltar, explique o resultado de forma natural em voz alta.',
+            ];
+            const others = Object.values(bots).filter((x) => x.id !== b.id);
+            if (others.length) {
+              lines.push('Bots especialistas disponíveis para o parâmetro opcional "bot" de ask_agent: ' +
+                others.map((x) => x.id + ' (' + x.name + (x.description ? ': ' + x.description.slice(0, 80) : '') + ')').join('; ') + '.');
+            }
+            if (b.instructions) {
+              lines.push('Instruções específicas deste bot (adapte para fala natural):\n' + String(b.instructions).slice(0, 4000));
+            }
+            if (b.memory === 'own') {
+              const mem = readBotMemory(b.id).trim();
+              if (mem) lines.push('Memória própria deste bot:\n' + mem.slice(0, 2000));
+            }
+            if (chatId) {
+              const rawList = isWeb(chatId)
+                ? webHistory(chatId).map((m) => ({ role: m.role, bot: m.bot, text: m.text || m.transcript || '' }))
+                : ((chats[chatId] && chats[chatId].recent) || []);
+              const recent = rawList.filter((m) => String(m.text || '').trim()).slice(-12);
+              if (recent.length) {
+                lines.push('Contexto recente desta conversa (últimas ' + recent.length + ' mensagens):\n' +
+                  recent.map((m) => {
+                    const speaker = m.role === 'user' ? 'Usuário' : ((m.bot && bots[m.bot] ? bots[m.bot].name : b.name) || 'Assistente');
+                    return speaker + ': ' + String(m.text || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+                  }).join('\n'));
+              }
+            }
+            return lines.join('\n\n');
+          }
+
+          async function executeVoiceAskAgent(chatId, activeBot, request, targetBotArg) {
+            const reqText = String(request || '').trim();
+            if (!reqText) throw new Error('parâmetro "request" vazio');
+            const resolvedBot = (targetBotArg && (bots[targetBotArg] || mentionBot(targetBotArg) || findBot(targetBotArg))) || activeBot || bots[DEFAULT_BOT];
+            const ephemeral = !chatId;
+            const execChatId = chatId || ('voice:' + crypto.randomBytes(4).toString('hex'));
+            if (ephemeral) {
+              const vc = chat(execChatId);
+              if (resolvedBot && resolvedBot.id !== DEFAULT_BOT) vc.bot = resolvedBot.id;
+            } else {
+              chat(execChatId);
+            }
+            audit({ action: 'voice-live-tool', chatId: chatId || '', bot: resolvedBot ? resolvedBot.id : DEFAULT_BOT, preview: reqText.slice(0, 80) });
+            const toolPrompt = '[Chamada de ferramenta durante ligação de voz em tempo real (ask_agent). Execute o pedido usando suas ferramentas se necessário e responda de forma objetiva, completa e direta — sua resposta será resumida em voz alta para o usuário.]\n\n' + reqText;
+            let timer = null;
+            let timedOut = false;
+            try {
+              const runPromise = new Promise((resolve, reject) => {
+                enqueue(execChatId, async () => {
+                  try {
+                    const started = Date.now();
+                    const r = await runTurn(execChatId, resolvedBot ? resolvedBot.id : null, toolPrompt, null, null, null, { noSteer: true, displayPrompt: reqText });
+                    const ms = r.usage ? r.usage.ms : Date.now() - started;
+                    recordRun(execChatId, { prompt: ('[voz] ' + reqText).slice(0, 80), ms, cost: r.usage ? r.usage.cost : 0, error: r.stopped ? 'interrompido' : r.error });
+                    resolve(r);
+                  } catch (e) {
+                    reject(e);
+                  }
+                });
+              });
+              const timeoutPromise = new Promise((resolve) => {
+                timer = setTimeout(() => {
+                  timedOut = true;
+                  const cur = running.get(execChatId);
+                  if (cur && cur.child) { try { cur.child.kill('SIGTERM'); } catch {} }
+                  resolve({ error: 'tempo limite excedido (' + Math.round(GEMINI_LIVE_TOOL_TIMEOUT_MS / 1000) + 's)' });
+                }, GEMINI_LIVE_TOOL_TIMEOUT_MS);
+              });
+              const r = await Promise.race([runPromise, timeoutPromise]);
+              if (timer) clearTimeout(timer);
+              if (!r) return 'Sem resposta do agente.';
+              if (timedOut || r.error) throw new Error(r.error || 'falha ao executar agente');
+              if (r.stopped) throw new Error('execução interrompida');
+              return String(r.text || 'Concluído sem texto de retorno.').trim().slice(0, 8000);
+            } finally {
+              if (timer) clearTimeout(timer);
+              if (ephemeral) { delete chats[execChatId]; }
+            }
+          }
+
+          async function decodeWsMessageText(data) {
+            if (typeof data === 'string') return data;
+            if (Buffer.isBuffer(data)) return data.toString('utf8');
+            if (data instanceof ArrayBuffer) return Buffer.from(data).toString('utf8');
+            if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString('utf8');
+            if (data && typeof data.text === 'function') return await data.text();
+            return String(data || '');
+          }
+
+          function attachVoiceLiveWs(req, socket, head) {
+            if (!adminAuthorized(req)) {
+              socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+              return socket.destroy();
+            }
+            const key = String(req.headers['sec-websocket-key'] || '');
+            if (!key) {
+              socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+              return socket.destroy();
+            }
+            const accept = wsAcceptKey(key);
+            socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n');
+
+            const u = new URL(req.url || '/', 'http://local');
+            const rawChatId = String(u.searchParams.get('chatId') || '').trim();
+            let resolvedChatId = rawChatId;
+            if (resolvedChatId && !chats[resolvedChatId] && !resolvedChatId.includes(':') && chats['web:' + resolvedChatId]) {
+              resolvedChatId = 'web:' + resolvedChatId;
+            }
+            const botParam = String(u.searchParams.get('bot') || '').trim();
+            const activeBot = (botParam && (bots[botParam] || mentionBot(botParam) || findBot(botParam)))
+              || (resolvedChatId && chats[resolvedChatId] ? botOf(chats[resolvedChatId]) : bots[DEFAULT_BOT]);
+            const lang = String(u.searchParams.get('lang') || 'pt-BR').trim() || 'pt-BR';
+            const voice = String(u.searchParams.get('voice') || GEMINI_LIVE_DEFAULT_VOICE).trim() || GEMINI_LIVE_DEFAULT_VOICE;
+
+            const apiKey = resolveGeminiApiKey();
+            if (!apiKey) {
+              wsSendText(socket, { type: 'error', message: 'Chave Gemini não configurada (configure gemini_api_key no Cofre, GEMINI_API_KEY ou ~/.config/gemini/api_key)', fatal: true });
+              wsSendClose(socket, 1008, 'missing gemini api key');
+              return;
+            }
+
+            let activeModel = GEMINI_LIVE_DEFAULT_MODEL;
+            let triedFallback = false;
+            let setupDone = false;
+            let everSetupDone = false;
+            let resumeHandle = '';
+            let reconnectAttempts = 0;
+            let closed = false;
+            let upstreamWs = null;
+            let reconnectTimer = null;
+            let upstreamQueue = Promise.resolve();
+            let pendingUserText = '';
+            let pendingAssistantText = '';
+            let turnCount = 0;
+            const cancelledCalls = new Set();
+
+            const pingTimer = setInterval(() => {
+              if (!closed) wsSendPing(socket);
+            }, GEMINI_LIVE_PING_MS);
+            if (pingTimer.unref) pingTimer.unref();
+
+            const persistVoiceMessage = (role, text) => {
+              const clean = String(text || '').trim();
+              if (!clean || !resolvedChatId) return;
+              try {
+                if (isWeb(resolvedChatId)) {
+                  const c = chat(resolvedChatId);
+                  if (role === 'user' && (!c.title || c.title === 'Nova conversa')) {
+                    c.title = clean.replace(/\s+/g, ' ').slice(0, 60);
+                    c.titleAuto = true;
+                    save();
+                  }
+                  webAppend(resolvedChatId, {
+                    role,
+                    text: clean,
+                    ...(role === 'assistant' ? { provider: 'gemini-live', bot: activeBot ? activeBot.id : DEFAULT_BOT, noPush: true } : {}),
+                    meta: { voiceCall: true, ...(role === 'assistant' ? { model: activeModel, voice } : {}) },
+                  });
+                } else {
+                  remember(resolvedChatId, role, clean, role === 'assistant' ? (activeBot ? activeBot.id : DEFAULT_BOT) : '');
+                }
+              } catch (e) {
+                log('voice-live persist failed:', e.message);
+              }
+            };
+
+            const flushUserTranscript = (emitToClient = true) => {
+              const uText = pendingUserText.trim();
+              if (!uText) return;
+              pendingUserText = '';
+              if (emitToClient && !closed) {
+                wsSendText(socket, { type: 'transcript', role: 'user', text: uText, delta: false, final: true });
+              }
+              persistVoiceMessage('user', uText);
+            };
+
+            const flushAssistantTranscript = (emitToClient = true) => {
+              const aText = pendingAssistantText.trim();
+              if (!aText) return;
+              pendingAssistantText = '';
+              if (emitToClient && !closed) {
+                wsSendText(socket, { type: 'transcript', role: 'assistant', text: aText, delta: false, final: true });
+              }
+              persistVoiceMessage('assistant', aText);
+            };
+
+            const flushTranscripts = (emitToClient = true) => {
+              flushUserTranscript(emitToClient);
+              flushAssistantTranscript(emitToClient);
+            };
+
+            const cleanup = (closeCode, closeReason) => {
+              if (closed) return;
+              closed = true;
+              clearInterval(pingTimer);
+              if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+              flushTranscripts(false);
+              if (upstreamWs) {
+                const wsRef = upstreamWs;
+                upstreamWs = null;
+                try { wsRef._bridgeIntentionalClose = true; wsRef.close(1000, 'client closed'); } catch {}
+              }
+              if (closeCode) wsSendClose(socket, closeCode, closeReason);
+              else { try { socket.end(); } catch {} }
+              audit({ action: 'voice-live-end', chatId: resolvedChatId || '', bot: activeBot ? activeBot.id : DEFAULT_BOT, turns: turnCount });
+            };
+
+            const sendUpstreamJson = (obj) => {
+              if (!upstreamWs || upstreamWs.readyState !== 1) return false;
+              try { upstreamWs.send(JSON.stringify(obj)); return true; } catch { return false; }
+            };
+
+            const handleToolCall = (fc) => {
+              const callId = String((fc && fc.id) || crypto.randomBytes(4).toString('hex'));
+              const fnName = String((fc && fc.name) || '');
+              const args = (fc && fc.args && typeof fc.args === 'object') ? fc.args : {};
+              if (fnName !== 'ask_agent') {
+                sendUpstreamJson({
+                  toolResponse: {
+                    functionResponses: [{ id: callId, name: fnName, response: { result: 'Ferramenta desconhecida: ' + fnName } }],
+                  },
+                });
+                return;
+              }
+              const request = String(args.request || '').trim();
+              const targetBotArg = String(args.bot || '').trim();
+              flushUserTranscript(true);
+              wsSendText(socket, { type: 'tool', name: 'ask_agent', status: 'running', detail: request });
+              executeVoiceAskAgent(resolvedChatId, activeBot, request, targetBotArg).then((result) => {
+                if (closed || cancelledCalls.has(callId)) return;
+                sendUpstreamJson({
+                  toolResponse: {
+                    functionResponses: [{ id: callId, name: 'ask_agent', response: { result } }],
+                  },
+                });
+                wsSendText(socket, { type: 'tool', name: 'ask_agent', status: 'done', detail: request, summary: result.slice(0, 300) });
+              }).catch((err) => {
+                if (closed || cancelledCalls.has(callId)) return;
+                const errMsg = String((err && err.message) || err || 'erro desconhecido');
+                sendUpstreamJson({
+                  toolResponse: {
+                    functionResponses: [{ id: callId, name: 'ask_agent', response: { result: 'Erro ao executar ask_agent: ' + errMsg } }],
+                  },
+                });
+                wsSendText(socket, { type: 'tool', name: 'ask_agent', status: 'error', detail: request, summary: errMsg.slice(0, 300) });
+              });
+            };
+
+            const handleUpstreamMessage = (msg, isResumed) => {
+              if (closed || !msg || typeof msg !== 'object') return;
+              if (msg.setupComplete !== undefined) {
+                setupDone = true;
+                everSetupDone = true;
+                reconnectAttempts = 0;
+                wsSendText(socket, {
+                  type: 'ready',
+                  model: activeModel,
+                  voice,
+                  sampleRateIn: 16000,
+                  sampleRateOut: 24000,
+                  ...(isResumed ? { resumed: true } : {}),
+                });
+              }
+              if (msg.sessionResumptionUpdate && msg.sessionResumptionUpdate.newHandle && msg.sessionResumptionUpdate.resumable !== false) {
+                resumeHandle = String(msg.sessionResumptionUpdate.newHandle);
+              }
+              if (msg.goAway) {
+                if (!closed && resumeHandle && reconnectAttempts < GEMINI_LIVE_MAX_RECONNECTS) {
+                  reconnectAttempts += 1;
+                  wsSendText(socket, { type: 'reconnecting', reason: 'goAway' });
+                  if (upstreamWs) {
+                    const oldWs = upstreamWs;
+                    upstreamWs = null;
+                    try { oldWs._bridgeIntentionalClose = true; oldWs.close(1000, 'reconnecting'); } catch {}
+                  }
+                  setupDone = false;
+                  const delay = GEMINI_LIVE_RECONNECT_BASE_MS * Math.pow(2, reconnectAttempts - 1);
+                  reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!closed) connectUpstream(true); }, delay);
+                  return;
+                }
+              }
+              if (msg.toolCallCancellation && Array.isArray(msg.toolCallCancellation.ids)) {
+                for (const id of msg.toolCallCancellation.ids) cancelledCalls.add(String(id));
+              }
+              if (msg.toolCall && Array.isArray(msg.toolCall.functionCalls)) {
+                for (const fc of msg.toolCall.functionCalls) handleToolCall(fc);
+              }
+              const sc = msg.serverContent;
+              if (sc && typeof sc === 'object') {
+                if (sc.inputTranscription && typeof sc.inputTranscription.text === 'string' && sc.inputTranscription.text) {
+                  const chunk = sc.inputTranscription.text;
+                  pendingUserText += chunk;
+                  wsSendText(socket, { type: 'transcript', role: 'user', text: chunk, delta: true, final: false });
+                }
+                if (sc.modelTurn && Array.isArray(sc.modelTurn.parts)) {
+                  for (const part of sc.modelTurn.parts) {
+                    if (part && part.inlineData && part.inlineData.data) {
+                      const mime = String(part.inlineData.mimeType || '').toLowerCase();
+                      if (mime.startsWith('audio/pcm')) {
+                        flushUserTranscript(true);
+                        const pcm = Buffer.from(part.inlineData.data, 'base64');
+                        if (pcm.length) wsSendBinary(socket, pcm);
+                      }
+                    }
+                  }
+                }
+                if (sc.outputTranscription && typeof sc.outputTranscription.text === 'string' && sc.outputTranscription.text) {
+                  flushUserTranscript(true);
+                  const chunk = sc.outputTranscription.text;
+                  pendingAssistantText += chunk;
+                  wsSendText(socket, { type: 'transcript', role: 'assistant', text: chunk, delta: true, final: false });
+                }
+                if (sc.interrupted) {
+                  flushTranscripts(true);
+                  wsSendText(socket, { type: 'interrupted' });
+                }
+                if (sc.turnComplete) {
+                  turnCount += 1;
+                  flushTranscripts(true);
+                  wsSendText(socket, { type: 'turn_complete' });
+                }
+              }
+            };
+
+            const connectUpstream = (isResumed = false) => {
+              if (closed) return;
+              setupDone = false;
+              const url = GEMINI_LIVE_WS_URL + (GEMINI_LIVE_WS_URL.includes('?') ? '&' : '?') + 'key=' + encodeURIComponent(apiKey);
+              let ws;
+              try {
+                ws = new WebSocket(url);
+              } catch (e) {
+                wsSendText(socket, { type: 'error', message: 'Erro ao conectar ao Gemini Live: ' + e.message, fatal: true });
+                return cleanup(1011, 'upstream connect error');
+              }
+              upstreamWs = ws;
+              let lastError = '';
+
+              ws.addEventListener('open', () => {
+                if (closed || upstreamWs !== ws) { try { ws._bridgeIntentionalClose = true; ws.close(); } catch {} return; }
+                const sysText = buildVoiceLiveSystemPrompt(resolvedChatId, activeBot, lang);
+                const setupPayload = {
+                  setup: {
+                    model: activeModel,
+                    generationConfig: {
+                      responseModalities: ['AUDIO'],
+                      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
+                    },
+                    systemInstruction: { parts: [{ text: sysText }] },
+                    inputAudioTranscription: {},
+                    outputAudioTranscription: {},
+                    sessionResumption: resumeHandle ? { handle: resumeHandle } : {},
+                    contextWindowCompression: { slidingWindow: {} },
+                    tools: [{
+                      functionDeclarations: [{
+                        name: 'ask_agent',
+                        description: 'Aciona o agente completo da ponte com acesso a todas as ferramentas (WhatsApp, e-mail, memória, arquivos, código, Coolify, GitHub, agenda, iPhone IOS_Action, outros bots). Use sempre que precisar executar uma ação real ou consultar dados externos/locais.',
+                        parameters: {
+                          type: 'OBJECT',
+                          properties: {
+                            request: { type: 'STRING', description: 'Instrução clara e autossuficiente do que executar ou consultar' },
+                            bot: { type: 'STRING', description: 'ID opcional de um bot especialista (ex: infra, email, familia, trabalho, viagens, radar, arquivista). Omita para usar o bot atual do chat.' },
+                          },
+                          required: ['request'],
+                        },
+                      }],
+                    }],
+                  },
+                };
+                try { ws.send(JSON.stringify(setupPayload)); }
+                catch (e) { lastError = e.message; }
+              });
+
+              ws.addEventListener('message', (ev) => {
+                if (closed || upstreamWs !== ws) return;
+                upstreamQueue = upstreamQueue.then(async () => {
+                  if (closed || upstreamWs !== ws) return;
+                  const txt = await decodeWsMessageText(ev.data);
+                  let parsed;
+                  try { parsed = JSON.parse(txt); } catch { return; }
+                  handleUpstreamMessage(parsed, isResumed);
+                }).catch((e) => { log('voice-live upstream msg err:', e.message); });
+              });
+
+              ws.addEventListener('error', (ev) => {
+                lastError = (ev && ev.message) || 'erro na conexão WebSocket com Gemini Live';
+              });
+
+              ws.addEventListener('close', (ev) => {
+                if (closed || ws._bridgeIntentionalClose || upstreamWs !== ws) return;
+                upstreamWs = null;
+                const code = Number((ev && ev.code) || 1006);
+                const reason = String((ev && ev.reason) || lastError || ('código ' + code));
+                // Fallback model if initial setup failed on primary model
+                if (!everSetupDone && !triedFallback && GEMINI_LIVE_FALLBACK_MODEL && activeModel !== GEMINI_LIVE_FALLBACK_MODEL) {
+                  log('voice-live setup failed on', activeModel, '(' + reason + '), falling back to', GEMINI_LIVE_FALLBACK_MODEL);
+                  triedFallback = true;
+                  activeModel = GEMINI_LIVE_FALLBACK_MODEL;
+                  resumeHandle = '';
+                  connectUpstream(false);
+                  return;
+                }
+                // Recoverable drop after setup with session resumption handle
+                const unrecoverable = code === 4001 || code === 4003 || code === 1008;
+                if (everSetupDone && !unrecoverable && resumeHandle && reconnectAttempts < GEMINI_LIVE_MAX_RECONNECTS) {
+                  reconnectAttempts += 1;
+                  setupDone = false;
+                  wsSendText(socket, { type: 'reconnecting', reason });
+                  const delay = GEMINI_LIVE_RECONNECT_BASE_MS * Math.pow(2, reconnectAttempts - 1);
+                  reconnectTimer = setTimeout(() => { reconnectTimer = null; if (!closed) connectUpstream(true); }, delay);
+                  return;
+                }
+                wsSendText(socket, { type: 'error', message: 'Conexão Gemini Live encerrada: ' + reason, fatal: true });
+                cleanup(1011, 'upstream closed');
+              });
+            };
+
+            createWsFrameParser(socket, {
+              onBinary(buf) {
+                if (closed || !setupDone || !buf || !buf.length) return;
+                sendUpstreamJson({
+                  realtimeInput: {
+                    audio: { mimeType: 'audio/pcm;rate=16000', data: buf.toString('base64') },
+                  },
+                });
+              },
+              onText(str) {
+                if (closed) return;
+                let msg;
+                try { msg = JSON.parse(str); } catch { return; }
+                if (!msg || typeof msg !== 'object') return;
+                if (msg.type === 'ping') {
+                  wsSendText(socket, { type: 'pong', ts: Date.now() });
+                  return;
+                }
+                if (msg.type === 'audio_end') {
+                  if (setupDone) sendUpstreamJson({ realtimeInput: { audioStreamEnd: true } });
+                  return;
+                }
+                if (msg.type === 'text') {
+                  const txt = String(msg.text || '').trim();
+                  if (!txt || !setupDone) return;
+                  pendingUserText = pendingUserText ? (pendingUserText + ' ' + txt) : txt;
+                  sendUpstreamJson({
+                    clientContent: {
+                      turns: [{ role: 'user', parts: [{ text: txt }] }],
+                      turnComplete: true,
+                    },
+                  });
+                }
+              },
+              onClose() { cleanup(); },
+            }, head);
+
+            socket.on('close', () => cleanup());
+            socket.on('error', () => cleanup());
+
+            audit({ action: 'voice-live-start', chatId: resolvedChatId || '', bot: activeBot ? activeBot.id : DEFAULT_BOT, model: activeModel, voice });
+            connectUpstream(false);
           }
 
           // ---------- periodic maintenance (trash pruning + durable job recovery) ----------
@@ -9283,9 +9914,12 @@ services:
                   return res.end(script);
                 }
               }
+              if (a === 'voice' && b === 'status' && m === 'GET') {
+                return send(200, voiceLiveStatus());
+              }
               if (a === 'voice' && b === 'live-config' && m === 'GET') {
                 const gemSec = secrets.gemini_api_key || secrets.google_api_key || null;
-                const key = (gemSec && gemSec.value) || env.GEMINI_API_KEY || '';
+                const key = (gemSec && gemSec.value) || resolveGeminiApiKey();
                 return send(200, { geminiConfigured: Boolean(key), geminiKey: u.searchParams.get('internal') === '1' ? key : undefined });
               }
               if (a === 'audit' && b === 'csv' && m === 'GET') {
@@ -9694,11 +10328,14 @@ services:
             }
           }
 
-          // WebSocket proxy for live computer noVNC (/admin/computer/ws) AND Local Computer Bridge (/admin/local-bridge/ws)
+          // WebSocket proxy for live computer noVNC (/admin/computer/ws), Local Computer Bridge (/admin/local-bridge/ws) and Gemini Live Voice (/admin/voice/ws)
           server.on('upgrade', (req, socket, head) => {
             const u = new URL(req.url || '/', 'http://local');
             if (u.pathname === '/admin/local-bridge/ws') {
               return attachLocalBridgeWs(req, socket, head);
+            }
+            if (u.pathname === '/admin/voice/ws') {
+              return attachVoiceLiveWs(req, socket, head);
             }
             if (u.pathname !== '/admin/computer/ws' || !adminAuthorized(req)) {
               socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
