@@ -907,7 +907,7 @@ function runClaude(chatId, prompt, opts, onActivity, onEvent) {
       if (opts.resume && !opts._staleRetry && /No conversation found with session ID/i.test(err + out) && results.every((x) => !x.num_turns)) {
         clearTimeout(timer); inputOpen = false; if (running.get(chatId) === entry) running.delete(chatId);
         audit({ action: 'stale-session-reset', chatId, session: opts.resume });
-        return resolve(runClaude(chatId, prompt, { ...opts, resume: undefined, _staleRetry: true }, onActivity, onEvent));
+        return resolve(runClaude(chatId, opts.handoff && opts.basePrompt !== undefined ? opts.handoff + opts.basePrompt : prompt, { ...opts, resume: undefined, _staleRetry: true }, onActivity, onEvent));
       }
       const sum = (k) => results.reduce((a, x) => a + (Number(x[k]) || 0), 0);
       done({ text: results.map((x) => x.result || '').filter((x) => x.trim()).join('\n\n'), sessionId: last.session_id,
@@ -1667,10 +1667,12 @@ async function runAgent(chatId, prompt, opts, onActivity, onEvent) {
       const order = Array.isArray(routing.fallbackOrder) && routing.fallbackOrder.length
         ? routing.fallbackOrder
         : ['antigravity', 'claude', 'copilot', 'opencode', 'openai_compat'];
+      // The next provider starts a fresh session: give it the conversation so far (runTurn passes it in opts.handoff).
+      const failoverPrompt = opts.handoff && opts.basePrompt !== undefined ? (sem.text || '') + opts.handoff + opts.basePrompt : actualPrompt;
       for (const nextProv of order) {
         if (!PROVIDERS[nextProv] || nextProv === provider || !isProviderAvailable(nextProv)) continue;
         log('provider failover:', provider, '->', nextProv, 'reason:', String(r.error).slice(0, 120));
-        const r2 = await invokeProviderOnce(nextProv, chatId, actualPrompt, cfg, { ...opts, resume: undefined, modelOverride: '', noFallback: true, displayPrompt }, onActivity, onEvent);
+        const r2 = await invokeProviderOnce(nextProv, chatId, failoverPrompt, cfg, { ...opts, resume: undefined, modelOverride: '', noFallback: true, displayPrompt }, onActivity, onEvent);
         if (r2 && !r2.error && !r2.stopped) {
           fallbackFrom = provider;
           usedProvider = nextProv;
@@ -2010,7 +2012,7 @@ async function command(chatId, body) {
       return sendMenu(chatId, 'O que você quer fazer?', HELP_MENU, helpTxt);
     }
     case '/new':
-      delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; delete c.cpSession; delete c.olSession; save();
+      resetSessions(c); save();
       return reply(chatId, 'Nova conversa iniciada com ' + botLabel(botOf(c)) + '. Modelo: ' + (runConfig(c).model || 'padrão') + '.', true);
     case '/provider': {
       const cur = PROVIDERS[providerOf(c)];
@@ -2072,7 +2074,7 @@ async function command(chatId, body) {
       const b = findBot(arg);
       if (!b) return reply(chatId, 'Bot não encontrado. Disponíveis: ' + Object.values(bots).map((x) => x.name).join(', ') + '.', true);
       if (b.id === DEFAULT_BOT) delete c.bot; else c.bot = b.id;
-      delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; save();
+      resetSessions(c); save();
       audit({ action: 'chat-bot', chatId, bot: b.id });
       return reply(chatId, 'Agora quem responde é ' + botLabel(b) + '. Conversa nova iniciada.', true);
     }
@@ -2092,7 +2094,7 @@ async function command(chatId, body) {
         '*Status*',
         'Bot: ' + botLabel(botOf(c)),
         'Provedor: ' + PROVIDERS[providerOf(c)],
-        'Sessão: ' + (((providerOf(c) === 'antigravity' ? c.agySession : providerOf(c) === 'opencode' ? c.ocSession : c.session) || '').slice(0, 8) || 'nenhuma (próxima mensagem inicia uma)'),
+        'Sessão: ' + ((c[sessionKey(providerOf(c))] || '').slice(0, 8) || 'nenhuma (próxima mensagem inicia uma)') + (c.lastProvider && c.lastProvider !== providerOf(c) ? ' | última resposta: ' + PROVIDERS[c.lastProvider] + ' (contexto será repassado)' : ''),
         providerOf(c) === 'antigravity'
           ? 'Modelo: ' + agyModelLabel(c) + ' | Esforço: ' + (c.agyEffort || 'padrão') + ' | enviado ao agy: ' + (resolveAgyRun(c).model || 'padrão')
           : 'Modelo: ' + (runConfig(c).model || 'padrão da conta') + ' | Esforço: ' + (runConfig(c).effort || 'padrão'),
@@ -2182,7 +2184,7 @@ async function handleWebCommand(chatId, body) {
     case '/help':
       return out('**Comandos disponíveis no Chat Web:**\n- `/new` — inicia nova sessão limpa\n- `/status` — mostra bot, provedor, modelo e fila\n- `/usage` — uso desta conversa e gasto do mês\n- `/log [n]` — últimas execuções\n- `/provider <claude|antigravity|copilot|opencode|openai_compat>` — troca provedor\n- `/model <id|default>` — troca modelo\n- `/effort <low|medium|high|xhigh|max|default>` — troca esforço\n- `/bot <nome>` — troca bot da conversa\n- `/stop` — interrompe execução atual\n- `/schedules` — lista agendamentos desta conversa\n- `/council <pergunta>` — consulta múltiplos modelos em paralelo e sintetiza\n- `/<slug-da-skill>` — executa uma skill');
     case '/new':
-      delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; delete c.cpSession; delete c.olSession; save();
+      resetSessions(c); save();
       return out('Nova conversa iniciada com **' + botLabel(botOf(c)) + '**. Provedor: ' + PROVIDERS[providerOf(c)] + '.');
     case '/provider': {
       if (!arg) return out('Provedor atual: **' + PROVIDERS[providerOf(c)] + '**. Use `/provider claude`, `/provider antigravity`, `/provider copilot`, `/provider opencode`, `/provider ollama` ou `/provider openai_compat`.');
@@ -2216,7 +2218,7 @@ async function handleWebCommand(chatId, body) {
       const b = findBot(arg);
       if (!b) return out('Bot não encontrado. Disponíveis: ' + Object.values(bots).map((x) => x.name).join(', ') + '.');
       if (b.id === DEFAULT_BOT) delete c.bot; else c.bot = b.id;
-      delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; save();
+      resetSessions(c); save();
       audit({ action: 'chat-bot', chatId, bot: b.id, via: 'web-cmd' });
       return out('Agora quem responde é **' + botLabel(b) + '**. Nova sessão iniciada.');
     }
@@ -2318,7 +2320,7 @@ async function handleMessage(msg) {
   if (guest) {
     const gBot = bots[guest.bot] ? guest.bot : DEFAULT_BOT;
     if (body.toLowerCase() === '/new') {
-      const gc = chat(chatId); delete gc.session; delete gc.agySession; delete gc.ocSession; save();
+      const gc = chat(chatId); resetSessions(gc); save();
       return reply(chatId, 'Nova conversa iniciada com ' + botLabel(bots[gBot]) + '.', true);
     }
     if (body.toLowerCase() === '/help') {
@@ -2459,27 +2461,120 @@ function enqueueWhatsAppPrompt(chatId, number, body) {
   });
 }
 
+// ---------- provider handoff ----------
+// Each provider keeps its own session (Claude/Ollama: Claude Code session, agy, opencode, copilot, openai_compat file).
+// A provider's session only knows the turns it answered itself, so after /provider, a failover or light routing the
+// next provider would resume an old session (or start an empty one) without what happened in between. The chat keeps
+// a provider-independent transcript (c.transcript, with a sequence number per entry); every saved session remembers
+// the sequence it is in sync with (store.sessSeq[key]). A session that is behind gets the missing turns injected;
+// a fresh session gets the recent transcript.
+const SESSION_KEYS = ['session', 'agySession', 'ocSession', 'olSession', 'cpSession', 'compatSession'];
+function sessionKey(prov) {
+  return prov === 'antigravity' ? 'agySession' : prov === 'opencode' ? 'ocSession' : prov === 'copilot' ? 'cpSession'
+    : prov === 'ollama' ? 'olSession' : prov === 'openai_compat' ? 'compatSession' : 'session';
+}
+// /new, reset, bot change: drops every provider session (and, unless keepTranscript, the shared transcript).
+function resetSessions(c, keepTranscript) {
+  for (const k of SESSION_KEYS) delete c[k];
+  delete c.sessSeq; delete c.sessProv;
+  if (!keepTranscript) { delete c.transcript; delete c.lastProvider; }
+}
+const HANDOFF_ENTRY_CHARS = Number(env.HANDOFF_ENTRY_CHARS || 1500);
+const HANDOFF_MAX_CHARS = Number(env.HANDOFF_MAX_CHARS || 9000);
+const TRANSCRIPT_KEEP = Number(env.HANDOFF_TRANSCRIPT_KEEP || 24);
+function clipMiddle(text, max) {
+  const t = String(text || '').trim();
+  if (t.length <= max) return t;
+  const head = Math.floor(max * 0.4), tail = max - head - 12;
+  return t.slice(0, head) + '\n[…cortado…]\n' + t.slice(-tail);
+}
+function transcriptAppend(c, entry) {
+  c.tseq = (c.tseq || 0) + 1;
+  c.transcript = [...(c.transcript || []), { seq: c.tseq, at: new Date().toISOString(), ...entry, text: clipMiddle(entry.text, HANDOFF_ENTRY_CHARS) }].slice(-TRANSCRIPT_KEEP);
+  return c.tseq;
+}
+// Text block with the transcript entries after sequence `since` (0 = everything kept), newest kept within budget.
+function handoffBlock(c, since, reason) {
+  const list = (c.transcript || []).filter((e) => e.seq > (since || 0));
+  if (!list.length) return '';
+  const lines = [];
+  let used = 0, cut = false;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const e = list[i];
+    const who = e.role === 'user' ? 'Usuário' : ((bots[e.bot] ? bots[e.bot].name : 'Assistente') + (e.provider ? ' via ' + (PROVIDERS[e.provider] || e.provider) : ''));
+    const line = '- ' + who + ': ' + clipMiddle(e.text, HANDOFF_ENTRY_CHARS) + (e.error ? ' [falhou: ' + String(e.error).slice(0, 160) + ']' : '') + (e.stopped ? ' [interrompido]' : '');
+    if (used + line.length > HANDOFF_MAX_CHARS && lines.length) { cut = true; break; }
+    lines.unshift(line); used += line.length;
+  }
+  const older = cut || ((c.transcript || [])[0] && since && c.transcript[0].seq > since + 1);
+  return '[Contexto da conversa (' + reason + '). Este histórico é desta mesma conversa: use-o para continuar de onde parou, ' +
+    'inclusive tarefas em andamento, sem pedir que o usuário repita.' + (older ? ' Mensagens mais antigas foram omitidas.' : '') + ']\n' +
+    lines.join('\n') + '\n[Fim do contexto]\n\n';
+}
+// Decides, for the provider that will answer, whether to resume its session and what context to inject.
+function planHandoff(c, store, prov, isGroup) {
+  const key = sessionKey(prov);
+  const seq = (store.sessSeq || {})[key];
+  const hasTranscript = (c.transcript || []).length > 0;
+  let resume = store[key];
+  // Sessions saved before this feature have no sequence: only trust them if this provider answered last.
+  if (resume && seq === undefined && hasTranscript && c.lastProvider && c.lastProvider !== prov) resume = undefined;
+  if (resume && seq !== undefined && (c.transcript || []).length && c.transcript[0].seq > seq + 1) resume = undefined; // too far behind
+  const fullCtx = isGroup || !hasTranscript ? '' : handoffBlock(c, 0, 'troca de provedor: ' + (PROVIDERS[prov] || prov) + ' assumiu a conversa');
+  if (!resume) return { key, resume: undefined, context: fullCtx, fullCtx, stale: Boolean(store[key]) };
+  const behind = seq !== undefined && (c.tseq || 0) > seq;
+  const context = behind && !isGroup ? handoffBlock(c, seq, 'o que aconteceu nesta conversa enquanto outro provedor respondia') : '';
+  return { key, resume, context, fullCtx, stale: false };
+}
+
 // One turn of one bot in a chat: resumes that bot's session in this chat, retries from a fresh session only when
 // resuming failed (not on timeouts or stops: re-running a timed-out task could repeat side effects), saves the
 // session. botId null = the chat's own bot, with the chat's overrides. Other bots keep their sessions per chat
-// in c.botSessions.
+// in c.botSessions. Provider changes are bridged with the transcript (see planHandoff).
 async function runTurn(chatId, botId, prompt, onActivity, onEvent, onRetry, extra) {
   const c = chat(chatId);
   const id = botId || botOf(c).id;
   const own = id === botOf(c).id;
   const prov = runConfig(c, own ? undefined : id).provider;
-  const key = prov === 'antigravity' ? 'agySession' : prov === 'opencode' ? 'ocSession' : prov === 'copilot' ? 'cpSession' : prov === 'ollama' ? 'olSession' : 'session';
   const store = own ? c : ((c.botSessions = c.botSessions || {})[id] = c.botSessions[id] || {});
-  const opts = { resume: store[key], bot: own ? undefined : id, ...(extra || {}) };
-  let r = await runAgent(chatId, prompt, opts, onActivity, onEvent);
+  // Sessions of openai_compat used to share "session" with Claude: move them to their own key.
+  if (typeof store.session === 'string' && store.session.startsWith('compat-')) { store.compatSession = store.compatSession || store.session; delete store.session; }
+  // Chats from before the transcript existed: seed it from the WhatsApp recent list / web history (minus the
+  // message being answered now), so the first provider switch after the upgrade still carries context.
+  if (!c.tseq) {
+    const old = (isWeb(chatId) ? webHistory(chatId).map((m) => ({ role: m.role, bot: m.bot, provider: m.provider, text: m.text || m.transcript || '' })) : (c.recent || []))
+      .filter((m) => (m.role === 'user' || m.role === 'assistant') && String(m.text || '').trim());
+    if (old.length && old[old.length - 1].role === 'user') old.pop();
+    for (const m of old.slice(-16)) transcriptAppend(c, { role: m.role, ...(m.bot ? { bot: m.bot } : {}), ...(m.provider ? { provider: m.provider } : {}), text: m.text });
+  }
+  const isGroup = String(prompt || '').startsWith('[Conversa em grupo:');
+  const plan = planHandoff(c, store, prov, isGroup);
+  if (plan.stale) { audit({ action: 'handoff-stale-session', chatId, provider: prov }); delete store[plan.key]; }
+  if (plan.context) audit({ action: 'provider-handoff', chatId, provider: prov, from: c.lastProvider || '', resume: Boolean(plan.resume), chars: plan.context.length });
+  const opts = { resume: plan.resume, bot: own ? undefined : id, handoff: plan.fullCtx, basePrompt: prompt, ...(extra || {}) };
+  let r = await runAgent(chatId, plan.context + prompt, opts, onActivity, onEvent);
   if (r.error && opts.resume && !r.stopped && !r.timedOut) {
     log('resume failed, starting fresh:', r.error);
-    delete store[key];
+    delete store[plan.key];
     if (onRetry) onRetry();
     const more = (r.injected || []).map((x) => '\n\n' + STEER_NOTE + x).join('');
-    r = await runAgent(chatId, prompt + more, { ...opts, resume: undefined }, onActivity, onEvent);
+    r = await runAgent(chatId, plan.fullCtx + prompt + more, { ...opts, resume: undefined, basePrompt: prompt + more }, onActivity, onEvent);
   }
-  if (r.sessionId) store[key] = r.sessionId;
+  // The provider that actually answered (failover / light routing may differ from the configured one).
+  const used = r.provider && PROVIDERS[r.provider] ? r.provider : prov;
+  const usedKey = sessionKey(used);
+  if (!r.stopped || r.text) {
+    const userText = String((extra && extra.displayPrompt) || prompt || '').replace(/^\[Conversa em grupo:[\s\S]*?\[Mensagem do usuário\]\n/, '');
+    const last = (c.transcript || [])[(c.transcript || []).length - 1];
+    const injected = (r.injected || []).length ? '\n' + r.injected.map((x) => '(mensagem adicional) ' + x).join('\n') : '';
+    if (!(last && last.role === 'user' && last.text === userText && isGroup)) transcriptAppend(c, { role: 'user', text: userText + injected });
+    transcriptAppend(c, { role: 'assistant', bot: id, provider: used, text: r.text || '', ...(r.error ? { error: String(r.error).slice(0, 300) } : {}), ...(r.stopped ? { stopped: true } : {}) });
+  }
+  if (r.sessionId) {
+    store[usedKey] = r.sessionId;
+    store.sessSeq = { ...(store.sessSeq || {}), [usedKey]: c.tseq || 0 };
+  }
+  if (!r.error) c.lastProvider = used;
   if (r.usage) c.lastUsage = r.usage;
   save();
   return r;
@@ -11397,13 +11492,13 @@ async function handleAdmin(req, res, u, raw) {
       if ('bot' in body) {
         const nb = body.bot ? bots[body.bot] : bots[DEFAULT_BOT];
         if (!nb) throw new Error('bot desconhecido');
-        if (nb.id !== botOf(c).id) { delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; audit({ action: 'chat-bot', chatId: b, bot: nb.id, via: 'panel' }); }
+        if (nb.id !== botOf(c).id) { resetSessions(c); audit({ action: 'chat-bot', chatId: b, bot: nb.id, via: 'panel' }); }
         if (nb.id === DEFAULT_BOT) delete c.bot; else c.bot = nb.id;
       }
       if ('pinned' in body) { if (body.pinned) c.pinned = true; else delete c.pinned; }
       if ('archived' in body) { if (body.archived) c.archived = true; else delete c.archived; }
       if (body.read) c.readAt = new Date().toISOString();
-      if (body.reset) { delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; delete c.cpSession; delete c.olSession; }
+      if (body.reset) resetSessions(c);
       save();
       return send(200, chatView(b));
     }
@@ -11584,7 +11679,7 @@ async function handleAdmin(req, res, u, raw) {
       if (!c2 && m === 'DELETE') {
         if (bt.id === DEFAULT_BOT) throw new Error('o bot padrão não pode ser apagado');
         delete bots[bt.id]; saveBots();
-        for (const c of Object.values(chats)) if (c.bot === bt.id) { delete c.bot; delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; }
+        for (const c of Object.values(chats)) if (c.bot === bt.id) { delete c.bot; resetSessions(c, true); }
         save();
         for (const r of schedules) if (r.bot === bt.id) delete r.bot;
         saveSched();
