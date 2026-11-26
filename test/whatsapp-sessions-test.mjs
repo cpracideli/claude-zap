@@ -180,6 +180,40 @@ try {
   check('race: /session N refused while the panel runs on the live session', refused && /tarefa em andamento/.test(refused.text), refused);
   await until(async () => (await msgs(raceLive2)).some((m) => m.role === 'assistant' && /LENTO painel corrida 2/.test(m.text)));
   await cmd('/session ' + liveBefore, /Sessão retomada|já está/);
+  // 7d) /new while a WhatsApp turn runs: refused, the reply goes to the turn's mirror, no orphan mirror, no id leak
+  {
+    const liveD = (await view(W)).mirror, sessD = (await view(W)).session, nMirrors = (await mirrors()).length;
+    const runsBefore = (await view(liveD)).totals.runs;
+    const n0 = sent.length;
+    await wa('LENTO whatsapp turno');
+    await wait(800);
+    const refusedNew = await cmd('/new', /tarefa em andamento|Nova conversa/);
+    check('/new refused while a WhatsApp turn runs', refusedNew && /tarefa em andamento/.test(refusedNew.text), refusedNew);
+    await until(() => sent.slice(n0).some((m) => /respondeu a: LENTO whatsapp turno/.test(m.text)));
+    await wait(300);
+    check('reply of the running turn stays in its mirror (no orphan)', (await mirrors()).length === nMirrors && (await msgs(liveD)).some((m) => /respondeu a: LENTO whatsapp turno/.test(m.text)), await mirrors());
+    check('origin keeps the session (no reset mid-turn)', (await view(W)).session === sessD && (await view(W)).mirror === liveD, await view(W));
+    // 3) mirror counts the WhatsApp turns and they are not unread
+    const vD = await view(liveD);
+    check('mirror totals.runs counts WhatsApp turns', vD.totals.runs === runsBefore + 1 && vD.runs.length > 0 && vD.unread === false, vD.totals);
+    // 4) /stop on WhatsApp stops a panel turn on the live mirror
+    const nD = (await msgs(liveD)).length;
+    await api('POST', '/web/' + liveD.slice(4) + '/messages', { text: 'LENTO painel para parar' });
+    await wait(800);
+    const stopped = await cmd('/stop', /Interrompid|Nada em andamento/);
+    check('/stop on WhatsApp interrupts the panel turn on the live session', stopped && /painel/.test(stopped.text), stopped);
+    await until(async () => (await msgs(liveD)).slice(nD).some((m) => m.role === 'assistant'));
+    check('panel turn marked as stopped', (await msgs(liveD)).slice(nD).some((m) => m.role === 'assistant' && m.stopped), (await msgs(liveD)).slice(nD));
+    await wait(300);
+  }
+  // 2) /session typed in the panel answers with a hint, not the model
+  {
+    const before = calls().length;
+    await api('POST', '/web/' + plain.id.slice(4) + '/messages', { text: '/session' });
+    await until(async () => (await msgs(plain.id)).some((m) => m.role === 'assistant'));
+    const hint = (await msgs(plain.id)).find((m) => m.role === 'assistant');
+    check('/session in the panel: hint, no model call', hint && /WhatsApp e do Telegram/.test(hint.text) && calls().length === before, hint);
+  }
   // 8) help and panel commands
   const help = await cmd('/help', /Todos os comandos/);
   check('/help mentions /session', help && help.text.includes('/session'), help && help.text);

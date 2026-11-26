@@ -2013,6 +2013,7 @@ async function command(chatId, body) {
       return sendMenu(chatId, 'O que você quer fazer?', HELP_MENU, helpTxt);
     }
     case '/new':
+      if (isMirrorable(chatId) && sessionBusy(chatId)) return reply(chatId, '⚠️ Há uma tarefa em andamento. Aguarde terminar ou use /stop antes de começar uma conversa nova.', true);
       if (isMirrorable(chatId)) startNewSession(chatId); else { resetSessions(c); save(); }
       return reply(chatId, 'Nova conversa iniciada com ' + botLabel(botOf(c)) + '. Modelo: ' + (runConfig(c).model || 'padrão') + '.', true);
     case '/session': case '/sessions':
@@ -2077,6 +2078,7 @@ async function command(chatId, body) {
       }
       const b = findBot(arg);
       if (!b) return reply(chatId, 'Bot não encontrado. Disponíveis: ' + Object.values(bots).map((x) => x.name).join(', ') + '.', true);
+      if (isMirrorable(chatId) && sessionBusy(chatId)) return reply(chatId, '⚠️ Há uma tarefa em andamento. Aguarde terminar ou use /stop antes de trocar de bot.', true);
       if (isMirrorable(chatId)) freezeMirror(chatId, true);
       if (b.id === DEFAULT_BOT) delete c.bot; else c.bot = b.id;
       resetSessions(c); save();
@@ -2084,10 +2086,13 @@ async function command(chatId, body) {
       return reply(chatId, 'Agora quem responde é ' + botLabel(b) + '. Conversa nova iniciada.', true);
     }
     case '/stop': {
-      const r = running.get(chatId);
+      // Also stops a turn started from the panel on this chat's live session.
+      const target = running.has(chatId) ? chatId : (c.mirror && running.has(c.mirror) ? c.mirror : '');
+      const r = target && running.get(target);
       if (!r) return reply(chatId, 'Nada em andamento.', true);
-      stopChildren(chatId);
+      stopChildren(target);
       r.child.kill('SIGTERM');
+      if (target !== chatId) return reply(chatId, 'Interrompida a tarefa iniciada pelo painel, após ' + fmtDur(Date.now() - r.started) + '.', true);
       return reply(chatId, 'Interrompido após ' + fmtDur(Date.now() - r.started) + '. A conversa continua; mande a próxima mensagem.', true);
     }
     case '/status': {
@@ -2181,6 +2186,7 @@ async function handleWebCommand(chatId, body) {
     const cmd = String(body || '').trim().split(/\s+/)[0].toLowerCase();
     const say = (text) => { webAppend(chatId, { role: 'assistant', provider: providerOf(chats[chatId]), bot: botOf(chats[chatId]).id, text }); webEmit(chatId, { type: 'idle' }); return true; };
     if (cmd === '/new') {
+      if (sessionBusy(origin)) return say('Há uma tarefa em andamento no ' + (mirrorChannel(origin) === 'telegram' ? 'Telegram' : 'WhatsApp') + '. Aguarde terminar ou use /stop antes de começar uma sessão nova.');
       startNewSession(origin);
       return say('Sessão encerrada e salva. A próxima mensagem no ' + (mirrorChannel(origin) === 'telegram' ? 'Telegram' : 'WhatsApp') + ' abre uma sessão nova; esta conversa continua disponível aqui no painel.');
     }
@@ -2204,6 +2210,8 @@ async function handleWebCommandRaw(chatId, body) {
     return true;
   };
   switch (cmd) {
+    case '/session': case '/sessions':
+      return out('`/session` é um comando do WhatsApp e do Telegram. Aqui no painel, as sessões dessas conversas aparecem na lista de conversas (com o ícone do canal): basta abrir uma para ver o histórico e continuar.');
     case '/help':
       return out('**Comandos disponíveis no Chat Web:**\n- `/new` — inicia nova sessão limpa\n- `/status` — mostra bot, provedor, modelo e fila\n- `/usage` — uso desta conversa e gasto do mês\n- `/log [n]` — últimas execuções\n- `/provider <claude|antigravity|copilot|opencode|openai_compat>` — troca provedor\n- `/model <id|default>` — troca modelo\n- `/effort <low|medium|high|xhigh|max|default>` — troca esforço\n- `/bot <nome>` — troca bot da conversa\n- `/stop` — interrompe execução atual\n- `/schedules` — lista agendamentos desta conversa\n- `/council <pergunta>` — consulta múltiplos modelos em paralelo e sintetiza\n- `/<slug-da-skill>` — executa uma skill');
     case '/new':
@@ -2449,7 +2457,9 @@ function enqueueWhatsAppPrompt(chatId, number, body) {
     // "@Nome" (or @todos) makes those bots answer this message, one after the other; otherwise the chat's bot.
     const targets = mentionsIn(body, c);
     remember(chatId, 'user', body);
-    mirrorAppend(chatId, { role: 'user', text: body });
+    const turnMirror = mirrorAppend(chatId, { role: 'user', text: body });
+    channelTurns.add(chatId);
+    try {
     for (const id of targets.length ? targets : [null]) {
       const started = Date.now();
       const status = liveStatus(chatId);
@@ -2460,21 +2470,23 @@ function enqueueWhatsAppPrompt(chatId, number, body) {
       await status.finish();
       if (r.stopped) {
         recordRun(chatId, { prompt: body.slice(0, 80), ms: Date.now() - started, error: 'interrompido pelo usuário' });
+        mirrorRun(turnMirror, { prompt: body.slice(0, 80), ms: Date.now() - started, error: 'interrompido pelo usuário' });
         break;
       }
       recordRun(chatId, { prompt: body.slice(0, 80), ms: r.usage ? r.usage.ms : Date.now() - started,
         cost: r.usage ? r.usage.cost : 0, error: r.error });
+      mirrorRun(turnMirror, { prompt: body.slice(0, 80), ms: r.usage ? r.usage.ms : Date.now() - started, cost: r.usage ? r.usage.cost : 0, error: r.error });
       const who = bots[id || botOf(c).id] || botOf(c);
       const head = targets.length ? '*' + botLabel(who) + ':*\n' : '';
       if (r.error) {
         remember(chatId, 'assistant', '', who.id);
-        mirrorAppend(chatId, { role: 'assistant', bot: who.id, provider: r.provider || runConfig(c, id || undefined).provider, text: 'Erro: ' + r.error, error: true });
+        mirrorAppend(chatId, { role: 'assistant', bot: who.id, provider: r.provider || runConfig(c, id || undefined).provider, text: 'Erro: ' + r.error, error: true }, turnMirror);
         await reply(chatId, head + 'Erro ao executar ' + PROVIDERS[runConfig(c, id || undefined).provider] + ': ' + r.error, true);
       } else {
         const parsedReply = extractSuggestions(r.text || '');
         remember(chatId, 'assistant', parsedReply.text, who.id);
         const mid = mirrorAppend(chatId, { role: 'assistant', bot: who.id, provider: r.provider || runConfig(c, id || undefined).provider, text: parsedReply.text,
-          ...(parsedReply.suggestions.length ? { suggestions: parsedReply.suggestions } : {}), usage: { ms: r.usage ? r.usage.ms : Date.now() - started, cost: r.usage ? r.usage.cost : 0 } });
+          ...(parsedReply.suggestions.length ? { suggestions: parsedReply.suggestions } : {}), usage: { ms: r.usage ? r.usage.ms : Date.now() - started, cost: r.usage ? r.usage.cost : 0 } }, turnMirror);
         if (mid && !targets.length) autoTitleChat(mid, body, parsedReply.text);
         if (parsedReply.text || !parsedReply.suggestions.length) {
           await reply(chatId, head + parsedReply.text, false);
@@ -2485,6 +2497,7 @@ function enqueueWhatsAppPrompt(chatId, number, body) {
         }
       }
     }
+    } finally { channelTurns.delete(chatId); }
     clearInterval(keepTyping);
     waha('POST', '/api/stopTyping', { session: activeWaha().session, chatId }).catch(() => {});
   });
@@ -2550,18 +2563,29 @@ function ensureMirror(originId, firstText) {
   return id;
 }
 // Copies one WhatsApp/Telegram message into the current session's web chat (created on the first message).
-function mirrorAppend(originId, msg) {
+// `into`: the mirror captured when the turn started (a /new during the turn must not open an orphan mirror).
+function mirrorAppend(originId, msg, into) {
   try {
     if (!isMirrorable(originId)) return '';
-    const id = ensureMirror(originId, msg.role === 'user' ? msg.text : '');
+    const id = into !== undefined ? (into && chats[into] ? into : '') : ensureMirror(originId, msg.role === 'user' ? msg.text : '');
     if (!id) return '';
     webAppend(id, { ...msg, noPush: true });
-    copyKeys(chats[originId], chats[id], CHAT_CONFIG_KEYS); // the panel shows the settings in use
+    if (liveOrigin(id) === originId) copyKeys(chats[originId], chats[id], CHAT_CONFIG_KEYS); // the panel shows the settings in use
     chats[id].updated = new Date().toISOString();
     save();
     return id;
   } catch (e) { log('mirror append failed', e.message); return ''; }
 }
+// Counts a WhatsApp/Telegram turn in its mirror too (the panel shows totals.runs); already seen there, so not unread.
+function mirrorRun(id, entry) {
+  if (!id || !chats[id]) return;
+  recordRun(id, entry);
+  chats[id].readAt = new Date().toISOString();
+  save();
+}
+// A WhatsApp/Telegram turn in progress would write its session id into the new/resumed session when it finishes.
+const channelTurns = new Set(); // origin chats with a WhatsApp/Telegram turn between its start and its last write
+const sessionBusy = (originId) => running.has(originId) || channelTurns.has(originId);
 // Saves the origin's sessions (provider session ids, transcript, settings) into its current mirror.
 function freezeMirror(originId, detach) {
   const o = chats[originId];
@@ -5210,12 +5234,15 @@ async function handleTelegramUpdate(u) {
     c.title = c.title || ('Telegram · ' + ((msg.from && (msg.from.first_name || msg.from.username)) || uid));
     const expanded = expandSkillPrompt(body);
     remember(chatId, 'user', body);
-    mirrorAppend(chatId, { role: 'user', text: body });
+    const turnMirror = mirrorAppend(chatId, { role: 'user', text: body });
     const started = Date.now();
-    const r = await runTurn(chatId, null, expanded.text);
+    channelTurns.add(chatId);
+    let r;
+    try { r = await runTurn(chatId, null, expanded.text); } finally { channelTurns.delete(chatId); }
     recordRun(chatId, { prompt: body.slice(0, 80), ms: r.usage ? r.usage.ms : Date.now() - started, cost: r.usage ? r.usage.cost : 0, error: r.error });
+    mirrorRun(turnMirror, { prompt: body.slice(0, 80), ms: r.usage ? r.usage.ms : Date.now() - started, cost: r.usage ? r.usage.cost : 0, error: r.error });
     remember(chatId, 'assistant', r.error ? '' : r.text, botOf(c).id);
-    const mid = mirrorAppend(chatId, { role: 'assistant', bot: botOf(c).id, provider: r.provider || providerOf(c), text: r.error ? 'Erro: ' + r.error : (r.text || ''), ...(r.error ? { error: true } : {}) });
+    const mid = mirrorAppend(chatId, { role: 'assistant', bot: botOf(c).id, provider: r.provider || providerOf(c), text: r.error ? 'Erro: ' + r.error : (r.text || ''), ...(r.error ? { error: true } : {}) }, turnMirror);
     if (mid && !r.error) autoTitleChat(mid, body, r.text || '');
     await tgSendMessage(chatId, r.error ? 'Erro: ' + r.error : (r.text || '(sem resposta)'));
   });
@@ -8112,7 +8139,7 @@ function webSend(chatId, text, files = [], transcript = '') {
   // Support bridge slash commands directly in the web panel (/new, /status, /provider, /model, /effort, /bot, /stop, /council, /usage, /log, /schedules, /help)
   if (!files.length && text.startsWith('/')) {
     const firstCmd = text.trim().split(/\s+/)[0].toLowerCase();
-    if (['/help', '/new', '/provider', '/model', '/effort', '/bot', '/stop', '/status', '/usage', '/log', '/schedules', '/council'].includes(firstCmd)) {
+    if (['/help', '/new', '/provider', '/model', '/effort', '/bot', '/stop', '/status', '/usage', '/log', '/schedules', '/council', '/session', '/sessions'].includes(firstCmd)) {
       handleWebCommand(chatId, text).catch((e) => log('web cmd error', e.message));
       return { injected: false, command: firstCmd };
     }
