@@ -24,6 +24,7 @@ if (p.includes('Gere um título curto')) {
 }
 fs.appendFileSync(${JSON.stringify(LOG)}, JSON.stringify({ resume: get('--resume'), prompt: p }) + '\\n');
 const last = p.split('\\n').filter(Boolean).pop() || '';
+if (last.includes('LENTO')) await new Promise((r) => setTimeout(r, 2500));
 const sid = get('--resume') || ('sess-' + Math.random().toString(36).slice(2, 8));
 console.log(JSON.stringify({ type: 'result', result: 'CLAUDE respondeu a: ' + last, session_id: sid, is_error: false, num_turns: 1, duration_ms: 10 }));
 `);
@@ -159,6 +160,26 @@ try {
   check('panel /new on the live mirror archives it and resets the origin', !(await view(W)).mirror && !(await view(W)).session && (await view(liveBefore)).live === false && Boolean((await view(liveBefore)).session), [await view(W), await view(liveBefore)]);
   await cmd('/session ' + liveBefore, /Sessão retomada|já está/);
   check('resumed again after panel /new', (await view(W)).mirror === liveBefore, await view(W));
+  // 7c) race: /new on WhatsApp while the panel runs on the live mirror must not leak the old session id into the new one
+  const raceLive = (await view(W)).mirror;
+  const raceSess = (await view(W)).session;
+  const nRace = (await msgs(raceLive)).length;
+  await api('POST', '/web/' + raceLive.slice(4) + '/messages', { text: 'LENTO painel corrida' });
+  await wait(800);
+  await cmd('/new', /Nova conversa/);
+  await until(async () => (await msgs(raceLive)).slice(nRace).some((m) => m.role === 'assistant'));
+  await wait(300);
+  check('race: /new during a panel turn keeps the origin reset', !(await view(W)).session && !(await view(W)).mirror && (await view(raceLive)).session === raceSess, [await view(W), await view(raceLive)]);
+  k = await turn('DELTA depois da corrida');
+  check('race: next WhatsApp message starts a fresh session', k[0] && !k[0].resume, k);
+  // /session N while the panel runs on the live mirror is refused (the turn would write back the wrong session)
+  const raceLive2 = (await view(W)).mirror;
+  await api('POST', '/web/' + raceLive2.slice(4) + '/messages', { text: 'LENTO painel corrida 2' });
+  await wait(800);
+  const refused = await cmd('/session ' + raceLive, /tarefa em andamento|Sessão retomada/);
+  check('race: /session N refused while the panel runs on the live session', refused && /tarefa em andamento/.test(refused.text), refused);
+  await until(async () => (await msgs(raceLive2)).some((m) => m.role === 'assistant' && /LENTO painel corrida 2/.test(m.text)));
+  await cmd('/session ' + liveBefore, /Sessão retomada|já está/);
   // 8) help and panel commands
   const help = await cmd('/help', /Todos os comandos/);
   check('/help mentions /session', help && help.text.includes('/session'), help && help.text);

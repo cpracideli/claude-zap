@@ -2604,7 +2604,7 @@ function resumeSession(originId, mirrorId) {
   if (!m || m.origin !== originId) throw new Error('sessão não encontrada');
   const o = chat(originId);
   if (o.mirror === mirrorId) return false;
-  if (running.has(originId) || running.has(mirrorId)) throw new Error('há uma tarefa em andamento; aguarde ou use /stop antes de trocar de sessão');
+  if (running.has(originId) || running.has(mirrorId) || (o.mirror && running.has(o.mirror))) throw new Error('há uma tarefa em andamento; aguarde ou use /stop antes de trocar de sessão');
   freezeMirror(originId, true);
   resetSessions(o);
   copyKeys(m, o, SESSION_STATE_KEYS);
@@ -2641,7 +2641,9 @@ function syncMirrorIn(id) {
 }
 function syncMirrorOut(id, origin) {
   if (!origin || !chats[origin] || !chats[id]) return;
-  copyKeys(chats[id], chats[origin], SESSION_STATE_KEYS);
+  // Only while it is still the live session: a /new or /session N during the panel turn detached this mirror, and
+  // copying back would overwrite the new (or resumed) session of the origin. The mirror keeps its own ids.
+  if (liveOrigin(id) === origin) copyKeys(chats[id], chats[origin], SESSION_STATE_KEYS);
   chats[id].updated = new Date().toISOString();
   save();
 }
@@ -8189,7 +8191,7 @@ function webSend(chatId, text, files = [], transcript = '') {
         usage: { ms, cost: r.usage ? r.usage.cost : 0, turns: r.usage ? r.usage.turns : 0, ...(r.usage && r.usage.estimated ? { estimated: true } : {}) },
       });
       if (!r.stopped && !r.error) autoTitleChat(chatId, label || (tr && tr.text) || '', parsedReply.text);
-      if (origin) remember(origin, 'assistant', parsedReply.text, who.id);
+      if (origin && liveOrigin(chatId) === origin) remember(origin, 'assistant', parsedReply.text, who.id);
       if (r.stopped) break;
     }
     } finally { if (origin) syncMirrorOut(chatId, origin); }
