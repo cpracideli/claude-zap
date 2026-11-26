@@ -62,7 +62,7 @@ fs.mkdirSync(path.join(tmp, '.bridge'));
 const bridge = spawn(process.execPath, [path.join(dir, '..', 'bridge', 'bridge.mjs')], {
   env: { ...process.env, PORT: String(PORT), HOME: tmp, CLAUDE_BIN: path.join(tmp, 'no-claude'), AGY_BIN: path.join(tmp, 'no-agy'),
     OPENCODE_BIN: fakeOcBin, BRIDGE_ADMIN_TOKEN: TOKEN, ALLOWED_NUMBERS: '5511999990000', WAHA_URL: 'http://127.0.0.1:4041', WAHA_SESSION: 'S',
-    STARTUP_NOTICE: 'false', AI_MEMORY: 'off', SCHEDULER_TICK_MS: '300' },
+    STARTUP_NOTICE: 'false', BRIDGE_AUTO_TITLE: 'off', AI_MEMORY: 'off', SCHEDULER_TICK_MS: '300' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let logs = ''; bridge.stdout.on('data', (d) => { logs += d; }); bridge.stderr.on('data', (d) => { logs += d; });
