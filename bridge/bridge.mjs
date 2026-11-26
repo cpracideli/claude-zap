@@ -734,8 +734,8 @@ function systemPrompt(chatId, bot, providerHint = 'claude') {
     'Diretório de trabalho: ' + WORKDIR + '. Arquivos enviados pelo usuário chegam em ' + INBOX + '.',
     web
       ? (canThirdParty
-          ? 'Neste chat web não dá para anexar arquivos na resposta: informe o caminho absoluto do arquivo gerado. Para mandar um arquivo ao WhatsApp de alguém, use /send-file com "to" (abaixo).'
-          : 'Neste chat web não dá para anexar arquivos na resposta: informe o caminho absoluto do arquivo gerado. Para mandar um arquivo para o próprio usuário no WhatsApp, use /send-file com o número autorizado dele.')
+          ? 'Para ENVIAR um arquivo ou imagem ao usuário NESTE chat web (aparece na conversa: imagem com preview/zoom, demais arquivos como cartão com download), rode: curl -s -X POST http://127.0.0.1:' + PORT + '/send-file -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","path":"/caminho/absoluto","caption":"opcional"}\' — faça isso sempre que gerar um arquivo para o usuário, em vez de só informar o caminho. Para mandar um arquivo ao WhatsApp de alguém, use /send-file com "to" (abaixo).'
+          : 'Para ENVIAR um arquivo ou imagem ao usuário NESTE chat web (aparece na conversa: imagem com preview/zoom, demais arquivos como cartão com download), rode: curl -s -X POST http://127.0.0.1:' + PORT + '/send-file -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","path":"/caminho/absoluto","caption":"opcional"}\' — faça isso sempre que gerar um arquivo para o usuário, em vez de só informar o caminho. Para mandar um arquivo para o próprio usuário no WhatsApp, use /send-file com "to" e o número autorizado dele.')
       : 'Para ENVIAR um arquivo ou imagem ao usuário no WhatsApp, rode: curl -s -X POST http://127.0.0.1:' + PORT + '/send-file -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","path":"/caminho/absoluto","caption":"opcional"}\'',
     canThirdParty
       ? 'Para enviar uma nota de voz (PTT) no WhatsApp: curl -s -X POST http://127.0.0.1:' + PORT + '/send-voice -H "Content-Type: application/json" -d \'{"to":"5511999998888","text":"texto para falar"}\' (ou "path":"/caminho/audio.ogg" no lugar de "text").'
@@ -7510,10 +7510,34 @@ async function sendMessage(reqBody) {
 }
 
 // ---------- send-file (local only, used by Claude itself) ----------
+const FILE_TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic', '.svg': 'image/svg+xml',
+  '.pdf': 'application/pdf', '.txt': 'text/plain', '.md': 'text/markdown', '.csv': 'text/csv', '.json': 'application/json', '.zip': 'application/zip', '.html': 'text/html', '.htm': 'text/html',
+  '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.m4a': 'audio/mp4', '.wav': 'audio/wav', '.webm': 'audio/webm', '.mp4': 'video/mp4', '.mov': 'video/quicktime',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation' };
+// Web chat: copies the file into INBOX (served by GET /admin/web/files/<name>) and posts it as an assistant message.
+function sendWebFile(chatId, p, caption) {
+  if (!chats[chatId]) throw new Error('chatId desconhecido');
+  const abs = path.resolve(WORKDIR, String(p || ''));
+  if (!p || !fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error('arquivo não encontrado: ' + abs);
+  const size = fs.statSync(abs).size;
+  if (size > 100 * 1024 * 1024) throw new Error('arquivo grande demais (máx. 100 MB)');
+  const ext = path.extname(abs).toLowerCase();
+  const base = path.basename(abs, path.extname(abs)).replace(/[^\w.-]+/g, '_').slice(0, 60) || 'arquivo';
+  const name = 'web-out-' + new Date().toISOString().replace(/[:.]/g, '-') + '-' + crypto.randomBytes(2).toString('hex') + '_' + base + ext.replace(/[^\w.]/g, '');
+  fs.copyFileSync(abs, path.join(INBOX, name));
+  const file = { name: path.basename(abs).slice(0, 120), type: FILE_TYPES[ext] || 'application/octet-stream', size, file: name };
+  const c = chats[chatId];
+  const r = running.get(chatId);
+  webAppend(chatId, { role: 'assistant', bot: (r && r.bot) || (c ? botOf(c).id : DEFAULT_BOT), text: String(caption || '').slice(0, 4000), files: [file], attachment: true });
+  audit({ action: 'send-file', to: chatId, file: abs, bytes: size, caption: caption || null, via: 'web' });
+  return { sent: true, chatId, file: name };
+}
 async function sendFile(reqBody) {
   const { path: p, caption } = reqBody;
   if (reqBody.chatId && readOnlyRuns.has(String(reqBody.chatId))) throw new Error('bloqueado pelo modo proativo somente leitura (read-only)');
   let chatId = reqBody.chatId;
+  if (!reqBody.to && chatId && isWeb(chatId)) return sendWebFile(chatId, p, caption);
   if (reqBody.to) chatId = await resolveTo(reqBody.to);
   else if (!chatId || !chats[chatId]) throw new Error('chatId desconhecido');
   await assertWhatsAppRecipientAllowed(chatId);
@@ -11574,9 +11598,14 @@ async function handleAdmin(req, res, u, raw) {
       const file = path.join(INBOX, name);
       if (!name.startsWith('web-') || !fs.existsSync(file)) return send(404, { error: 'arquivo não encontrado' });
       const ext = path.extname(name).toLowerCase();
-      const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic',
-        '.pdf': 'application/pdf', '.webm': 'audio/webm', '.ogg': 'audio/ogg', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.mp4': 'video/mp4', '.wav': 'audio/wav', '.txt': 'text/plain' };
-      res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream', 'Content-Length': fs.statSync(file).size, 'Cache-Control': 'private, max-age=86400' });
+      let ctype = FILE_TYPES[ext] || 'application/octet-stream';
+      // SVG/HTML could run scripts on the panel origin: served as plain text unless downloaded.
+      if (/svg|html/.test(ctype)) ctype = 'text/plain; charset=utf-8';
+      else if (ctype.startsWith('text/') || ctype === 'application/json') ctype += '; charset=utf-8';
+      const dl = /[?&]download=1\b/.test(req.url);
+      const nice = name.replace(/^web-(out-)?[\dTZ-]+-[a-f0-9]{4}_/, '');
+      res.writeHead(200, { 'Content-Type': ctype, 'Content-Length': fs.statSync(file).size, 'Cache-Control': 'private, max-age=86400', 'X-Content-Type-Options': 'nosniff',
+        ...(dl ? { 'Content-Disposition': "attachment; filename*=UTF-8''" + encodeURIComponent(nice) } : {}) });
       return fs.createReadStream(file).pipe(res);
     }
     if (a === 'web' && b && c2 === 'events' && m === 'GET') {

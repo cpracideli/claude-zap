@@ -806,8 +806,8 @@ services:
               'Diretório de trabalho: ' + WORKDIR + '. Arquivos enviados pelo usuário chegam em ' + INBOX + '.',
               web
                 ? (canThirdParty
-                    ? 'Neste chat web não dá para anexar arquivos na resposta: informe o caminho absoluto do arquivo gerado. Para mandar um arquivo ao WhatsApp de alguém, use /send-file com "to" (abaixo).'
-                    : 'Neste chat web não dá para anexar arquivos na resposta: informe o caminho absoluto do arquivo gerado. Para mandar um arquivo para o próprio usuário no WhatsApp, use /send-file com o número autorizado dele.')
+                    ? 'Para ENVIAR um arquivo ou imagem ao usuário NESTE chat web (aparece na conversa: imagem com preview/zoom, demais arquivos como cartão com download), rode: curl -s -X POST http://127.0.0.1:' + PORT + '/send-file -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","path":"/caminho/absoluto","caption":"opcional"}\' — faça isso sempre que gerar um arquivo para o usuário, em vez de só informar o caminho. Para mandar um arquivo ao WhatsApp de alguém, use /send-file com "to" (abaixo).'
+                    : 'Para ENVIAR um arquivo ou imagem ao usuário NESTE chat web (aparece na conversa: imagem com preview/zoom, demais arquivos como cartão com download), rode: curl -s -X POST http://127.0.0.1:' + PORT + '/send-file -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","path":"/caminho/absoluto","caption":"opcional"}\' — faça isso sempre que gerar um arquivo para o usuário, em vez de só informar o caminho. Para mandar um arquivo para o próprio usuário no WhatsApp, use /send-file com "to" e o número autorizado dele.')
                 : 'Para ENVIAR um arquivo ou imagem ao usuário no WhatsApp, rode: curl -s -X POST http://127.0.0.1:' + PORT + '/send-file -H "Content-Type: application/json" -d \'{"chatId":"' + chatId + '","path":"/caminho/absoluto","caption":"opcional"}\'',
               canThirdParty
                 ? 'Para enviar uma nota de voz (PTT) no WhatsApp: curl -s -X POST http://127.0.0.1:' + PORT + '/send-voice -H "Content-Type: application/json" -d \'{"to":"5511999998888","text":"texto para falar"}\' (ou "path":"/caminho/audio.ogg" no lugar de "text").'
@@ -979,7 +979,7 @@ services:
                 if (opts.resume && !opts._staleRetry && /No conversation found with session ID/i.test(err + out) && results.every((x) => !x.num_turns)) {
                   clearTimeout(timer); inputOpen = false; if (running.get(chatId) === entry) running.delete(chatId);
                   audit({ action: 'stale-session-reset', chatId, session: opts.resume });
-                  return resolve(runClaude(chatId, prompt, { ...opts, resume: undefined, _staleRetry: true }, onActivity, onEvent));
+                  return resolve(runClaude(chatId, opts.handoff && opts.basePrompt !== undefined ? opts.handoff + opts.basePrompt : prompt, { ...opts, resume: undefined, _staleRetry: true }, onActivity, onEvent));
                 }
                 const sum = (k) => results.reduce((a, x) => a + (Number(x[k]) || 0), 0);
                 done({ text: results.map((x) => x.result || '').filter((x) => x.trim()).join('\n\n'), sessionId: last.session_id,
@@ -1739,10 +1739,12 @@ services:
                 const order = Array.isArray(routing.fallbackOrder) && routing.fallbackOrder.length
                   ? routing.fallbackOrder
                   : ['antigravity', 'claude', 'copilot', 'opencode', 'openai_compat'];
+                // The next provider starts a fresh session: give it the conversation so far (runTurn passes it in opts.handoff).
+                const failoverPrompt = opts.handoff && opts.basePrompt !== undefined ? (sem.text || '') + opts.handoff + opts.basePrompt : actualPrompt;
                 for (const nextProv of order) {
                   if (!PROVIDERS[nextProv] || nextProv === provider || !isProviderAvailable(nextProv)) continue;
                   log('provider failover:', provider, '->', nextProv, 'reason:', String(r.error).slice(0, 120));
-                  const r2 = await invokeProviderOnce(nextProv, chatId, actualPrompt, cfg, { ...opts, resume: undefined, modelOverride: '', noFallback: true, displayPrompt }, onActivity, onEvent);
+                  const r2 = await invokeProviderOnce(nextProv, chatId, failoverPrompt, cfg, { ...opts, resume: undefined, modelOverride: '', noFallback: true, displayPrompt }, onActivity, onEvent);
                   if (r2 && !r2.error && !r2.stopped) {
                     fallbackFrom = provider;
                     usedProvider = nextProv;
@@ -2082,7 +2084,7 @@ services:
                 return sendMenu(chatId, 'O que você quer fazer?', HELP_MENU, helpTxt);
               }
               case '/new':
-                delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; delete c.cpSession; delete c.olSession; save();
+                resetSessions(c); save();
                 return reply(chatId, 'Nova conversa iniciada com ' + botLabel(botOf(c)) + '. Modelo: ' + (runConfig(c).model || 'padrão') + '.', true);
               case '/provider': {
                 const cur = PROVIDERS[providerOf(c)];
@@ -2144,7 +2146,7 @@ services:
                 const b = findBot(arg);
                 if (!b) return reply(chatId, 'Bot não encontrado. Disponíveis: ' + Object.values(bots).map((x) => x.name).join(', ') + '.', true);
                 if (b.id === DEFAULT_BOT) delete c.bot; else c.bot = b.id;
-                delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; save();
+                resetSessions(c); save();
                 audit({ action: 'chat-bot', chatId, bot: b.id });
                 return reply(chatId, 'Agora quem responde é ' + botLabel(b) + '. Conversa nova iniciada.', true);
               }
@@ -2164,7 +2166,7 @@ services:
                   '*Status*',
                   'Bot: ' + botLabel(botOf(c)),
                   'Provedor: ' + PROVIDERS[providerOf(c)],
-                  'Sessão: ' + (((providerOf(c) === 'antigravity' ? c.agySession : providerOf(c) === 'opencode' ? c.ocSession : c.session) || '').slice(0, 8) || 'nenhuma (próxima mensagem inicia uma)'),
+                  'Sessão: ' + ((c[sessionKey(providerOf(c))] || '').slice(0, 8) || 'nenhuma (próxima mensagem inicia uma)') + (c.lastProvider && c.lastProvider !== providerOf(c) ? ' | última resposta: ' + PROVIDERS[c.lastProvider] + ' (contexto será repassado)' : ''),
                   providerOf(c) === 'antigravity'
                     ? 'Modelo: ' + agyModelLabel(c) + ' | Esforço: ' + (c.agyEffort || 'padrão') + ' | enviado ao agy: ' + (resolveAgyRun(c).model || 'padrão')
                     : 'Modelo: ' + (runConfig(c).model || 'padrão da conta') + ' | Esforço: ' + (runConfig(c).effort || 'padrão'),
@@ -2254,7 +2256,7 @@ services:
               case '/help':
                 return out('**Comandos disponíveis no Chat Web:**\n- `/new` — inicia nova sessão limpa\n- `/status` — mostra bot, provedor, modelo e fila\n- `/usage` — uso desta conversa e gasto do mês\n- `/log [n]` — últimas execuções\n- `/provider <claude|antigravity|copilot|opencode|openai_compat>` — troca provedor\n- `/model <id|default>` — troca modelo\n- `/effort <low|medium|high|xhigh|max|default>` — troca esforço\n- `/bot <nome>` — troca bot da conversa\n- `/stop` — interrompe execução atual\n- `/schedules` — lista agendamentos desta conversa\n- `/council <pergunta>` — consulta múltiplos modelos em paralelo e sintetiza\n- `/<slug-da-skill>` — executa uma skill');
               case '/new':
-                delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; delete c.cpSession; delete c.olSession; save();
+                resetSessions(c); save();
                 return out('Nova conversa iniciada com **' + botLabel(botOf(c)) + '**. Provedor: ' + PROVIDERS[providerOf(c)] + '.');
               case '/provider': {
                 if (!arg) return out('Provedor atual: **' + PROVIDERS[providerOf(c)] + '**. Use `/provider claude`, `/provider antigravity`, `/provider copilot`, `/provider opencode`, `/provider ollama` ou `/provider openai_compat`.');
@@ -2288,7 +2290,7 @@ services:
                 const b = findBot(arg);
                 if (!b) return out('Bot não encontrado. Disponíveis: ' + Object.values(bots).map((x) => x.name).join(', ') + '.');
                 if (b.id === DEFAULT_BOT) delete c.bot; else c.bot = b.id;
-                delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; save();
+                resetSessions(c); save();
                 audit({ action: 'chat-bot', chatId, bot: b.id, via: 'web-cmd' });
                 return out('Agora quem responde é **' + botLabel(b) + '**. Nova sessão iniciada.');
               }
@@ -2390,7 +2392,7 @@ services:
             if (guest) {
               const gBot = bots[guest.bot] ? guest.bot : DEFAULT_BOT;
               if (body.toLowerCase() === '/new') {
-                const gc = chat(chatId); delete gc.session; delete gc.agySession; delete gc.ocSession; save();
+                const gc = chat(chatId); resetSessions(gc); save();
                 return reply(chatId, 'Nova conversa iniciada com ' + botLabel(bots[gBot]) + '.', true);
               }
               if (body.toLowerCase() === '/help') {
@@ -2531,27 +2533,120 @@ services:
             });
           }
 
+          // ---------- provider handoff ----------
+          // Each provider keeps its own session (Claude/Ollama: Claude Code session, agy, opencode, copilot, openai_compat file).
+          // A provider's session only knows the turns it answered itself, so after /provider, a failover or light routing the
+          // next provider would resume an old session (or start an empty one) without what happened in between. The chat keeps
+          // a provider-independent transcript (c.transcript, with a sequence number per entry); every saved session remembers
+          // the sequence it is in sync with (store.sessSeq[key]). A session that is behind gets the missing turns injected;
+          // a fresh session gets the recent transcript.
+          const SESSION_KEYS = ['session', 'agySession', 'ocSession', 'olSession', 'cpSession', 'compatSession'];
+          function sessionKey(prov) {
+            return prov === 'antigravity' ? 'agySession' : prov === 'opencode' ? 'ocSession' : prov === 'copilot' ? 'cpSession'
+              : prov === 'ollama' ? 'olSession' : prov === 'openai_compat' ? 'compatSession' : 'session';
+          }
+          // /new, reset, bot change: drops every provider session (and, unless keepTranscript, the shared transcript).
+          function resetSessions(c, keepTranscript) {
+            for (const k of SESSION_KEYS) delete c[k];
+            delete c.sessSeq; delete c.sessProv;
+            if (!keepTranscript) { delete c.transcript; delete c.lastProvider; }
+          }
+          const HANDOFF_ENTRY_CHARS = Number(env.HANDOFF_ENTRY_CHARS || 1500);
+          const HANDOFF_MAX_CHARS = Number(env.HANDOFF_MAX_CHARS || 9000);
+          const TRANSCRIPT_KEEP = Number(env.HANDOFF_TRANSCRIPT_KEEP || 24);
+          function clipMiddle(text, max) {
+            const t = String(text || '').trim();
+            if (t.length <= max) return t;
+            const head = Math.floor(max * 0.4), tail = max - head - 12;
+            return t.slice(0, head) + '\n[…cortado…]\n' + t.slice(-tail);
+          }
+          function transcriptAppend(c, entry) {
+            c.tseq = (c.tseq || 0) + 1;
+            c.transcript = [...(c.transcript || []), { seq: c.tseq, at: new Date().toISOString(), ...entry, text: clipMiddle(entry.text, HANDOFF_ENTRY_CHARS) }].slice(-TRANSCRIPT_KEEP);
+            return c.tseq;
+          }
+          // Text block with the transcript entries after sequence `since` (0 = everything kept), newest kept within budget.
+          function handoffBlock(c, since, reason) {
+            const list = (c.transcript || []).filter((e) => e.seq > (since || 0));
+            if (!list.length) return '';
+            const lines = [];
+            let used = 0, cut = false;
+            for (let i = list.length - 1; i >= 0; i--) {
+              const e = list[i];
+              const who = e.role === 'user' ? 'Usuário' : ((bots[e.bot] ? bots[e.bot].name : 'Assistente') + (e.provider ? ' via ' + (PROVIDERS[e.provider] || e.provider) : ''));
+              const line = '- ' + who + ': ' + clipMiddle(e.text, HANDOFF_ENTRY_CHARS) + (e.error ? ' [falhou: ' + String(e.error).slice(0, 160) + ']' : '') + (e.stopped ? ' [interrompido]' : '');
+              if (used + line.length > HANDOFF_MAX_CHARS && lines.length) { cut = true; break; }
+              lines.unshift(line); used += line.length;
+            }
+            const older = cut || ((c.transcript || [])[0] && since && c.transcript[0].seq > since + 1);
+            return '[Contexto da conversa (' + reason + '). Este histórico é desta mesma conversa: use-o para continuar de onde parou, ' +
+              'inclusive tarefas em andamento, sem pedir que o usuário repita.' + (older ? ' Mensagens mais antigas foram omitidas.' : '') + ']\n' +
+              lines.join('\n') + '\n[Fim do contexto]\n\n';
+          }
+          // Decides, for the provider that will answer, whether to resume its session and what context to inject.
+          function planHandoff(c, store, prov, isGroup) {
+            const key = sessionKey(prov);
+            const seq = (store.sessSeq || {})[key];
+            const hasTranscript = (c.transcript || []).length > 0;
+            let resume = store[key];
+            // Sessions saved before this feature have no sequence: only trust them if this provider answered last.
+            if (resume && seq === undefined && hasTranscript && c.lastProvider && c.lastProvider !== prov) resume = undefined;
+            if (resume && seq !== undefined && (c.transcript || []).length && c.transcript[0].seq > seq + 1) resume = undefined; // too far behind
+            const fullCtx = isGroup || !hasTranscript ? '' : handoffBlock(c, 0, 'troca de provedor: ' + (PROVIDERS[prov] || prov) + ' assumiu a conversa');
+            if (!resume) return { key, resume: undefined, context: fullCtx, fullCtx, stale: Boolean(store[key]) };
+            const behind = seq !== undefined && (c.tseq || 0) > seq;
+            const context = behind && !isGroup ? handoffBlock(c, seq, 'o que aconteceu nesta conversa enquanto outro provedor respondia') : '';
+            return { key, resume, context, fullCtx, stale: false };
+          }
+
           // One turn of one bot in a chat: resumes that bot's session in this chat, retries from a fresh session only when
           // resuming failed (not on timeouts or stops: re-running a timed-out task could repeat side effects), saves the
           // session. botId null = the chat's own bot, with the chat's overrides. Other bots keep their sessions per chat
-          // in c.botSessions.
+          // in c.botSessions. Provider changes are bridged with the transcript (see planHandoff).
           async function runTurn(chatId, botId, prompt, onActivity, onEvent, onRetry, extra) {
             const c = chat(chatId);
             const id = botId || botOf(c).id;
             const own = id === botOf(c).id;
             const prov = runConfig(c, own ? undefined : id).provider;
-            const key = prov === 'antigravity' ? 'agySession' : prov === 'opencode' ? 'ocSession' : prov === 'copilot' ? 'cpSession' : prov === 'ollama' ? 'olSession' : 'session';
             const store = own ? c : ((c.botSessions = c.botSessions || {})[id] = c.botSessions[id] || {});
-            const opts = { resume: store[key], bot: own ? undefined : id, ...(extra || {}) };
-            let r = await runAgent(chatId, prompt, opts, onActivity, onEvent);
+            // Sessions of openai_compat used to share "session" with Claude: move them to their own key.
+            if (typeof store.session === 'string' && store.session.startsWith('compat-')) { store.compatSession = store.compatSession || store.session; delete store.session; }
+            // Chats from before the transcript existed: seed it from the WhatsApp recent list / web history (minus the
+            // message being answered now), so the first provider switch after the upgrade still carries context.
+            if (!c.tseq) {
+              const old = (isWeb(chatId) ? webHistory(chatId).map((m) => ({ role: m.role, bot: m.bot, provider: m.provider, text: m.text || m.transcript || '' })) : (c.recent || []))
+                .filter((m) => (m.role === 'user' || m.role === 'assistant') && String(m.text || '').trim());
+              if (old.length && old[old.length - 1].role === 'user') old.pop();
+              for (const m of old.slice(-16)) transcriptAppend(c, { role: m.role, ...(m.bot ? { bot: m.bot } : {}), ...(m.provider ? { provider: m.provider } : {}), text: m.text });
+            }
+            const isGroup = String(prompt || '').startsWith('[Conversa em grupo:');
+            const plan = planHandoff(c, store, prov, isGroup);
+            if (plan.stale) { audit({ action: 'handoff-stale-session', chatId, provider: prov }); delete store[plan.key]; }
+            if (plan.context) audit({ action: 'provider-handoff', chatId, provider: prov, from: c.lastProvider || '', resume: Boolean(plan.resume), chars: plan.context.length });
+            const opts = { resume: plan.resume, bot: own ? undefined : id, handoff: plan.fullCtx, basePrompt: prompt, ...(extra || {}) };
+            let r = await runAgent(chatId, plan.context + prompt, opts, onActivity, onEvent);
             if (r.error && opts.resume && !r.stopped && !r.timedOut) {
               log('resume failed, starting fresh:', r.error);
-              delete store[key];
+              delete store[plan.key];
               if (onRetry) onRetry();
               const more = (r.injected || []).map((x) => '\n\n' + STEER_NOTE + x).join('');
-              r = await runAgent(chatId, prompt + more, { ...opts, resume: undefined }, onActivity, onEvent);
+              r = await runAgent(chatId, plan.fullCtx + prompt + more, { ...opts, resume: undefined, basePrompt: prompt + more }, onActivity, onEvent);
             }
-            if (r.sessionId) store[key] = r.sessionId;
+            // The provider that actually answered (failover / light routing may differ from the configured one).
+            const used = r.provider && PROVIDERS[r.provider] ? r.provider : prov;
+            const usedKey = sessionKey(used);
+            if (!r.stopped || r.text) {
+              const userText = String((extra && extra.displayPrompt) || prompt || '').replace(/^\[Conversa em grupo:[\s\S]*?\[Mensagem do usuário\]\n/, '');
+              const last = (c.transcript || [])[(c.transcript || []).length - 1];
+              const injected = (r.injected || []).length ? '\n' + r.injected.map((x) => '(mensagem adicional) ' + x).join('\n') : '';
+              if (!(last && last.role === 'user' && last.text === userText && isGroup)) transcriptAppend(c, { role: 'user', text: userText + injected });
+              transcriptAppend(c, { role: 'assistant', bot: id, provider: used, text: r.text || '', ...(r.error ? { error: String(r.error).slice(0, 300) } : {}), ...(r.stopped ? { stopped: true } : {}) });
+            }
+            if (r.sessionId) {
+              store[usedKey] = r.sessionId;
+              store.sessSeq = { ...(store.sessSeq || {}), [usedKey]: c.tseq || 0 };
+            }
+            if (!r.error) c.lastProvider = used;
             if (r.usage) c.lastUsage = r.usage;
             save();
             return r;
@@ -7487,10 +7582,34 @@ services:
           }
 
           // ---------- send-file (local only, used by Claude itself) ----------
+          const FILE_TYPES = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic', '.svg': 'image/svg+xml',
+            '.pdf': 'application/pdf', '.txt': 'text/plain', '.md': 'text/markdown', '.csv': 'text/csv', '.json': 'application/json', '.zip': 'application/zip', '.html': 'text/html', '.htm': 'text/html',
+            '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.m4a': 'audio/mp4', '.wav': 'audio/wav', '.webm': 'audio/webm', '.mp4': 'video/mp4', '.mov': 'video/quicktime',
+            '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation' };
+          // Web chat: copies the file into INBOX (served by GET /admin/web/files/<name>) and posts it as an assistant message.
+          function sendWebFile(chatId, p, caption) {
+            if (!chats[chatId]) throw new Error('chatId desconhecido');
+            const abs = path.resolve(WORKDIR, String(p || ''));
+            if (!p || !fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new Error('arquivo não encontrado: ' + abs);
+            const size = fs.statSync(abs).size;
+            if (size > 100 * 1024 * 1024) throw new Error('arquivo grande demais (máx. 100 MB)');
+            const ext = path.extname(abs).toLowerCase();
+            const base = path.basename(abs, path.extname(abs)).replace(/[^\w.-]+/g, '_').slice(0, 60) || 'arquivo';
+            const name = 'web-out-' + new Date().toISOString().replace(/[:.]/g, '-') + '-' + crypto.randomBytes(2).toString('hex') + '_' + base + ext.replace(/[^\w.]/g, '');
+            fs.copyFileSync(abs, path.join(INBOX, name));
+            const file = { name: path.basename(abs).slice(0, 120), type: FILE_TYPES[ext] || 'application/octet-stream', size, file: name };
+            const c = chats[chatId];
+            const r = running.get(chatId);
+            webAppend(chatId, { role: 'assistant', bot: (r && r.bot) || (c ? botOf(c).id : DEFAULT_BOT), text: String(caption || '').slice(0, 4000), files: [file], attachment: true });
+            audit({ action: 'send-file', to: chatId, file: abs, bytes: size, caption: caption || null, via: 'web' });
+            return { sent: true, chatId, file: name };
+          }
           async function sendFile(reqBody) {
             const { path: p, caption } = reqBody;
             if (reqBody.chatId && readOnlyRuns.has(String(reqBody.chatId))) throw new Error('bloqueado pelo modo proativo somente leitura (read-only)');
             let chatId = reqBody.chatId;
+            if (!reqBody.to && chatId && isWeb(chatId)) return sendWebFile(chatId, p, caption);
             if (reqBody.to) chatId = await resolveTo(reqBody.to);
             else if (!chatId || !chats[chatId]) throw new Error('chatId desconhecido');
             await assertWhatsAppRecipientAllowed(chatId);
@@ -9162,6 +9281,21 @@ services:
             if (callId && wacalls.pushedCalls.has(callId)) return;
             if (callId) wacalls.pushedCalls.set(callId, now);
             const peerLabel = formatWaCallPeer(ev.peer);
+            if (callId && autoAnswerPeerMatch(ev.peer)) {
+              const chatId = chats[AI_CALL_AUTO_ANSWER_CHAT] ? AI_CALL_AUTO_ANSWER_CHAT : '';
+              log('ai-call auto-answer', callId, 'peer=' + ev.peer);
+              startAiCall({
+                to: AI_CALL_AUTO_ANSWER_PHONE,
+                incoming: { callId, sessionId: String(ev.sessionId || '') },
+                purpose: 'O ' + (OWNER_NAME || 'Caio') + ' ligou para você. Não há um motivo pré-definido: pergunte/escute o que ele precisa e resolva, usando ask_agent para consultar dados reais ou executar ações.',
+                chatId,
+                bot: DEFAULT_BOT,
+              }, 'auto-answer').catch((e) => {
+                log('ai-call auto-answer falhou:', e.message);
+                notifyPush({ title: '📞 Ligação WhatsApp', body: 'Falha ao atender automaticamente ' + peerLabel + ': ' + e.message, tag: 'wacall-' + callId, url: '/#/calls' });
+              });
+              return;
+            }
             notifyPush({
               title: '📞 Ligação WhatsApp',
               body: 'Chamada recebida de ' + peerLabel,
@@ -9466,6 +9600,24 @@ services:
           const AI_CALL_END_DRAIN_MS = Math.max(200, Number(env.AI_CALL_END_DRAIN_MS || 5000));
           const AI_CALL_GREET_DELAY_MS = Math.max(0, Number(env.AI_CALL_GREET_DELAY_MS || 350));
           const AI_CALL_MAX_HISTORY = 50;
+          // Ligações RECEBIDAS atendidas automaticamente pela IA (Gemini Live) — somente estes peers
+          // (número e/ou LID do WhatsApp). Vazio/"off" desativa. Demais ligações seguem só com push.
+          const AI_CALL_AUTO_ANSWER = String(env.AI_CALL_AUTO_ANSWER ?? '5511984691018,29631180763152@lid')
+            .split(',').map((x) => x.trim()).filter((x) => x && x !== 'off');
+          const AI_CALL_AUTO_ANSWER_PHONE = String(env.AI_CALL_AUTO_ANSWER_PHONE || '5511984691018').replace(/\D/g, '');
+          const AI_CALL_AUTO_ANSWER_CHAT = String(env.AI_CALL_AUTO_ANSWER_CHAT || '29631180763152@lid');
+          function autoAnswerPeerMatch(peer) {
+            const p = String(peer || '').trim().toLowerCase();
+            if (!p || !AI_CALL_AUTO_ANSWER.length) return false;
+            const user = p.split('@')[0].split(':')[0];
+            const domain = p.includes('@') ? p.split('@')[1] : '';
+            return AI_CALL_AUTO_ANSWER.some((a) => {
+              const al = a.toLowerCase();
+              if (al.includes('@')) return al.split('@')[0] === user && al.split('@')[1] === domain;
+              const digits = al.replace(/\D/g, '');
+              return domain !== 'lid' && digits && user === digits;
+            });
+          }
           const aiCalls = new Map();
 
           function parsePcmSampleRate(mimeType, fallback = 24000) {
@@ -9746,7 +9898,9 @@ services:
             const nowStr = new Date().toLocaleString('pt-BR', { timeZone: TZ });
             const ownerLabel = OWNER_NAME || 'Caio';
             const peerLabel = '+' + opts.to;
-            const whoLine = opts.isOwnerCall
+            const whoLine = opts.incoming
+              ? ('LIGAÇÃO RECEBIDA: o próprio ' + ownerLabel + ' (' + peerLabel + ') ligou para você e você atendeu automaticamente. Atenda como assistente dele e ajude no que ele pedir.')
+              : opts.isOwnerCall
               ? ('Você está ligando para o próprio ' + ownerLabel + ' (' + peerLabel + ').')
               : ('Você está ligando para ' + peerLabel + ' a pedido de ' + ownerLabel + '.');
             const lines = [
@@ -9782,7 +9936,9 @@ services:
           function formatAiCallSummary(rec) {
             const peerLabel = '+' + rec.to;
             const lines = [];
-            if (rec.status === 'no_answer') {
+            if (rec.direction === 'inbound') {
+              lines.push('📞 Ligação recebida de ' + peerLabel + ' atendida pela IA (' + (rec.durationSec || 0) + 's' + (rec.status === 'error' ? ', erro: ' + (rec.error || rec.endReason) : ', encerramento: ' + (rec.endReason || 'concluída')) + ').');
+            } else if (rec.status === 'no_answer') {
               lines.push('📞 Ligação IA para ' + peerLabel + ' — não atendeu.');
             } else if (rec.status === 'declined') {
               lines.push('📞 Ligação IA para ' + peerLabel + ' — recusada.');
@@ -9795,7 +9951,7 @@ services:
             } else {
               lines.push('📞 Ligação IA para ' + peerLabel + ' (' + rec.durationSec + 's, encerramento: ' + (rec.endReason || 'concluída') + ').');
             }
-            if (rec.purpose) lines.push('Motivo: ' + rec.purpose.slice(0, 300));
+            if (rec.purpose && rec.direction !== 'inbound') lines.push('Motivo: ' + rec.purpose.slice(0, 300));
             if (Array.isArray(rec.transcript) && rec.transcript.length) {
               lines.push('Transcrição:');
               for (const item of rec.transcript) {
@@ -9926,6 +10082,7 @@ services:
           async function startAiCall(body, via = 'api') {
             body = body && typeof body === 'object' ? body : {};
             const phone = normalizeCallPhone(body.to || body.phone);
+            const incoming = body.incoming && typeof body.incoming === 'object' && body.incoming.callId ? body.incoming : null;
             const purpose = String(body.purpose || body.context || body.message || '').trim().slice(0, 4000);
             if (!purpose) {
               const err = new Error('"purpose" (ou "context") obrigatório');
@@ -9968,7 +10125,7 @@ services:
               err.status = 503;
               throw err;
             }
-            const requestedSid = String(body.sessionId || '').trim();
+            const requestedSid = String((incoming && incoming.sessionId) || body.sessionId || '').trim();
             const session = (requestedSid ? sessRes.sessions.find((s) => s && s.id === requestedSid && s.paired) : null)
               || sessRes.sessions.find((s) => s && s.paired && s.state === 'open')
               || sessRes.sessions.find((s) => s && s.paired);
@@ -9999,6 +10156,7 @@ services:
               sessionId: session.id,
               to: phone,
               isOwner,
+              direction: incoming ? 'inbound' : 'outbound',
               purpose,
               chatId: resolvedChatId,
               bot: botId,
@@ -10062,16 +10220,22 @@ services:
             sseReq.on('error', () => {});
             sseReq.end();
 
-            // Initiate outbound WhatsApp call via WaCalls
+            // Initiate outbound WhatsApp call via WaCalls (or accept the incoming one)
             let startResp;
             let startText = '';
             try {
-              startResp = await fetch(WACALLS_URL + '/api/sessions/' + encodeURIComponent(session.id) + '/calls', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-Client-Id': ownerClientId },
-                body: JSON.stringify({ phone }),
-                signal: AbortSignal.timeout(15000),
-              });
+              startResp = incoming
+                ? await fetch(WACALLS_URL + '/api/sessions/' + encodeURIComponent(session.id) + '/calls/' + encodeURIComponent(String(incoming.callId)) + '/accept', {
+                  method: 'POST',
+                  headers: { 'X-Client-Id': ownerClientId },
+                  signal: AbortSignal.timeout(15000),
+                })
+                : await fetch(WACALLS_URL + '/api/sessions/' + encodeURIComponent(session.id) + '/calls', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'X-Client-Id': ownerClientId },
+                  body: JSON.stringify({ phone }),
+                  signal: AbortSignal.timeout(15000),
+                });
               startText = await startResp.text();
             } catch (e) {
               closeSse();
@@ -10239,7 +10403,9 @@ services:
                   clientContent: {
                     turns: [{
                       role: 'user',
-                      parts: [{ text: '[A pessoa acabou de atender a ligação. Cumprimente de forma natural e breve e diga o motivo da ligação.]' }],
+                      parts: [{ text: incoming
+                        ? '[Você acabou de atender a ligação que o ' + (OWNER_NAME || 'Caio') + ' fez para você. Atenda de forma natural e bem breve (ex.: "Oi, ' + (OWNER_NAME || 'Caio') + ', pode falar!") e espere ele dizer o que precisa.]'
+                        : '[A pessoa acabou de atender a ligação. Cumprimente de forma natural e breve e diga o motivo da ligação.]' }],
                     }],
                     turnComplete: true,
                   },
@@ -10456,7 +10622,7 @@ services:
 
               ws.addEventListener('open', () => {
                 if (closed || geminiWs !== ws) { try { ws._bridgeIntentionalClose = true; ws.close(); } catch {} return; }
-                const sysText = buildAiCallSystemPrompt({ to: phone, isOwnerCall: isOwner, purpose, chatId: resolvedChatId, bot: activeBot, lang });
+                const sysText = buildAiCallSystemPrompt({ to: phone, isOwnerCall: isOwner, incoming: Boolean(incoming), purpose, chatId: resolvedChatId, bot: activeBot, lang });
                 const setupPayload = {
                   setup: {
                     model: activeModel,
@@ -10588,6 +10754,7 @@ services:
             });
 
             connectGemini();
+            if (incoming) markCallConnected();
 
             if (body.wait !== undefined && Number(body.wait) > 0) {
               return await waitAiCall(rec, Number(body.wait));
@@ -11421,13 +11588,13 @@ services:
                 if ('bot' in body) {
                   const nb = body.bot ? bots[body.bot] : bots[DEFAULT_BOT];
                   if (!nb) throw new Error('bot desconhecido');
-                  if (nb.id !== botOf(c).id) { delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; audit({ action: 'chat-bot', chatId: b, bot: nb.id, via: 'panel' }); }
+                  if (nb.id !== botOf(c).id) { resetSessions(c); audit({ action: 'chat-bot', chatId: b, bot: nb.id, via: 'panel' }); }
                   if (nb.id === DEFAULT_BOT) delete c.bot; else c.bot = nb.id;
                 }
                 if ('pinned' in body) { if (body.pinned) c.pinned = true; else delete c.pinned; }
                 if ('archived' in body) { if (body.archived) c.archived = true; else delete c.archived; }
                 if (body.read) c.readAt = new Date().toISOString();
-                if (body.reset) { delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; delete c.cpSession; delete c.olSession; }
+                if (body.reset) resetSessions(c);
                 save();
                 return send(200, chatView(b));
               }
@@ -11503,9 +11670,14 @@ services:
                 const file = path.join(INBOX, name);
                 if (!name.startsWith('web-') || !fs.existsSync(file)) return send(404, { error: 'arquivo não encontrado' });
                 const ext = path.extname(name).toLowerCase();
-                const types = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.heic': 'image/heic',
-                  '.pdf': 'application/pdf', '.webm': 'audio/webm', '.ogg': 'audio/ogg', '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.mp4': 'video/mp4', '.wav': 'audio/wav', '.txt': 'text/plain' };
-                res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream', 'Content-Length': fs.statSync(file).size, 'Cache-Control': 'private, max-age=86400' });
+                let ctype = FILE_TYPES[ext] || 'application/octet-stream';
+                // SVG/HTML could run scripts on the panel origin: served as plain text unless downloaded.
+                if (/svg|html/.test(ctype)) ctype = 'text/plain; charset=utf-8';
+                else if (ctype.startsWith('text/') || ctype === 'application/json') ctype += '; charset=utf-8';
+                const dl = /[?&]download=1\b/.test(req.url);
+                const nice = name.replace(/^web-(out-)?[\dTZ-]+-[a-f0-9]{4}_/, '');
+                res.writeHead(200, { 'Content-Type': ctype, 'Content-Length': fs.statSync(file).size, 'Cache-Control': 'private, max-age=86400', 'X-Content-Type-Options': 'nosniff',
+                  ...(dl ? { 'Content-Disposition': "attachment; filename*=UTF-8''" + encodeURIComponent(nice) } : {}) });
                 return fs.createReadStream(file).pipe(res);
               }
               if (a === 'web' && b && c2 === 'events' && m === 'GET') {
@@ -11608,7 +11780,7 @@ services:
                 if (!c2 && m === 'DELETE') {
                   if (bt.id === DEFAULT_BOT) throw new Error('o bot padrão não pode ser apagado');
                   delete bots[bt.id]; saveBots();
-                  for (const c of Object.values(chats)) if (c.bot === bt.id) { delete c.bot; delete c.session; delete c.agySession; delete c.ocSession; delete c.olSession; }
+                  for (const c of Object.values(chats)) if (c.bot === bt.id) { delete c.bot; resetSessions(c, true); }
                   save();
                   for (const r of schedules) if (r.bot === bt.id) delete r.bot;
                   saveSched();
